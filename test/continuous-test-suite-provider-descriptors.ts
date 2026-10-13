@@ -88,11 +88,11 @@ async function runDescriptorTests(
     // count of hand-registered providers (openai, anthropic, google-ai,
     // vertex, bedrock, sagemaker, azure, ollama, openrouter, litellm,
     // openai-compatible, nvidia-nim, lm-studio, llamacpp, cohere, replicate,
-    // voyage, jina, stability, ideogram, recraft, typesafe, xor,
+    // voyage, jina, stability, ideogram, recraft, typesafe,
     // perplexity-decider, cloudflare-clef). A catalog JSON of either kind adds
     // one descriptor and no hand line, so only the hand count is a literal.
     // Mirrors the wiring suite's HAND_ONLY_PROVIDER_COUNT.
-    const HAND_ONLY_PROVIDER_COUNT = 25;
+    const HAND_ONLY_PROVIDER_COUNT = 24;
     const expectedCount =
       CATALOG_PROVIDER_IDS.length +
       DECIDE_CATALOG_PROVIDER_IDS.length +
@@ -403,7 +403,7 @@ async function runDescriptorTests(
     }
     // Mirrors continuous-test-suite-provider-wiring.ts's
     // HAND_ONLY_PROVIDER_COUNT.
-    const HAND_ONLY_PROVIDER_COUNT = 25;
+    const HAND_ONLY_PROVIDER_COUNT = 24;
     const totalCount =
       CATALOG_PROVIDER_IDS.length +
       DECIDE_CATALOG_PROVIDER_IDS.length +
@@ -1010,11 +1010,9 @@ async function runDescriptorTests(
       // typesafe serves only the `decide` inference type, so it has no tools
       // at all — the same reason voyage/jina (embedding-only) are here.
       "typesafe",
-      // Every decide catalog entry (laya today) is decide-only too: no tools
-      // for the same reason. Derived, so the next decide JSON needs no line.
+      // Every decide catalog entry (laya and xor today) is decide-only too: no
+      // tools for the same reason. Derived, so the next decide JSON needs no line.
       ...DECIDE_CATALOG_PROVIDER_IDS,
-      // xor is decide-only too: no tools for the same reason.
-      "xor",
       // perplexity-decider is decide-only as well, and unrelated to the
       // `perplexity` text provider: no tools for the same reason.
       "perplexity-decider",
