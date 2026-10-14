@@ -170,38 +170,35 @@ export class LoopSession {
         // The .fail() handler in cli.ts is now session-aware and will
         // handle all parsing and validation errors without exiting the loop.
         // We create a fresh instance for each command to prevent state pollution.
-        await tracers.sdk.startActiveSpan(
-          "neurolink.cli.turn",
-          async (turnSpan) => {
-            try {
-              turnSpan.setAttribute(
-                "cli.command",
-                typeof processedCommand === "string"
-                  ? processedCommand.slice(0, 100)
-                  : (processedCommand[0] ?? "unknown"),
-              );
-              turnSpan.setAttribute("cli.session_id", this.sessionId ?? "none");
-              const yargsInstance = this.initializeCliParser();
-              await yargsInstance
-                .scriptName("")
-                .fail((msg, err) => {
-                  throw err || new Error(msg);
-                })
-                .exitProcess(false)
-                .parse(processedCommand);
-            } catch (e) {
-              const err = e instanceof Error ? e : new Error(String(e));
-              turnSpan.recordException(err);
-              turnSpan.setStatus({
-                code: SpanStatusCode.ERROR,
-                message: err.message,
-              });
-              throw e;
-            } finally {
-              turnSpan.end();
-            }
-          },
-        );
+        await tracers.sdk.startActiveSpan("cli.turn", async (turnSpan) => {
+          try {
+            turnSpan.setAttribute(
+              "cli.command",
+              typeof processedCommand === "string"
+                ? processedCommand.slice(0, 100)
+                : (processedCommand[0] ?? "unknown"),
+            );
+            turnSpan.setAttribute("cli.session_id", this.sessionId ?? "none");
+            const yargsInstance = this.initializeCliParser();
+            await yargsInstance
+              .scriptName("")
+              .fail((msg, err) => {
+                throw err || new Error(msg);
+              })
+              .exitProcess(false)
+              .parse(processedCommand);
+          } catch (e) {
+            const err = e instanceof Error ? e : new Error(String(e));
+            turnSpan.recordException(err);
+            turnSpan.setStatus({
+              code: SpanStatusCode.ERROR,
+              message: err.message,
+            });
+            throw e;
+          } finally {
+            turnSpan.end();
+          }
+        });
 
         // Check context budget after each generation command
         await this.checkContextBudgetWarning();

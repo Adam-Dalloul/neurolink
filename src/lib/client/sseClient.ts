@@ -96,7 +96,7 @@ export class NeuroLinkSSE {
   ): Promise<void> {
     return withClientSpan(
       {
-        name: "neurolink.client.sse.stream",
+        name: "client.sse.stream",
         tracer: tracers.http,
         attributes: {
           "http.method": options.body ? "POST" : "GET",

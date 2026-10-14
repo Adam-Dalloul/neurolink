@@ -55,7 +55,7 @@ type NeurolinkConstructorConfig = {
   // Custom tool registry (advanced)
   toolRegistry?: MCPToolRegistry;
 
-  // Observability (Langfuse integration)
+  // Observability (Langfuse; auto-enabled from LANGFUSE_PUBLIC_KEY + LANGFUSE_SECRET_KEY, `langfuse: false` disables)
   observability?: ObservabilityConfig;
 };
 ```
@@ -102,7 +102,6 @@ const neurolinkComplete = new NeuroLink({
   hitl: { enabled: true },
   observability: {
     langfuse: {
-      enabled: true,
       publicKey: process.env.LANGFUSE_PUBLIC_KEY,
       secretKey: process.env.LANGFUSE_SECRET_KEY,
     },

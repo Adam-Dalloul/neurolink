@@ -1,4 +1,9 @@
-import type { ProxyTokenBudgetSnapshot } from "./proxyBudget.js";
+import type {
+  ProxyTokenBudgetLease,
+  ProxyTokenBudgetSnapshot,
+} from "./proxyBudget.js";
+import type { CodexRuntimeAccount } from "./codex.js";
+import type { JsonObject, JsonValue } from "./common.js";
 import type {
   ProxyContextEvidence,
   ProxyPreparedContext,
@@ -44,7 +49,7 @@ import type {
   ProxyRoutingConfig,
   CloakingConfig,
 } from "./subscription.js";
-import type { RouteDeprecation } from "./server.js";
+import type { RouteDeprecation, ServerContext } from "./server.js";
 import type { StoredOAuthTokens } from "./auth.js";
 
 /**
@@ -1259,6 +1264,50 @@ export type CodexAttemptLogExtra = Partial<
   >
 >;
 
+/** Mutable per-request state shared by the Codex request helpers. */
+export type CodexRequestState = {
+  body: JsonObject;
+  bodyStr: string;
+  contextPreflight?: ProxyContextEvidence;
+  budgetLease?: ProxyTokenBudgetLease;
+  budgetDispatched: boolean;
+  finalOutcomeRecorded: boolean;
+};
+
+/** Everything the Codex request helpers need to serve and account one turn. */
+export type CodexRequestRuntime = {
+  ctx: ServerContext;
+  model: string;
+  tracer?: ProxyTracer;
+  requestStartTime: number;
+  isFallbackRequest: boolean;
+  state: CodexRequestState;
+  runtimeConfigProvider?: ProxyRuntimeConfigProvider;
+  loopbackPort?: number;
+  internalDispatch?: (request: Request) => Response | Promise<Response>;
+  settleBudget: (actualTokens?: number) => Promise<void>;
+  recordFinalOutcome: (
+    account: CodexRuntimeAccount | undefined,
+    responseStatus: number,
+    extra?: CodexFinalLogExtra,
+  ) => Promise<void>;
+  writeAttempt: (
+    account: CodexRuntimeAccount,
+    attempt: number,
+    startedAt: number,
+    responseStatus: number,
+    extra?: CodexAttemptLogExtra,
+  ) => void;
+};
+
+/** Failure details recorded when a Codex account is rotated past. */
+export type CodexRotationFailure = {
+  lastFailure: CodexFinalLogExtra;
+  lastErrorStatus: number;
+  lastErrorCode: string | undefined;
+  lastErrorMessage: string;
+};
+
 /** Minimal persistence contract needed by Codex rotating-token refreshes. */
 export type CodexRefreshTokenStore = {
   peekTokens(provider: string): Promise<StoredOAuthTokens | null>;
@@ -2281,6 +2330,8 @@ export type ResponseInfoContext = {
   stopSequence?: string;
   /** Names of the tools the model actually invoked (tool_use blocks). */
   toolCalls?: string[];
+  output?: JsonValue | Array<{ type?: string; toolName?: string }>;
+  firstOutputAt?: number;
 };
 
 /** Context recorded when an account is selected for a proxy request. */
@@ -2866,6 +2917,7 @@ export type CodexStreamEvidence = {
   errorType?: string;
   errorMessage?: string;
   errorCode?: string;
+  response?: JsonObject;
 };
 
 /** Validated account-routing evidence joined to a final request log. */

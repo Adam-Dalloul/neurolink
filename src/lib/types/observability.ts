@@ -5,32 +5,8 @@
  */
 
 import type { AttributeValue } from "@opentelemetry/api";
+import type { JsonValue, RawUsageObject, Unknown } from "./common.js";
 import type { SpanData } from "./span.js";
-
-/**
- * Trace name format for Langfuse traces
- *
- * Controls how userId and operationName are combined to form the trace name.
- * Can be a predefined format string or a custom function.
- *
- * @example
- * // Predefined formats:
- * "userId:operationName" → "user@email.com:ai.streamText"
- * "operationName:userId" → "ai.streamText:user@email.com"
- * "operationName" → "ai.streamText"
- * "userId" → "user@email.com" (legacy)
- *
- * @example
- * // Custom function:
- * (ctx) => `[${ctx.operationName}] ${ctx.userId}`
- * // → "[ai.streamText] user@email.com"
- */
-export type TraceNameFormat =
-  | "userId:operationName"
-  | "operationName:userId"
-  | "operationName"
-  | "userId"
-  | ((context: { userId?: string; operationName?: string }) => string);
 
 /**
  * Standard GenAI semantic convention attributes from OpenTelemetry
@@ -66,131 +42,57 @@ export type LangfuseSpanAttributes = {
 };
 
 /**
- * Langfuse observability configuration
+ * @description Langfuse exporter options. Every field falls back to its `LANGFUSE_*` environment variable when omitted.
  */
-export type LangfuseConfig = {
-  /** Whether Langfuse is enabled */
-  enabled: boolean;
-  /** Langfuse public key */
-  publicKey: string;
-  /**
-   * Langfuse secret key
-   * @sensitive
-   * WARNING: This is a sensitive credential. Handle securely.
-   * Do NOT log, expose, or share this key. Follow best practices for secret management.
-   */
-  secretKey: string;
-  /** Langfuse base URL (default: https://cloud.langfuse.com) */
+export type NeurolinkLangfuseConfig = {
+  /** Project public key; defaults to `LANGFUSE_PUBLIC_KEY`. */
+  publicKey?: string;
+  /** Project secret key; defaults to `LANGFUSE_SECRET_KEY`. */
+  secretKey?: string;
+  /** Langfuse host; defaults to `LANGFUSE_BASE_URL`, then Langfuse Cloud. */
   baseUrl?: string;
-  /** Environment name (e.g., dev, staging, prod) */
+  /** Environment name; defaults to `LANGFUSE_TRACING_ENVIRONMENT`. */
   environment?: string;
-  /** Release/version identifier */
+  /** Release identifier; defaults to `LANGFUSE_RELEASE`. */
   release?: string;
-  /** Optional default user id to attach to spans */
-  userId?: string;
-  /** Optional default session id to attach to spans */
-  sessionId?: string;
-
-  // NEW FIELDS - External TracerProvider Support
-  /**
-   * If true, NeuroLink will NOT create or register its own TracerProvider.
-   * Instead, it will only create the LangfuseSpanProcessor and ContextEnricher,
-   * which the parent application must add to its own TracerProvider.
-   *
-   * Use this when your application already has OpenTelemetry instrumentation.
-   *
-   * @default false
-   */
-  useExternalTracerProvider?: boolean;
-
-  /**
-   * If true, NeuroLink will automatically detect if a TracerProvider is already
-   * registered globally and skip its own registration to avoid conflicts.
-   *
-   * This is a convenience option that combines well with useExternalTracerProvider.
-   *
-   * @default false
-   */
-  autoDetectExternalProvider?: boolean;
-
-  /**
-   * If true, NeuroLink will NOT register its own LangfuseSpanProcessor with the
-   * global TracerProvider when using external provider mode. Only the ContextEnricher
-   * will be registered. Use this when the host application already registers a
-   * LangfuseSpanProcessor (e.g., via a DeferredSpanProcessor) to prevent duplicate
-   * trace exports to Langfuse.
-   *
-   * @default false
-   */
-  skipLangfuseSpanProcessor?: boolean;
-
-  // Operation Name Support
-
-  /**
-   * Enable auto-detection of operation names from span names.
-   *
-   * When true (default), AI operation spans (ai.streamText, ai.generateText, etc.)
-   * will have their operation name automatically extracted and included in the
-   * trace name.
-   *
-   * @default true
-   *
-   * @example
-   * // With auto-detection enabled (default):
-   * // Span "ai.streamText" + userId "user@email.com"
-   * // → Trace name: "user@email.com:ai.streamText"
-   *
-   * @example
-   * // With auto-detection disabled:
-   * // → Trace name: "user@email.com" (legacy behavior)
-   */
-  autoDetectOperationName?: boolean;
-
-  /**
-   * Format for trace names in Langfuse.
-   *
-   * Controls how userId and operationName are combined to form the trace name.
-   * Can be a predefined format string or a custom function for full control.
-   *
-   * @default "userId:operationName"
-   *
-   * @example
-   * // Predefined formats:
-   * traceNameFormat: "userId:operationName" // "user@email.com:ai.streamText"
-   * traceNameFormat: "operationName:userId" // "ai.streamText:user@email.com"
-   * traceNameFormat: "operationName"        // "ai.streamText"
-   * traceNameFormat: "userId"               // "user@email.com" (legacy)
-   *
-   * @example
-   * // Custom function:
-   * traceNameFormat: (ctx) => `[${ctx.operationName || 'unknown'}] ${ctx.userId}`
-   * // → "[ai.streamText] user@email.com"
-   */
-  traceNameFormat?: TraceNameFormat;
+  /** Applied to input, output and metadata before they leave the process. */
+  mask?: (params: { data: JsonValue }) => JsonValue;
+  /** `"immediate"` sends every span as it ends; `"batched"` (default) queues them. */
+  exportMode?: "batched" | "immediate";
+  /** Spans queued before a batch is sent; defaults to 15. */
+  flushAt?: number;
+  /** Seconds between batch sends; defaults to 5. */
+  flushInterval?: number;
 };
 
 /**
- * OpenTelemetry configuration
- */
-export type OpenTelemetryConfig = {
-  /** Whether OpenTelemetry is enabled */
-  enabled: boolean;
-  /** OTLP endpoint URL */
-  endpoint?: string;
-  /** Service name for traces */
-  serviceName?: string;
-  /** Service version */
-  serviceVersion?: string;
-};
-
-/**
- * Complete observability configuration for Neurolink SDK
+ * @description Observability configuration for the NeuroLink SDK. Langfuse turns on automatically when `LANGFUSE_PUBLIC_KEY` and `LANGFUSE_SECRET_KEY` are set; `false` turns it off.
  */
 export type ObservabilityConfig = {
-  /** Langfuse configuration */
-  langfuse?: LangfuseConfig;
-  /** OpenTelemetry configuration */
-  openTelemetry?: OpenTelemetryConfig;
+  /** `false` disables Langfuse, `true` or an options object enables it. */
+  langfuse?: boolean | NeurolinkLangfuseConfig;
+};
+
+/**
+ * @description Per-call trace attributes propagated to every span created inside the call.
+ */
+export type NeurolinkTraceContext = {
+  /** End user the trace belongs to. */
+  userId?: string | null;
+  /** Session that groups related traces. */
+  sessionId?: string | null;
+  /** Conversation identifier, recorded as trace metadata. */
+  conversationId?: string | null;
+  /** Request identifier, recorded as trace metadata. */
+  requestId?: string | null;
+  /** Trace name shown in Langfuse. */
+  traceName?: string | null;
+  /** Trace tags. */
+  tags?: string[];
+  /** Trace metadata; values up to 200 characters once stringified are on every observation, longer values and arrays only on the trace. */
+  metadata?: Record<string, SpanContent | undefined>;
+  /** Name of the root observation of this `generate` or `stream` call; not propagated to child observations and not the trace name. */
+  observationName?: string | null;
 };
 
 // =============================================================================
@@ -267,14 +169,6 @@ export type TraceView = {
   status: "ok" | "error" | "partial";
 };
 
-// =============================================================================
-// LANGFUSE CONTEXT (moved from services/server/ai/observability/instrumentation.ts)
-// =============================================================================
-
-/**
- * Extended context for Langfuse spans.
- * Supports all Langfuse trace attributes for rich observability.
- */
 /** A model request serialized onto a span: the system prompt plus messages, or a bare prompt. */
 export type SpanModelRequest = {
   system?: unknown;
@@ -282,35 +176,101 @@ export type SpanModelRequest = {
   prompt?: string;
 };
 
-export type LangfuseContext = {
-  userId?: string | null;
-  sessionId?: string | null;
-  /** Conversation/thread identifier for grouping related traces */
-  conversationId?: string | null;
-  /** Request identifier for correlating with application logs */
-  requestId?: string | null;
-  /** Custom trace name for better organization in Langfuse UI */
-  traceName?: string | null;
-  /** Custom metadata to attach to spans */
-  metadata?: Record<string, unknown> | null;
-  /** Langfuse trace tags, set on the trace's root span (e.g. to label what a trace is for) */
-  tags?: string[] | null;
-  /**
-   * Explicit operation name (e.g., "ai.streamText", "chat", "embeddings").
-   * If set, overrides auto-detection from the span name.
-   */
-  operationName?: string | null;
-  /**
-   * Override global autoDetectOperationName setting for this context.
-   * When undefined, uses the global setting (defaults to true).
-   */
-  autoDetectOperationName?: boolean;
-  /**
-   * Custom attributes to set on all spans within this context.
-   * These attributes are propagated to every span created within the
-   * AsyncLocalStorage context.
-   */
-  customAttributes?: Record<string, string | number | boolean>;
+export type GenerationOperation = "generate" | "stream";
+
+/** @description Any value a span attribute can carry: JSON, or an object serialized on the way out. */
+export type SpanContent = JsonValue | object;
+
+/** @description Observation kinds Langfuse renders a span as. */
+export type ObservationType =
+  | "span"
+  | "generation"
+  | "event"
+  | "embedding"
+  | "agent"
+  | "tool"
+  | "chain"
+  | "retriever"
+  | "evaluator"
+  | "guardrail";
+
+/** @description Severity of an observation. */
+export type ObservationLevel = "DEBUG" | "DEFAULT" | "WARNING" | "ERROR";
+
+/** @description Attributes stamped on an observation span by `observe`. */
+export type ObservationAttributes = {
+  input?: Unknown;
+  output?: Unknown;
+  metadata?: Record<string, SpanContent | undefined>;
+  level?: ObservationLevel;
+  statusMessage?: string;
+  completionStartTime?: Date;
+  model?: string;
+  modelParameters?: Record<string, string | number>;
+  usageDetails?: Record<string, number>;
+  costDetails?: Record<string, number>;
+};
+
+/** @description Trace-level input, output and per-key metadata recorded by `observeTrace`. */
+export type TraceContent = Pick<ObservationAttributes, "input" | "output"> & {
+  metadata?: Record<string, SpanContent | undefined>;
+};
+
+/** @description A tool call as a provider, the agentic loop or a tool execution names its fields. */
+export type AssistantToolCall = {
+  id?: string;
+  toolCallId?: string;
+  name?: string;
+  toolName?: string;
+  args?: SpanContent;
+  input?: SpanContent;
+  arguments?: SpanContent;
+  function?: { name?: string; arguments?: SpanContent };
+};
+
+/** @description A model response split into text, reasoning and tool calls. */
+export type AssistantReply = {
+  text?: string;
+  reasoning?: string;
+  toolCalls?: AssistantToolCall[];
+};
+
+/** @description A model response as plain text, a structured reply, or message or content-part arrays. */
+export type AssistantOutput = string | AssistantReply | object[];
+
+/** @description A tool call in OpenAI chat shape, as Langfuse renders it. */
+export type ObservationToolCall = {
+  id?: string;
+  type: "function";
+  function: { name?: string; arguments: string };
+};
+
+/**
+ * @description One model request as a Langfuse generation. Every field is optional so the request half and the response half can be recorded separately.
+ */
+export type GenerationRecord = {
+  /** Public API the call serves; inferred from the enclosing span when unset. */
+  operation?: GenerationOperation;
+  /** Provider name, used with the model to price the call. */
+  provider?: string;
+  /** Model the request asked for. */
+  model?: string;
+  /** Model the response says served it, when the API reports one. */
+  responseModel?: string;
+  /** Sampling and thinking parameters sent; undefined entries are dropped. */
+  modelParameters?: Record<string, string | number | undefined>;
+  /** System prompt and messages, or the bare prompt, sent. */
+  input?: SpanModelRequest;
+  /** Text and tool calls returned. */
+  output?: AssistantOutput;
+  /** Token usage in any naming convention `extractTokenUsage` reads. */
+  usage?: RawUsageObject | null;
+  /** Provider finish reason. */
+  finishReason?: string;
+  /** Whether the caller aborted the call before it finished. */
+  aborted?: boolean;
+  /** When the first chunk of a streamed response arrived. */
+  completionStartTime?: Date;
 };
 
 /**
@@ -490,6 +450,10 @@ export type SpanOptions = {
   tracer: import("@opentelemetry/api").Tracer;
   kind?: import("@opentelemetry/api").SpanKind;
   attributes?: Record<string, string | number | boolean | undefined>;
+  /** Marks a thrown error as an expected skip whose Langfuse level the span set itself, so `withSpan` keeps it instead of raising ERROR. */
+  expectedFailure?: (error: unknown) => boolean;
+  /** Keeps the span out of the active context, so spans started inside `fn` parent to the nearest ancestor that is exported. */
+  detached?: boolean;
 };
 
 // =============================================================================

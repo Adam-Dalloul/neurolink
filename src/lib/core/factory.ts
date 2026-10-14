@@ -335,7 +335,7 @@ export class AIProviderFactory {
     // Providers are registered via ProviderFactory.initialize() on first use
 
     return factoryTracer.startActiveSpan(
-      "neurolink.factory.createProvider",
+      "factory.createProvider",
       {
         kind: SpanKind.INTERNAL,
         attributes: {

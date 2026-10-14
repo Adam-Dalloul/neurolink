@@ -1537,21 +1537,17 @@ npx @juspay/neurolink observability status
 # Show metrics summary
 npx @juspay/neurolink obs metrics --detailed
 
-# List configured exporters
-npx @juspay/neurolink otel exporters
-
 # Show cost breakdown
 npx @juspay/neurolink observability costs --by-model
 ```
 
 **Subcommands:**
 
-| Subcommand  | Alias  | Description                             |
-| ----------- | ------ | --------------------------------------- |
-| `status`    |        | Show telemetry and observability status |
-| `metrics`   |        | Show metrics summary                    |
-| `exporters` | `exp`  | List configured exporters               |
-| `costs`     | `cost` | Show cost breakdown                     |
+| Subcommand | Alias  | Description                             |
+| ---------- | ------ | --------------------------------------- |
+| `status`   |        | Show telemetry and observability status |
+| `metrics`  |        | Show metrics summary                    |
+| `costs`    | `cost` | Show cost breakdown                     |
 
 **Shared flags (all subcommands):**
 
@@ -1577,17 +1573,11 @@ npx @juspay/neurolink observability costs --by-model
 
 ## telemetry \<subcommand\>
 
-Telemetry and exporter management. Alias: `tel`.
+Telemetry management. Alias: `tel`. Tracing is configured through `LANGFUSE_*` environment variables.
 
 ```bash
-# Show exporter status and health
+# Show telemetry status and health
 npx @juspay/neurolink telemetry status
-
-# Configure an exporter
-npx @juspay/neurolink tel configure --exporter langfuse --config '{"publicKey":"pk-...","secretKey":"sk-..."}'
-
-# List all available and configured exporters
-npx @juspay/neurolink telemetry list-exporters
 
 # Flush pending spans to exporters
 npx @juspay/neurolink telemetry flush
@@ -1598,13 +1588,11 @@ npx @juspay/neurolink telemetry stats --detailed
 
 **Subcommands:**
 
-| Subcommand       | Aliases      | Description                                 |
-| ---------------- | ------------ | ------------------------------------------- |
-| `status`         |              | Show exporter status and health             |
-| `configure`      |              | Configure an exporter with JSON settings    |
-| `list-exporters` | `list`, `ls` | List all available and configured exporters |
-| `flush`          |              | Flush all pending spans to exporters        |
-| `stats`          |              | Show token usage and cost statistics        |
+| Subcommand | Aliases | Description                          |
+| ---------- | ------- | ------------------------------------ |
+| `status`   |         | Show telemetry status and health     |
+| `flush`    |         | Flush all pending spans              |
+| `stats`    |         | Show token usage and cost statistics |
 
 **Shared flags (all subcommands):**
 
@@ -1612,13 +1600,6 @@ npx @juspay/neurolink telemetry stats --detailed
 | ---------- | ----- | ------- | ------- | -------------------------------------- |
 | `--format` | `-f`  | string  | `text`  | Output format: `text`, `json`, `table` |
 | `--quiet`  | `-q`  | boolean | `false` | Minimal output                         |
-
-**`configure` flags:**
-
-| Option       | Alias | Type   | Required | Description                                                                                                      |
-| ------------ | ----- | ------ | -------- | ---------------------------------------------------------------------------------------------------------------- |
-| `--exporter` | `-e`  | string | yes      | Exporter name: `langfuse`, `langsmith`, `otel`, `datadog`, `sentry`, `braintrust`, `arize`, `posthog`, `laminar` |
-| `--config`   | `-c`  | string | yes      | JSON configuration string                                                                                        |
 
 **`flush` flags:**
 

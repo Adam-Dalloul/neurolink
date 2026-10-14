@@ -288,7 +288,7 @@ await test("proxy spans count Codex cache and reasoning subsets exactly once", a
         "custom token buckets do not reconcile with the total",
       );
       assertEqual(
-        attrs["gen_ai.usage.input_tokens"],
+        attrs["proxy.usage.input_tokens"],
         index === 0 ? 100 : 160,
         "standard input attribute lost cache-inclusive semantics",
       );

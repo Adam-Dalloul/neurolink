@@ -255,7 +255,7 @@ export abstract class BaseProvider implements AIProvider {
   private streamHandler: StreamHandler;
   protected telemetryHandler: TelemetryHandler;
   private utilities: Utilities;
-  private readonly toolsManager: ToolsManager;
+  protected readonly toolsManager: ToolsManager;
 
   constructor(
     modelName?: string,
@@ -308,7 +308,7 @@ export abstract class BaseProvider implements AIProvider {
     this.modelName = model;
     trace
       .getSpan(context.active())
-      ?.setAttribute(ATTR.GEN_AI_MODEL, this.modelName);
+      ?.setAttribute(ATTR.NL_MODEL, this.modelName);
     this.messageBuilder = new MessageBuilder(this.providerName, this.modelName);
     this.streamHandler = new StreamHandler(this.providerName, this.modelName);
     this.telemetryHandler = new TelemetryHandler(
@@ -1995,30 +1995,20 @@ export abstract class BaseProvider implements AIProvider {
     // model that failed rather than the one that served.
     const attempt = async (): Promise<EnhancedGenerateResult | null> => {
       // OTEL span for provider-level generate tracing
-      // Use startActiveSpan pattern via context.with() so child spans become descendants
-      const otelSpan = tracers.provider.startSpan(
-        "neurolink.provider.generate",
-        {
-          kind: SpanKind.CLIENT,
-          attributes: {
-            [ATTR.GEN_AI_SYSTEM]: this.providerName || "unknown",
-            [ATTR.GEN_AI_MODEL]: this.modelName || options.model || "unknown",
-            [ATTR.GEN_AI_OPERATION]: "generate",
-            [ATTR.NL_PROVIDER]: this.providerName || "unknown",
-          },
+      const otelSpan = tracers.provider.startSpan("provider.generate", {
+        kind: SpanKind.CLIENT,
+        attributes: {
+          [ATTR.NL_MODEL]: this.modelName || options.model || "unknown",
+          [ATTR.NL_PROVIDER]: this.providerName || "unknown",
         },
-      );
-      // Set this span as the active context so child spans (provider calls, tool executions) become descendants
-      const activeCtx = trace.setSpan(context.active(), otelSpan);
+      });
       const otelSpanState = { ended: false };
 
-      return await context.with(activeCtx, async () =>
-        this.runGenerateInActiveContext(
-          options,
-          startTime,
-          otelSpan,
-          otelSpanState,
-        ),
+      return await this.runGenerateInActiveContext(
+        options,
+        startTime,
+        otelSpan,
+        otelSpanState,
       );
     };
 
@@ -2286,7 +2276,6 @@ export abstract class BaseProvider implements AIProvider {
         error,
         latency,
       };
-      this.telemetryHandler.recordTTSFailure(ttsProvider, error, latency);
       logger.error(
         `TTS synthesis failed in Mode 1 (direct input synthesis):`,
         ttsError,
@@ -2750,7 +2739,6 @@ export abstract class BaseProvider implements AIProvider {
     } catch (ttsError) {
       const latency = Date.now() - ttsStartTime;
       const error = this.getTTSErrorDetails(ttsError);
-      this.telemetryHandler.recordTTSFailure(ttsProvider, error, latency);
       logger.error(
         `TTS synthesis failed in Mode 2 (AI response synthesis):`,
         ttsError,

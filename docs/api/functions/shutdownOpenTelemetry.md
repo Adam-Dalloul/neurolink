@@ -8,13 +8,12 @@
 
 > **shutdownOpenTelemetry**(): `Promise`\<`void`\>
 
-Shutdown OpenTelemetry and Langfuse span processor
-
-Concurrent callers share one in-flight teardown, the same way concurrent
-initializers share one in-flight `initializeOpenTelemetry`: a second
-shutdown call joins the first instead of tearing down the same provider
-instances a second time.
-
 ## Returns
 
 `Promise`\<`void`\>
+
+Resolves when telemetry is flushed or shut down.
+
+## Description
+
+Terminally shuts down the providers NeuroLink owns once no `acquireTelemetry` holder remains; while holders remain it only flushes. Telemetry cannot be restarted in this process afterwards. A host provider is never shut down; with one, only NeuroLink's Langfuse exporter is shut down and unregistered.

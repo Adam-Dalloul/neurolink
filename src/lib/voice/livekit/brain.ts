@@ -80,7 +80,7 @@ export function createVoiceBrain(
       systemPrompt,
       temperature,
       maxTokens,
-      context,
+      context: { ...context, tags: ["voice"] },
       // Every turn through this brain is spoken; stored messages are marked so.
       modality: "voice",
       abortSignal: signal,

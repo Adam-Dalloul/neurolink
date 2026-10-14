@@ -43,10 +43,11 @@ export type WorkerLogEvent = {
  * Options for `NeuroLink.createWorkerInstance()`.
  *
  * A worker instance is a sub-agent-grade NeuroLink: conversation memory off,
- * orchestration off, observability inherited from the creating instance with
- * `autoDetectExternalProvider: true` + `skipLangfuseSpanProcessor: true`
- * (so worker spans join the host's tracer without duplicate Langfuse
- * exports), and an internal log bridge attached with a caller-supplied tag.
+ * orchestration off, observability config inherited from the creating
+ * instance, and an internal log bridge attached with a caller-supplied tag.
+ * Telemetry is shared through the process-wide tracer provider, which is
+ * auto-detected when the host registered its own, so worker spans join the
+ * host's traces without duplicate Langfuse exports.
  */
 export type WorkerInstanceOptions = {
   /** Tag stamped on every forwarded log event (default "worker"). */

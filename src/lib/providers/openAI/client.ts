@@ -1,4 +1,3 @@
-import { SpanKind, SpanStatusCode, trace } from "@opentelemetry/api";
 import type { AIProviderName } from "../../constants/enums.js";
 import { AIProviderName as AIProviderNameEnum } from "../../constants/enums.js";
 import { createProxyFetch } from "../../proxy/proxyFetch.js";
@@ -6,7 +5,6 @@ import type {
   EmbedInput,
   EnhancedGenerateResult,
   NeurolinkCredentials,
-  OpenAICompatStreamLifecycleListeners,
   ProviderErrorRule,
   TextGenerationOptions,
   UnknownRecord,
@@ -19,7 +17,6 @@ import {
 } from "../../types/index.js";
 import { logger } from "../../utils/logger.js";
 import { redactUrlCredentials } from "../../utils/logSanitize.js";
-import { calculateCost } from "../../utils/pricing.js";
 import {
   classifyProviderError,
   DEFAULT_ERROR_RULES,
@@ -80,15 +77,12 @@ const getOpenAIApiKey = (): string => validateApiKey(createOpenAIConfig());
 const getOpenAIModel = (): string =>
   getProviderModel("OPENAI_MODEL", "gpt-5.4");
 
-const streamTracer = trace.getTracer("neurolink.provider.openai");
-
 /**
  * OpenAI Provider — direct HTTP, no AI SDK.
  *
  * OpenAI chat completions at api.openai.com/v1. All request / stream /
  * tool-loop orchestration lives in `OpenAIChatCompletionsProvider`; this
  * class adds:
- *   - OTel span wrap with cost (`onStreamStart`)
  *   - Native `/v1/embeddings` (`embed` / `embedMany`)
  *   - Image generation via `/v1/images/generations` (`executeImageGeneration`)
  *   - OpenAI-specific error mapping (`formatProviderError`)
@@ -210,75 +204,6 @@ export class OpenAIProvider extends OpenAIChatCompletionsProvider {
       this.providerName,
       this.modelName,
     );
-  }
-
-  // ===========================================================================
-  // Optional hook overrides
-  // ===========================================================================
-
-  /**
-   * Wrap the stream in an OTel span to capture provider-level latency,
-   * token usage, finish reason, and cost. Mirrors the pre-migration
-   * `streamText`-span behaviour.
-   */
-  protected onStreamStart(
-    modelId: string,
-  ): OpenAICompatStreamLifecycleListeners | undefined {
-    const span = streamTracer.startSpan("neurolink.provider.streamText", {
-      kind: SpanKind.CLIENT,
-      attributes: {
-        "gen_ai.system": "openai",
-        "gen_ai.request.model": modelId,
-      },
-    });
-    let spanEnded = false;
-    const endSpan = () => {
-      if (!spanEnded) {
-        spanEnded = true;
-        span.end();
-      }
-    };
-    return {
-      onUsage: (usage) => {
-        // promptTokens is the uncached remainder — the attribute reports the
-        // full prompt (uncached + cache read/creation), and the cache fields
-        // let calculateCost price tiers.
-        span.setAttribute(
-          "gen_ai.usage.input_tokens",
-          usage.promptTokens +
-            (usage.cacheReadTokens ?? 0) +
-            (usage.cacheCreationTokens ?? 0),
-        );
-        span.setAttribute("gen_ai.usage.output_tokens", usage.completionTokens);
-        const cost = calculateCost(this.providerName, modelId, {
-          input: usage.promptTokens,
-          output: usage.completionTokens,
-          total: usage.totalTokens,
-          ...(usage.cacheReadTokens
-            ? { cacheReadTokens: usage.cacheReadTokens }
-            : {}),
-          ...(usage.cacheCreationTokens
-            ? { cacheCreationTokens: usage.cacheCreationTokens }
-            : {}),
-        });
-        if (cost && cost > 0) {
-          span.setAttribute("neurolink.cost", cost);
-        }
-      },
-      onFinish: (reason, capturedError) => {
-        span.setAttribute("gen_ai.response.finish_reason", reason || "unknown");
-        if (reason === "error") {
-          span.setStatus({
-            code: SpanStatusCode.ERROR,
-            message:
-              capturedError instanceof Error
-                ? capturedError.message
-                : String(capturedError ?? "stream error"),
-          });
-        }
-        endSpan();
-      },
-    };
   }
 
   // ===========================================================================

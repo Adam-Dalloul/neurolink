@@ -36,7 +36,7 @@ All four:
 - Extend `BaseProvider`
 - Use `createOpenAI(...).chat()` for /v1/chat/completions endpoint (NOT /v1/responses)
 - Wrap `streamText` with `withClientStreamSpan` for OTEL tracing (NOT `withClientSpan` — that ends the span when the callback returns, before the iterable is consumed; for streaming use the `*StreamSpan` variant that wraps the returned iterable)
-- Emit `neurolink.provider.stream` span with proper `gen_ai.*` attrs
+- Emit `provider.stream` span with proper `gen_ai.*` attrs
 - Use `makeLoggingFetch` to capture upstream non-2xx response bodies
 - Implement all 5 `BaseProvider` abstract methods (executeStream, getProviderName, getDefaultModel, getAISDKModel, formatProviderError)
 
@@ -129,7 +129,7 @@ docs/provider-integration/
 feat(providers): integrate DeepSeek, NVIDIA NIM, LM Studio, llama.cpp
 
 - Add 4 OpenAI-compatible providers via Vercel AI SDK's createOpenAI().chat()
-- Each provider extends BaseProvider, emits neurolink.provider.stream OTEL spans,
+- Each provider extends BaseProvider, emits provider.stream OTEL spans,
   and ships with proper error formatting + validateConfiguration
 - Pricing: add _default sentinel as provider-level fallback + symbolic local rates
 - Tests: fix maxTokens fallback that defaulted unknown providers to context-overflow

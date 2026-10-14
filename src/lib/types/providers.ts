@@ -2894,3 +2894,17 @@ export type VertexAnthropicContentBlock =
       input: Record<string, unknown>;
     }
   | { type: "tool_result"; tool_use_id: string; content: string };
+
+/** Content block as seen by the trace sanitizer; media blocks carry a `source`. */
+export type AnthropicTraceBlock = {
+  type: string;
+  source?:
+    | string
+    | { type?: string; media_type?: string; data?: string; url?: string };
+};
+
+/** Anthropic message shape accepted by the trace sanitizer. */
+export type AnthropicTraceMessage = {
+  role: string;
+  content: string | AnthropicTraceBlock[];
+};

@@ -19,6 +19,7 @@
  * different, unrelated feature — scoring a generated response with RAGAS.
  */
 
+import type { NeurolinkTraceContext } from "./observability.js";
 import type { NeurolinkCredentials } from "./providers.js";
 
 /**
@@ -367,6 +368,8 @@ export type DecisionOptions = DecisionRequest & {
   provider?: string;
   /** Per-call credential overrides, as `generate()` takes. */
   credentials?: NeurolinkCredentials;
+  /** Per-call trace attributes (user, session, tags, trace name, metadata) for this decision's spans. */
+  context?: NeurolinkTraceContext;
 };
 
 /**

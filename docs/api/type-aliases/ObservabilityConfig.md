@@ -8,20 +8,14 @@
 
 > **ObservabilityConfig** = `object`
 
-Complete observability configuration for Neurolink SDK
+## Description
+
+Observability configuration for the NeuroLink SDK. Langfuse turns on automatically when `LANGFUSE_PUBLIC_KEY` and `LANGFUSE_SECRET_KEY` are set; `false` turns it off.
 
 ## Properties
 
 ### langfuse?
 
-> `optional` **langfuse?**: [`LangfuseConfig`](LangfuseConfig.md)
+> `optional` **langfuse?**: `boolean` \| [`NeurolinkLangfuseConfig`](NeurolinkLangfuseConfig.md)
 
-Langfuse configuration
-
----
-
-### openTelemetry?
-
-> `optional` **openTelemetry?**: [`OpenTelemetryConfig`](OpenTelemetryConfig.md)
-
-OpenTelemetry configuration
+`false` disables Langfuse, `true` or an options object enables it.

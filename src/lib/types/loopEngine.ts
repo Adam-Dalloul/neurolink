@@ -2,6 +2,8 @@ import type Anthropic from "@anthropic-ai/sdk";
 import type { Span } from "@opentelemetry/api";
 import type { Tool } from "./tools.js";
 import type { GenerateStopReason } from "./generate.js";
+import type { UnknownRecord } from "./common.js";
+import type { GenerationRecord } from "./observability.js";
 import type {
   CollectedChunkResult,
   NativeFunctionCall,
@@ -61,6 +63,8 @@ export type AgenticLoopStepResult<TRaw = unknown> = {
   usage: AgenticLoopUsage;
   /** Provider's own raw stop/finish-reason string, e.g. "tool_use", "MAX_TOKENS" */
   rawStopReason: string | undefined;
+  /** Model the response says served it, when the API reports one. */
+  model?: string;
   /** Adapter-private accumulated response data needed by buildToolResultMessages
    *  (e.g. Anthropic's ordered content blocks, Gemini's rawResponseParts). */
   raw: TRaw;
@@ -74,6 +78,8 @@ export type AgenticLoopToolCallResult = AgenticLoopToolCall & {
 
 export type AgenticLoopStepRequest = {
   raw: unknown;
+  /** The request half of this step's generation observation. */
+  generation?: GenerationRecord;
   /**
    * Tools that became callable while this step's request was being built —
    * mid-turn discovery hydrating a name the model had already tried.
@@ -311,6 +317,8 @@ export type AnthropicLoopAdapterConfig<
   client: {
     messages: Pick<Anthropic["messages"], "create">;
   };
+  /** Provider name recorded on each step's generation and used to price it. */
+  provider: string;
   maxSteps: number;
   /**
    * Build one step's request. A closure so the per-turn work the caller
@@ -418,14 +426,6 @@ export type AnthropicLoopAdapterConfig<
  * it, so this cannot quietly give a provider behaviour its hand-rolled loops
  * never had.
  */
-/** One model-requested tool call, as recorded on the tool's observability span. */
-export type ToolSpanCall = {
-  /** Arguments the model passed to the tool. */
-  args?: Record<string, unknown>;
-  /** The model's id for this call, shared with the tool_use block that requested it. */
-  toolCallId?: string;
-};
-
 export type ToolExecutionGuards = {
   /**
    * Upper bound on a single execute(). Omit, or pass `null`, for no bound.
@@ -447,29 +447,6 @@ export type ToolExecutionGuards = {
    * legitimately slow tool reads as a stalled turn without this.
    */
   onProgress?: () => void;
-  /**
-   * Wrap one tool call in the provider's own observability.
-   *
-   * A function rather than a pair of start/end callbacks, because the caller
-   * needs the execution to happen INSIDE its span's context — spans opened by
-   * the tool itself must nest under the tool call, not dangle as siblings of
-   * the turn. Handing over the whole invocation is the only shape that lets a
-   * caller do `context.with(span, run)`.
-   *
-   * The caller awaits `run()` itself, so it sees the settled result and can
-   * mark a FAILURE THAT WAS RETURNED rather than thrown: MCP tools report
-   * errors in their payload, and an observation that only watches for
-   * exceptions records those calls as successful.
-   *
-   * `call` carries the arguments the model passed and the model's id for the
-   * call, so the observation can show what was asked and be paired with the
-   * request that asked it.
-   */
-  withToolSpan?: <T>(
-    name: string,
-    run: () => Promise<T>,
-    call?: ToolSpanCall,
-  ) => Promise<T>;
 };
 
 /**
@@ -486,6 +463,13 @@ export type GeminiStepRaw = {
   stepFunctionCalls: NativeFunctionCall[];
 };
 
+/** One Gemini step's request: the model, the conversation and the generation config. */
+export type GeminiStepRequest = {
+  model: string;
+  contents: GeminiTurnContent[];
+  config?: UnknownRecord;
+};
+
 /** One turn entry in a Gemini conversation: a role plus its content parts. */
 export type GeminiTurnContent = {
   role: string;
@@ -500,9 +484,14 @@ export type GeminiTurnContent = {
 export type GeminiLoopAdapterCoreConfig = {
   /** Used in log lines and generated tool-call ids. */
   providerLabel: string;
+  /** Provider name recorded on each step's generation and used to price it. */
+  provider: string;
   maxSteps: number;
   /** Build one step's request object (model, contents, config). */
-  buildRequest: (conversation: GeminiTurnContent[], step: number) => unknown;
+  buildRequest: (
+    conversation: GeminiTurnContent[],
+    step: number,
+  ) => GeminiStepRequest;
   /** Issue the request. Kept injectable so each provider keeps its own client. */
   sendStep: (
     request: unknown,
@@ -646,7 +635,7 @@ export type AgenticLoopOptions = {
   /**
    * Span the per-step provider retry annotates, via
    * `withProviderRetry(..., span, ...)` — it records
-   * `gen_ai.provider.total_attempts` on every completed step, retried or not.
+   * `provider.total_attempts` on every completed step, retried or not.
    *
    * Caller-supplied rather than read from the ambient context inside the
    * engine. Reading it here would hand the attribute to every provider on the

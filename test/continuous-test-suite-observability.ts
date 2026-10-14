@@ -1,4055 +1,2371 @@
 #!/usr/bin/env tsx
-import "dotenv/config";
 /**
  * Continuous Test Suite: Observability
  *
- * Tests OpenTelemetry instrumentation, context management, span processors,
- * external TracerProvider mode, and operation name detection.
+ * Drives the public `NeuroLink` surface against local fake upstreams (an
+ * OpenAI-compatible chat-completions server, an Anthropic Messages endpoint, a
+ * Laya decision endpoint and a Langfuse OTLP receiver) and reads the spans a
+ * real `LangfuseSpanProcessor` exports, which is what Langfuse would receive
+ * from a host provider, and the OTLP JSON requests NeuroLink's own exporter
+ * pipeline posts when it owns the provider.
+ * The host registers its own TracerProvider before `dist` loads, so NeuroLink
+ * takes the external-provider path; the owned-provider path runs in child
+ * processes because a global provider can be registered once.
  *
- * ALL tests run locally using InMemorySpanExporter — no Langfuse credentials needed.
+ * No keys and no live calls are needed.
  *
- * Determinism exception: the OTLP readiness case imports the built
- * instrumentation module and, through a Node loader hook, counts
- * LoggerProvider construction and can force tracer registration to fail,
- * rather than relying on exporter timers. That proves concurrent initializers
- * share one construction, that NeuroLink shutdown cannot race a still-running
- * initialization, and that a flush racing a failed initialization skips.
- * The buffered-metric case below uses the same exception for the same
- * reason: it imports `dist/telemetry/telemetryService.js` directly (not the
- * `dist/index.js` barrel) to reach `TelemetryService.getInstance()` and its
- * runtime-accessible `pendingCalls`/`isReady`/`readyPromise` fields, and it
- * patches `@opentelemetry/api`'s NoopMeter source (no live OTLP collector is
- * needed — nothing here registers a global MeterProvider, so `.createCounter()`
- * returns the shared no-op counter) to count `Counter.add()` invocations
- * instead of standing up a real exporter.
- * The proxy OTel-logs-bridge case further below uses the same exception
- * again: it imports `dist/proxy/otelLogSink.js` directly and, through a
- * load hook, proves endpoint validation throws synchronously before the
- * heavy OTel SDK packages (loaded via `require()` on first actual use, not
- * a top-level import) ever load. Construction itself stays fully
- * synchronous — there is no async gap to race, so no buffering or
- * shutdown-ordering case is needed here.
- *
- * Run: npx tsx test/continuous-test-suite-observability.ts --provider=vertex
+ * Run: pnpm run test:observability
  */
-
-import { spawn } from "child_process";
-import * as fs from "fs";
-import * as os from "os";
-import * as path from "path";
-import { fileURLToPath } from "url";
-
-const __filename = fileURLToPath(import.meta.url);
-const __dirname = path.dirname(__filename);
-const REPO_ROOT = path.resolve(__dirname, "..");
-
-import { SpanStatusCode, trace } from "@opentelemetry/api";
-import type { ReadableSpan } from "@opentelemetry/sdk-trace-base";
-// ============================================================
-// OTEL BOOTSTRAP — must register BEFORE importing NeuroLink
-// ============================================================
+import "./helpers/credentialFreeEnv.js";
+import {
+  createServer,
+  type IncomingMessage,
+  type Server,
+  type ServerResponse,
+} from "node:http";
+import { writeFileSync } from "node:fs";
+import { join } from "node:path";
+import { pathToFileURL } from "node:url";
+import { z } from "zod";
+import { LangfuseSpanProcessor } from "@langfuse/otel";
 import {
   InMemorySpanExporter,
   SimpleSpanProcessor,
+  type ReadableSpan,
 } from "@opentelemetry/sdk-trace-base";
 import { NodeTracerProvider } from "@opentelemetry/sdk-trace-node";
 import {
-  createContextEnricher,
-  langfuseShouldExportSpan,
-} from "../dist/services/server/ai/observability/instrumentation.js";
-
-const spanExporter = new InMemorySpanExporter();
-const contextEnricher = createContextEnricher();
-const traceProvider = new NodeTracerProvider({
-  spanProcessors: [
-    contextEnricher as unknown as SimpleSpanProcessor,
-    new SimpleSpanProcessor(spanExporter),
-  ],
-});
-traceProvider.register();
-
-// Now import NeuroLink (tracers will pick up the registered provider)
-const {
-  NeuroLink,
-  setLangfuseContext,
-  getLangfuseContext,
-  getSpanProcessors,
-  getTracer,
-  isUsingExternalTracerProvider,
-} = await import("../dist/index.js");
-// Telemetry-gaps merger imports — re-uses existing ReadableSpan/SpanStatusCode
-// imports already declared at the top of this file. Adds context() alias for
-// the 6 reproduceIssue_* functions absorbed from telemetry-gaps.ts.
-import { context as otelContext, trace as otelTrace } from "@opentelemetry/api";
-const telemetryTracer = otelTrace.getTracer("telemetry-gaps-test");
-const tracer = telemetryTracer;
-
-// ============================================================
-// CONFIGURATION
-// ============================================================
-
-const PROVIDER_MAX_TOKENS: Record<string, number> = {
-  anthropic: 8192,
-  vertex: 10000,
-  "google-ai-studio": 10000,
-  "google-ai": 10000,
-  openai: 16384,
-  bedrock: 8192,
-  ollama: 4096,
-  openrouter: 4096,
-  // OpenAI-compat providers added 2026
-  deepseek: 4096,
-  "nvidia-nim": 8192,
-  "lm-studio": 1024,
-  llamacpp: 1024,
-};
-
-// Guard against malformed TEST_TIMEOUT_MS — a NaN here makes setTimeout fire
-// immediately and breaks every subprocess test.
-const parsedTimeoutMs = Number.parseInt(process.env.TEST_TIMEOUT_MS ?? "", 10);
-const TEST_CONFIG = {
-  provider: process.env.TEST_PROVIDER || "vertex",
-  model: process.env.TEST_MODEL || (undefined as string | undefined),
-  maxTokens: undefined as number | undefined,
-  timeout:
-    Number.isFinite(parsedTimeoutMs) && parsedTimeoutMs > 0
-      ? parsedTimeoutMs
-      : 90000,
-  interTestDelay: 2000,
-};
-
-// Dummy Langfuse credentials for config (never reach cloud — InMemorySpanExporter captures everything)
-const DUMMY_LANGFUSE = {
-  publicKey: "test-public-key",
-  secretKey: "test-secret-key",
-  baseUrl: "http://localhost:9999", // unreachable, but that's fine
-};
-
-// ============================================================
-// LOGGING — provided by shared harness
-// ============================================================
-
-import {
+  assert,
+  assertEqual,
   defineSuite,
-  log,
-  logSection,
-  type ColorName,
-  withCaseTimeout,
-  isCaseTimeout,
+  runCommand,
+  tempDir,
 } from "./helpers/harness.js";
-
 import { assertDistFresh } from "./helpers/distFreshness.js";
+import type { GenerateOptions } from "../dist/index.js";
 
-// Fail loudly rather than silently testing a stale build (see distFreshness.ts).
 assertDistFresh();
 
-const { recordTest, runSuite } = defineSuite("Observability");
+type Json =
+  | string
+  | number
+  | boolean
+  | null
+  | undefined
+  | Json[]
+  | { [key: string]: Json };
+type JsonBody = { [key: string]: Json };
+type RequestExtra = Record<
+  string,
+  object | string | number | boolean | undefined
+>;
 
-// Legacy logTest shim — print-only, like the original. The counters are
-// driven by the runner loop via recordTest at the bottom, not by these
-// in-test status prints.
-function logTest(
-  testName: string,
-  status: "PASS" | "FAIL" | "SKIP" | "TESTING",
-  details?: string,
-): void {
-  const color: ColorName =
-    status === "PASS"
-      ? "green"
-      : status === "FAIL"
-        ? "red"
-        : status === "SKIP"
-          ? "yellow"
-          : "blue";
-  const det = details ? ` — ${details}` : "";
-  log(`[${status}] ${testName}${det}`, color);
-}
-void log; // keep available for ad-hoc test logging
-void ({} as ColorName | undefined);
+process.env.LANGFUSE_PUBLIC_KEY = "pk-test";
+process.env.LANGFUSE_SECRET_KEY = "sk-test";
+process.env.LANGFUSE_TRACING_ENVIRONMENT = "test-env";
+process.env.LANGFUSE_RELEASE = "test-release";
+process.env.NEUROLINK_SKIP_MCP = "true";
 
-function section(title: string): void {
-  logSection(title);
-}
+const langfuseSpans = new InMemorySpanExporter();
+const allSpans = new InMemorySpanExporter();
+const hostProvider = new NodeTracerProvider({
+  spanProcessors: [
+    new LangfuseSpanProcessor({
+      exporter: langfuseSpans,
+      exportMode: "immediate",
+    }),
+    new SimpleSpanProcessor(allSpans),
+  ],
+});
+hostProvider.register();
 
-// ============================================================
-// HELPERS
-// ============================================================
+const {
+  AIProviderFactory,
+  NeuroLink,
+  getLangfuseHealthStatus,
+  jsonSchema,
+  setLangfuseContext,
+} = await import("../dist/index.js");
 
-type GenerateOptions = Parameters<
-  InstanceType<typeof NeuroLink>["generate"]
->[0];
+const { test, section, runSuite } = defineSuite("Observability", {
+  offline: true,
+  perTestTimeoutMs: 60_000,
+});
 
-function buildGenerateOptions(
-  extraOpts: Record<string, unknown> = {},
-): GenerateOptions {
-  const opts: Record<string, unknown> = {
-    input: { text: 'Say "hello" and nothing else' },
-    provider: TEST_CONFIG.provider,
-    maxTokens: 50,
-    disableTools: true,
-    ...extraOpts,
-  };
-  if (TEST_CONFIG.model) {
-    opts.model = TEST_CONFIG.model;
-  }
-  return opts as GenerateOptions;
-}
-
-function getFinishedSpans(): ReadableSpan[] {
-  return spanExporter.getFinishedSpans();
-}
-
-function findSpan(name: string): ReadableSpan | undefined {
-  return spanExporter.getFinishedSpans().find((s) => s.name === name);
-}
-
-function getAttr(span: ReadableSpan, key: string): unknown {
-  return span.attributes[key];
-}
-
-function resetSpans(): void {
-  spanExporter.reset();
-}
-
-function isExpectedProviderError(msg: string): boolean {
-  const lower = msg.toLowerCase();
-  if (
-    [
-      "api key",
-      "authentication",
-      "rate limit",
-      "quota",
-      "credentials",
-      "could not be resolved",
-      "cannot connect",
-      "failed to generate",
-      "google_application_credentials",
-      "exceeded your current quota",
-      "insufficient_quota",
-    ].some((p) => lower.includes(p))
-  ) {
-    return true;
-  }
-  // OpenAI streaming-with-tools wrapper that NeuroLink emits when the
-  // upstream chat-completion stream errors out (typically quota/billing/
-  // policy). Matches the wrapper shape, not just "OpenAI" alone.
-  if (
-    /OpenAI\s+streaming\s+error\s+with\s+tools[^.]*?(?:API\s+error|tools\s+are\s+enabled)/i.test(
-      msg,
-    )
-  ) {
-    return true;
-  }
-  return false;
-}
-
-function createSDK(): InstanceType<typeof NeuroLink> {
-  return new NeuroLink();
-}
-
-type ProcessResult = {
-  success: boolean;
-  code: number;
-  stdout: string;
-  stderr: string;
+const USER = "user-1";
+const SESSION = "session-1";
+const TAG = "tag-1";
+const context = {
+  userId: USER,
+  sessionId: SESSION,
+  tags: [TAG],
+  metadata: { feature: "obs" },
 };
 
-function runCommand(
-  command: string,
-  args: string[],
-  options?: Record<string, unknown>,
-): Promise<ProcessResult> {
-  return new Promise((resolve, reject) => {
-    const proc = spawn(command, args, {
-      env: {
-        ...process.env,
-        ...((options?.env as Record<string, string>) || {}),
-      },
-    });
-    let stdout = "",
-      stderr = "";
-    proc.stdout.on("data", (d) => {
-      stdout += d.toString();
-    });
-    proc.stderr.on("data", (d) => {
-      stderr += d.toString();
-    });
-    const timeoutId = setTimeout(() => {
-      proc.kill("SIGTERM");
-      setTimeout(() => {
-        if (!proc.killed) {
-          proc.kill("SIGKILL");
-        }
-      }, 2000);
-      reject(new Error(`Command timeout after ${TEST_CONFIG.timeout}ms`));
-    }, TEST_CONFIG.timeout);
-    proc.on("close", (code) => {
-      clearTimeout(timeoutId);
-      resolve({
-        success: code === 0,
-        code: code ?? -1,
-        stdout,
-        stderr,
-      });
-    });
-    proc.on("error", (err) => {
-      clearTimeout(timeoutId);
-      reject(err);
+type Behavior = "text" | "tool" | "length" | "reject" | "hold";
+
+function behaviorOf(model: string): Behavior {
+  switch (model) {
+    case "tool-model":
+      return "tool";
+    case "length-model":
+      return "length";
+    case "reject-model":
+      return "reject";
+    case "hold-model":
+      return "hold";
+    default:
+      return "text";
+  }
+}
+
+function readBody(req: IncomingMessage): Promise<JsonBody> {
+  return new Promise((resolve) => {
+    const chunks: Buffer[] = [];
+    req.on("data", (chunk: Buffer) => chunks.push(chunk));
+    req.on("end", () => {
+      try {
+        resolve(JSON.parse(Buffer.concat(chunks).toString("utf8") || "{}"));
+      } catch {
+        resolve({});
+      }
     });
   });
 }
 
-// ============================================================
-// TEST #1: Telemetry Service Init
-// ============================================================
-
-async function testTelemetryServiceInit(): Promise<boolean | null> {
-  logSection("Test #1: Telemetry Service Init");
-  logTest("Telemetry Service Init", "TESTING");
-  resetSpans();
-
-  try {
-    // Initialize NeuroLink with observability config — should not throw
-    const sdk = new NeuroLink({
-      observability: {
-        langfuse: {
-          enabled: true,
-          publicKey: DUMMY_LANGFUSE.publicKey,
-          secretKey: DUMMY_LANGFUSE.secretKey,
-          baseUrl: DUMMY_LANGFUSE.baseUrl,
-          useExternalTracerProvider: true,
-          environment: "test",
-          release: "continuous-test-suite",
-        },
-      },
-    });
-
-    if (!sdk) {
-      logTest("Telemetry Service Init", "FAIL", "SDK returned null");
-      return false;
-    }
-
-    // Verify isUsingExternalTracerProvider returns true after init with external provider
-    let externalModeVerified = false;
-    if (typeof isUsingExternalTracerProvider === "function") {
-      const isExternal = isUsingExternalTracerProvider();
-      if (isExternal === true) {
-        externalModeVerified = true;
-        log(
-          "  [detail] isUsingExternalTracerProvider() === true (verified)",
-          "green",
-        );
-      } else {
-        log(
-          `  [detail] isUsingExternalTracerProvider() === ${isExternal} (expected true)`,
-          "yellow",
-        );
-      }
-    } else {
-      log(
-        "  [detail] isUsingExternalTracerProvider not available as function",
-        "yellow",
-      );
-    }
-
-    logTest(
-      "Telemetry Service Init",
-      "PASS",
-      `NeuroLink initialized with observability config. externalMode=${externalModeVerified}`,
-    );
-    try {
-      await sdk.shutdown?.();
-    } catch {
-      /* ignore */
-    }
-    return true;
-  } catch (error) {
-    const msg = error instanceof Error ? error.message : String(error);
-    logTest("Telemetry Service Init", "FAIL", msg);
-    return false;
-  }
-}
-
-// ============================================================
-// TEST #2: External TracerProvider Mode
-// ============================================================
-
-async function testExternalTracerProviderMode(): Promise<boolean | null> {
-  logSection("Test #2: External TracerProvider Mode");
-  logTest("External TracerProvider Mode", "TESTING");
-  resetSpans();
-
-  try {
-    const sdk = new NeuroLink({
-      observability: {
-        langfuse: {
-          enabled: true,
-          publicKey: DUMMY_LANGFUSE.publicKey,
-          secretKey: DUMMY_LANGFUSE.secretKey,
-          baseUrl: DUMMY_LANGFUSE.baseUrl,
-          useExternalTracerProvider: true,
-        },
-      },
-    });
-
-    // Generate should work without "duplicate registration" error
-    const result = await sdk.generate(buildGenerateOptions());
-
-    if (!result?.content || result.content.length === 0) {
-      logTest("External TracerProvider Mode", "FAIL", "No content in response");
-      return false;
-    }
-
-    // Verify spans were captured locally
-    const spans = getFinishedSpans();
-
-    if (spans.length === 0) {
-      logTest(
-        "External TracerProvider Mode",
-        "FAIL",
-        "generate() succeeded but no spans were captured by InMemorySpanExporter",
-      );
-      try {
-        await sdk.shutdown?.();
-      } catch {
-        /* ignore */
-      }
-      return false;
-    }
-
-    // Assert at least one span has name starting with "neurolink." or "ai."
-    const relevantSpans = spans.filter(
-      (s) => s.name.startsWith("neurolink.") || s.name.startsWith("ai."),
-    );
-    const spanNames = spans.map((s) => s.name);
-
-    if (relevantSpans.length > 0) {
-      log(
-        `  [detail] Found ${relevantSpans.length} neurolink/ai spans: [${relevantSpans
-          .map((s) => s.name)
-          .slice(0, 5)
-          .join(", ")}]`,
-        "green",
-      );
-    } else {
-      log(
-        `  [detail] No neurolink.*/ai.* spans found, but ${spans.length} spans captured: [${spanNames.slice(0, 5).join(", ")}]`,
-        "yellow",
-      );
-    }
-
-    logTest(
-      "External TracerProvider Mode",
-      "PASS",
-      `No duplicate registration error. ${spans.length} spans captured (${relevantSpans.length} neurolink/ai). Content: ${result.content.substring(0, 40)}`,
-    );
-    try {
-      await sdk.shutdown?.();
-    } catch {
-      /* ignore */
-    }
-    return true;
-  } catch (error) {
-    const msg = error instanceof Error ? error.message : String(error);
-    if (isExpectedProviderError(msg)) {
-      logTest(
-        "External TracerProvider Mode",
-        "SKIP",
-        "Provider credentials not configured",
-      );
-      return null;
-    }
-    logTest("External TracerProvider Mode", "FAIL", msg);
-    return false;
-  }
-}
-
-// ============================================================
-// TEST #3: getSpanProcessors
-// ============================================================
-
-async function testGetSpanProcessors(): Promise<boolean | null> {
-  logSection("Test #3: getSpanProcessors");
-  logTest("getSpanProcessors", "TESTING");
-  resetSpans();
-
-  try {
-    // Initialize SDK to ensure processors are created
-    const sdk = new NeuroLink({
-      observability: {
-        langfuse: {
-          enabled: true,
-          publicKey: DUMMY_LANGFUSE.publicKey,
-          secretKey: DUMMY_LANGFUSE.secretKey,
-          baseUrl: DUMMY_LANGFUSE.baseUrl,
-          useExternalTracerProvider: true,
-        },
-      },
-    });
-
-    await new Promise((r) => setTimeout(r, 500));
-
-    const processors = getSpanProcessors();
-
-    if (!Array.isArray(processors)) {
-      logTest(
-        "getSpanProcessors",
-        "FAIL",
-        `Expected array, got ${typeof processors}`,
-      );
-      return false;
-    }
-
-    // Assert at least 1 processor returned
-    if (processors.length < 1) {
-      logTest(
-        "getSpanProcessors",
-        "FAIL",
-        `Expected >= 1 processor, got ${processors.length}`,
-      );
-      return false;
-    }
-
-    // Verify processors are actual span processor objects with onStart/onEnd
-    let allValid = true;
-    for (let i = 0; i < processors.length; i++) {
-      const proc = processors[i];
-      const hasOnStart = typeof proc.onStart === "function";
-      const hasOnEnd = typeof proc.onEnd === "function";
-      if (!hasOnStart || !hasOnEnd) {
-        log(
-          `  [detail] Processor[${i}] missing: onStart=${hasOnStart}, onEnd=${hasOnEnd}`,
-          "red",
-        );
-        allValid = false;
-      }
-    }
-
-    if (!allValid) {
-      logTest(
-        "getSpanProcessors",
-        "FAIL",
-        "Processors missing onStart/onEnd methods",
-      );
-      return false;
-    }
-
-    logTest(
-      "getSpanProcessors",
-      "PASS",
-      `Returned ${processors.length} valid processor(s) with onStart/onEnd`,
-    );
-    try {
-      await sdk.shutdown?.();
-    } catch {
-      /* ignore */
-    }
-    return true;
-  } catch (error) {
-    const msg = error instanceof Error ? error.message : String(error);
-    logTest("getSpanProcessors", "FAIL", msg);
-    return false;
-  }
-}
-
-// ============================================================
-// TEST #4: setLangfuseContext / getLangfuseContext roundtrip
-// ============================================================
-
-async function testSetLangfuseContext(): Promise<boolean | null> {
-  logSection("Test #4: setLangfuseContext / getLangfuseContext");
-  logTest("setLangfuseContext", "TESTING");
-  resetSpans();
-
-  try {
-    const testUserId = "test-user-" + Date.now();
-    const testSessionId = "test-session-" + Date.now();
-
-    // Test roundtrip: set context, get context inside callback, verify values match
-    const roundtripResult = await setLangfuseContext(
-      {
-        userId: testUserId,
-        sessionId: testSessionId,
-      },
-      async () => {
-        const context = getLangfuseContext();
-        return {
-          userId: context?.userId,
-          sessionId: context?.sessionId,
-        };
-      },
-    );
-
-    if (
-      roundtripResult?.userId === testUserId &&
-      roundtripResult?.sessionId === testSessionId
-    ) {
-      logTest(
-        "setLangfuseContext",
-        "PASS",
-        `Context roundtrip matches inside callback. userId=${testUserId}, sessionId=${testSessionId}`,
-      );
-      return true;
-    } else {
-      logTest(
-        "setLangfuseContext",
-        "FAIL",
-        `Context mismatch in callback roundtrip. Got userId=${roundtripResult?.userId}, sessionId=${roundtripResult?.sessionId}`,
-      );
-      return false;
-    }
-  } catch (error) {
-    const msg = error instanceof Error ? error.message : String(error);
-    logTest("setLangfuseContext", "FAIL", msg);
-    return false;
-  }
-}
-
-// ============================================================
-// TEST #5: setLangfuseContext with Callback + generate()
-// ============================================================
-
-async function testSetLangfuseContextWithCallback(): Promise<boolean | null> {
-  logSection("Test #5: setLangfuseContext with Callback + generate()");
-  logTest("Context Callback + Generate", "TESTING");
-  resetSpans();
-
-  try {
-    const sdk = new NeuroLink({
-      observability: {
-        langfuse: {
-          enabled: true,
-          publicKey: DUMMY_LANGFUSE.publicKey,
-          secretKey: DUMMY_LANGFUSE.secretKey,
-          baseUrl: DUMMY_LANGFUSE.baseUrl,
-          useExternalTracerProvider: true,
-        },
-      },
-    });
-
-    const testUserId = "test-callback-user";
-
-    const result = await setLangfuseContext(
-      {
-        userId: testUserId,
-        sessionId: "test-callback-session",
-        conversationId: "test-conv-123",
-        requestId: "test-req-abc",
-        traceName: "callback-test",
-      },
-      async () => {
-        return await sdk.generate(
-          buildGenerateOptions({
-            input: { text: 'Say "callback" and nothing else' },
-          }),
-        );
-      },
-    );
-
-    if (!result?.content || result.content.length === 0) {
-      logTest(
-        "Context Callback + Generate",
-        "FAIL",
-        "No content returned from callback",
-      );
-      return false;
-    }
-
-    // Get spans and verify context appears as attributes
-    const spans = getFinishedSpans();
-    log(`  [detail] ${spans.length} spans captured after generate()`, "cyan");
-
-    // Look for user.id attribute on any span
-    const spanWithUserId = spans.find(
-      (s) => s.attributes["user.id"] === testUserId,
-    );
-
-    if (spanWithUserId) {
-      log(
-        `  [detail] Found user.id="${testUserId}" on span "${spanWithUserId.name}" (verified)`,
-        "green",
-      );
-    } else {
-      log(
-        `  [detail] user.id attribute not found on spans — context was set but SDK may not propagate to spans yet`,
-        "yellow",
-      );
-    }
-
-    // The callback returned the correct result — that's the primary gate
-    logTest(
-      "Context Callback + Generate",
-      "PASS",
-      `Callback returned content. ${spans.length} spans captured. user.id on spans: ${!!spanWithUserId}. Content: ${result.content.substring(0, 40)}`,
-    );
-    try {
-      await sdk.shutdown?.();
-    } catch {
-      /* ignore */
-    }
-    return true;
-  } catch (error) {
-    const msg = error instanceof Error ? error.message : String(error);
-    if (isExpectedProviderError(msg)) {
-      logTest(
-        "Context Callback + Generate",
-        "SKIP",
-        "Provider credentials not configured",
-      );
-      return null;
-    }
-    logTest("Context Callback + Generate", "FAIL", msg);
-    return false;
-  }
-}
-
-// ============================================================
-// TEST #6: Operation Name Auto-Detection
-// ============================================================
-
-async function testOperationNameAutoDetection(): Promise<boolean | null> {
-  logSection("Test #6: Operation Name Auto-Detection");
-  logTest("Operation Name Auto-Detection", "TESTING");
-  resetSpans();
-
-  try {
-    const sdk = new NeuroLink({
-      observability: {
-        langfuse: {
-          enabled: true,
-          publicKey: DUMMY_LANGFUSE.publicKey,
-          secretKey: DUMMY_LANGFUSE.secretKey,
-          baseUrl: DUMMY_LANGFUSE.baseUrl,
-          useExternalTracerProvider: true,
-          autoDetectOperationName: true,
-        },
-      },
-    });
-
-    const result = await setLangfuseContext(
-      { userId: "test-autodetect-user" },
-      async () => {
-        return await sdk.generate(
-          buildGenerateOptions({
-            input: { text: 'Say "autodetect" and nothing else' },
-          }),
-        );
-      },
-    );
-
-    if (!result?.content || result.content.length === 0) {
-      logTest("Operation Name Auto-Detection", "FAIL", "No content");
-      return false;
-    }
-
-    const spans = getFinishedSpans();
-    const spanNames = spans.map((s) => s.name);
-
-    // Look for gen_ai.operation.name attribute on any span
-    const spansWithOpName = spans.filter(
-      (s) => s.attributes["gen_ai.operation.name"],
-    );
-
-    if (spansWithOpName.length > 0) {
-      const opName = spansWithOpName[0].attributes["gen_ai.operation.name"];
-      if (typeof opName === "string" && opName.length > 0) {
-        log(
-          `  [detail] gen_ai.operation.name="${opName}" found on span "${spansWithOpName[0].name}" (verified)`,
-          "green",
-        );
-      } else {
-        log(
-          `  [detail] gen_ai.operation.name attribute found but empty or non-string: ${opName}`,
-          "yellow",
-        );
-      }
-    } else {
-      log(
-        `  [detail] gen_ai.operation.name not found on any of ${spans.length} spans: [${spanNames.slice(0, 5).join(", ")}]`,
-        "yellow",
-      );
-    }
-
-    logTest(
-      "Operation Name Auto-Detection",
-      "PASS",
-      `Auto-detection generate completed. ${spans.length} spans, ${spansWithOpName.length} with gen_ai.operation.name: [${spanNames.slice(0, 5).join(", ")}]`,
-    );
-    try {
-      await sdk.shutdown?.();
-    } catch {
-      /* ignore */
-    }
-    return true;
-  } catch (error) {
-    const msg = error instanceof Error ? error.message : String(error);
-    if (isExpectedProviderError(msg)) {
-      logTest(
-        "Operation Name Auto-Detection",
-        "SKIP",
-        "Provider credentials not configured",
-      );
-      return null;
-    }
-    logTest("Operation Name Auto-Detection", "FAIL", msg);
-    return false;
-  }
-}
-
-// ============================================================
-// TEST #7: Custom Trace Name Format
-// ============================================================
-
-async function testTraceNameFormat(): Promise<boolean | null> {
-  logSection("Test #7: Custom Trace Name Format");
-  logTest("Trace Name Format", "TESTING");
-  resetSpans();
-
-  try {
-    let formatCalled = false;
-    const sdk = new NeuroLink({
-      observability: {
-        langfuse: {
-          enabled: true,
-          publicKey: DUMMY_LANGFUSE.publicKey,
-          secretKey: DUMMY_LANGFUSE.secretKey,
-          baseUrl: DUMMY_LANGFUSE.baseUrl,
-          useExternalTracerProvider: true,
-          autoDetectOperationName: true,
-          traceNameFormat: (context: {
-            operationName?: string;
-            userId?: string | null;
-          }) => {
-            formatCalled = true;
-            return (
-              "custom/" +
-              (context.operationName || "unknown") +
-              "/" +
-              (context.userId || "anon")
-            );
-          },
-        },
-      },
-    });
-
-    // In external TracerProvider mode, NeuroLink's processors (ContextEnricher, LangfuseSpanProcessor)
-    // must be manually added to the active TracerProvider — they're not auto-registered.
-    // This mirrors how a real consumer would integrate: getSpanProcessors() → add to their NodeSDK.
-    // Note: In newer OTEL versions, addSpanProcessor() is removed — processors go in the constructor.
-    // We create a fresh provider with both the test exporter AND NeuroLink's processors.
-    const nlProcessors = getSpanProcessors();
-    const traceNameProvider = new NodeTracerProvider({
-      spanProcessors: [
-        new SimpleSpanProcessor(spanExporter),
-        ...nlProcessors.map((p: unknown) => p as SimpleSpanProcessor),
-      ],
-    });
-    traceNameProvider.register();
-
-    const result = await setLangfuseContext(
-      { userId: "format-test-user" },
-      async () => {
-        return await sdk.generate(
-          buildGenerateOptions({
-            input: { text: 'Say "formatted" and nothing else' },
-          }),
-        );
-      },
-    );
-
-    if (!result?.content || result.content.length === 0) {
-      logTest("Trace Name Format", "FAIL", "No content");
-      return false;
-    }
-
-    // Check if format was called. In external TracerProvider mode with bundled OTEL,
-    // the ContextEnricher may not process spans from the test's TracerProvider due to
-    // separate @opentelemetry/api global states. Verify the config was stored correctly instead.
-    if (!formatCalled) {
-      // Verify the function IS stored in the config by checking getSpanProcessors
-      // returns a ContextEnricher (which reads the format function)
-      const procs = getSpanProcessors();
-      const hasContextEnricher = procs.some(
-        (p: unknown) =>
-          (p as { constructor?: { name?: string } }).constructor?.name ===
-          "ContextEnricher",
-      );
-      if (hasContextEnricher) {
-        logTest(
-          "Trace Name Format",
-          "PASS",
-          "ContextEnricher registered with traceNameFormat config. Function not invoked due to bundled OTEL API isolation (expected in external provider mode).",
-        );
-        try {
-          await sdk.shutdown?.();
-        } catch {
-          /* ignore */
-        }
-        return true;
-      }
-      logTest(
-        "Trace Name Format",
-        "FAIL",
-        "Custom traceNameFormat function was never invoked and no ContextEnricher found",
-      );
-      try {
-        await sdk.shutdown?.();
-      } catch {
-        /* ignore */
-      }
-      return false;
-    }
-
-    const spans = getFinishedSpans();
-
-    // If format function was called, that's the primary assertion.
-    // Optionally check if the formatted name appears on spans.
-    const spansWithTraceName = spans.filter((s) => {
-      const tn =
-        s.attributes["langfuse.trace.name"] || s.attributes["trace.name"];
-      return typeof tn === "string" && tn.startsWith("custom/");
-    });
-
-    if (spansWithTraceName.length > 0) {
-      log(
-        `  [detail] Custom trace name found on ${spansWithTraceName.length} span(s): "${spansWithTraceName[0].attributes["langfuse.trace.name"] || spansWithTraceName[0].attributes["trace.name"]}"`,
-        "green",
-      );
-    } else {
-      log(
-        `  [detail] Format function was called but custom trace name not found on spans (format output may not be stored as span attribute in this path)`,
-        "yellow",
-      );
-    }
-
-    logTest(
-      "Trace Name Format",
-      "PASS",
-      `Custom format invoked (formatCalled=true). ${spans.length} spans.`,
-    );
-    try {
-      await sdk.shutdown?.();
-    } catch {
-      /* ignore */
-    }
-    return true;
-  } catch (error) {
-    const msg = error instanceof Error ? error.message : String(error);
-    if (isExpectedProviderError(msg)) {
-      logTest(
-        "Trace Name Format",
-        "SKIP",
-        "Provider credentials not configured",
-      );
-      return null;
-    }
-    logTest("Trace Name Format", "FAIL", msg);
-    return false;
-  }
-}
-
-// ============================================================
-// TEST #8: Custom Metadata in Context
-// ============================================================
-
-async function testCustomMetadataInContext(): Promise<boolean | null> {
-  logSection("Test #8: Custom Metadata in Context");
-  logTest("Custom Metadata in Context", "TESTING");
-  resetSpans();
-
-  try {
-    const sdk = new NeuroLink({
-      observability: {
-        langfuse: {
-          enabled: true,
-          publicKey: DUMMY_LANGFUSE.publicKey,
-          secretKey: DUMMY_LANGFUSE.secretKey,
-          baseUrl: DUMMY_LANGFUSE.baseUrl,
-          useExternalTracerProvider: true,
-        },
-      },
-    });
-
-    const testMetadata = {
-      feature: "customer-support",
-      tier: "premium",
-      priority: 1,
-    };
-
-    let contextMetadataOk = false;
-
-    const result = await setLangfuseContext(
-      {
-        userId: "metadata-test-user",
-        metadata: testMetadata,
-      },
-      async () => {
-        // Verify metadata is in context
-        const ctx = getLangfuseContext();
-        if (ctx?.metadata && ctx.metadata.feature === "customer-support") {
-          contextMetadataOk = true;
-        }
-        return await sdk.generate(
-          buildGenerateOptions({
-            input: { text: 'Say "metadata" and nothing else' },
-          }),
-        );
-      },
-    );
-
-    if (!result?.content || result.content.length === 0) {
-      logTest("Custom Metadata in Context", "FAIL", "No content");
-      return false;
-    }
-
-    // Check if metadata appears on spans
-    const spans = getFinishedSpans();
-    let metadataOnSpans = false;
-
-    // ContextEnricher sets langfuse.trace.metadata as JSON string on root spans,
-    // and/or metadata.<key> on individual spans
-    const spanWithMetadata = spans.find((s) => {
-      const traceMetaAttr = s.attributes["langfuse.trace.metadata"];
-      if (typeof traceMetaAttr === "string") {
-        try {
-          const parsed = JSON.parse(traceMetaAttr);
-          if (parsed.feature === "customer-support") {
-            return true;
-          }
-        } catch {
-          /* not JSON */
-        }
-      }
-      // Check individual metadata.* attributes
-      if (
-        s.attributes["metadata.feature"] === "customer-support" ||
-        s.attributes["metadata.feature"] === '"customer-support"'
-      ) {
-        return true;
-      }
-      return false;
-    });
-
-    if (spanWithMetadata) {
-      metadataOnSpans = true;
-      log(
-        `  [detail] Metadata found on span "${spanWithMetadata.name}" (verified on spans)`,
-        "green",
-      );
-    } else {
-      log(
-        `  [detail] Metadata not found on spans, but verified in context: ${contextMetadataOk}`,
-        "yellow",
-      );
-    }
-
-    // Gate: at least context storage must work
-    if (!contextMetadataOk && !metadataOnSpans) {
-      logTest(
-        "Custom Metadata in Context",
-        "FAIL",
-        "Metadata not found in context or on spans",
-      );
-      try {
-        await sdk.shutdown?.();
-      } catch {
-        /* ignore */
-      }
-      return false;
-    }
-
-    logTest(
-      "Custom Metadata in Context",
-      "PASS",
-      `Metadata in context: ${contextMetadataOk}, on spans: ${metadataOnSpans}. ${spans.length} spans.`,
-    );
-    try {
-      await sdk.shutdown?.();
-    } catch {
-      /* ignore */
-    }
-    return true;
-  } catch (error) {
-    const msg = error instanceof Error ? error.message : String(error);
-    if (isExpectedProviderError(msg)) {
-      logTest(
-        "Custom Metadata in Context",
-        "SKIP",
-        "Provider credentials not configured",
-      );
-      return null;
-    }
-    logTest("Custom Metadata in Context", "FAIL", msg);
-    return false;
-  }
-}
-
-// ============================================================
-// TEST #9: OTEL Exports Availability
-// ============================================================
-
-async function testOTELExportsAvailability(): Promise<boolean | null> {
-  logSection("Test #9: OTEL Exports Availability");
-  logTest("OTEL Exports Availability", "TESTING");
-
-  try {
-    const exports: Array<{ name: string; value: unknown }> = [
-      { name: "setLangfuseContext", value: setLangfuseContext },
-      { name: "getLangfuseContext", value: getLangfuseContext },
-      { name: "getTracer", value: getTracer },
-      { name: "getSpanProcessors", value: getSpanProcessors },
-    ];
-
-    const results: string[] = [];
-    let allDefined = true;
-
-    for (const exp of exports) {
-      const isDefined = exp.value !== undefined && exp.value !== null;
-      const isFunction = typeof exp.value === "function";
-      const status = isDefined && isFunction ? "OK" : "MISSING";
-      results.push(`${exp.name}=${status}`);
-
-      if (!isDefined || !isFunction) {
-        allDefined = false;
-        log(
-          `  [detail] ${exp.name}: defined=${isDefined}, isFunction=${isFunction}`,
-          "red",
-        );
-      }
-    }
-
-    if (!allDefined) {
-      logTest(
-        "OTEL Exports Availability",
-        "FAIL",
-        `Some exports missing or not functions: ${results.join(", ")}`,
-      );
-      return false;
-    }
-
-    // Also verify isUsingExternalTracerProvider if available
-    if (typeof isUsingExternalTracerProvider === "function") {
-      results.push("isUsingExternalTracerProvider=OK");
-    }
-
-    logTest(
-      "OTEL Exports Availability",
-      "PASS",
-      `All documented exports are defined and are functions: ${results.join(", ")}`,
-    );
-    return true;
-  } catch (error) {
-    const msg = error instanceof Error ? error.message : String(error);
-    logTest("OTEL Exports Availability", "FAIL", msg);
-    return false;
-  }
-}
-
-// ============================================================
-// TEST #10: getTracer for Custom Spans
-// ============================================================
-
-async function testGetTracer(): Promise<boolean | null> {
-  logSection("Test #10: getTracer for Custom Spans");
-  logTest("getTracer", "TESTING");
-  resetSpans();
-
-  try {
-    // getTracer is pure OTel — just wraps trace.getTracer()
-    const tracer = getTracer("test-app", "1.0.0");
-
-    if (!tracer) {
-      logTest("getTracer", "FAIL", "getTracer returned null");
-      return false;
-    }
-
-    // Create a custom span and verify it appears in the exporter
-    const span = tracer.startSpan("custom-test-operation", {
-      attributes: {
-        "test.suite": "observability",
-        "test.number": 10,
-      },
-    });
-
-    span.setStatus({ code: SpanStatusCode.OK });
-    span.end();
-
-    // Wait for span processor to flush
-    await new Promise((r) => setTimeout(r, 100));
-
-    const spans = getFinishedSpans();
-    const customSpan = spans.find((s) => s.name === "custom-test-operation");
-
-    if (customSpan) {
-      const hasTestAttr =
-        customSpan.attributes["test.suite"] === "observability";
-      logTest(
-        "getTracer",
-        "PASS",
-        `Custom span captured. name="${customSpan.name}", test.suite attr=${hasTestAttr}`,
-      );
-      return true;
-    } else {
-      logTest(
-        "getTracer",
-        "FAIL",
-        `Custom span not found in ${spans.length} captured spans: [${spans.map((s) => s.name).join(", ")}]`,
-      );
-      return false;
-    }
-  } catch (error) {
-    const msg = error instanceof Error ? error.message : String(error);
-    logTest("getTracer", "FAIL", msg);
-    return false;
-  }
-}
-
-async function testTagsInContext(): Promise<boolean | null> {
-  logSection("Test #10b: Trace Tags in Context");
-  logTest("Trace Tags in Context", "TESTING");
-  resetSpans();
-
-  try {
-    await setLangfuseContext(
-      { userId: "tags-test-user", tags: ["eval-chat", "turn"] },
-      async () => {
-        const span = getTracer("tags-test").startSpan("tags-root-operation");
-        span.end();
-      },
-    );
-    await new Promise((r) => setTimeout(r, 100));
-
-    const tags = findSpan("tags-root-operation")?.attributes[
-      "langfuse.trace.tags"
-    ];
-    if (
-      Array.isArray(tags) &&
-      tags.some((tag) => tag === "eval-chat") &&
-      tags.some((tag) => tag === "turn")
-    ) {
-      logTest(
-        "Trace Tags in Context",
-        "PASS",
-        "context tags reached the trace",
-      );
-      return true;
-    }
-    logTest(
-      "Trace Tags in Context",
-      "FAIL",
-      "the root span carries no langfuse.trace.tags from the context",
-    );
-    return false;
-  } catch (error) {
-    const msg = error instanceof Error ? error.message : String(error);
-    logTest("Trace Tags in Context", "FAIL", msg);
-    return false;
-  }
-}
-
-// ============================================================
-// TEST #11: All Extended Context Fields
-// ============================================================
-
-async function testAllContextFields(): Promise<boolean | null> {
-  logSection("Test #11: All Extended Context Fields");
-  logTest("All Context Fields", "TESTING");
-  resetSpans();
-
-  try {
-    const sdk = new NeuroLink({
-      observability: {
-        langfuse: {
-          enabled: true,
-          publicKey: DUMMY_LANGFUSE.publicKey,
-          secretKey: DUMMY_LANGFUSE.secretKey,
-          baseUrl: DUMMY_LANGFUSE.baseUrl,
-          useExternalTracerProvider: true,
-        },
-      },
-    });
-
-    const allFields = {
-      userId: "all-fields-user",
-      sessionId: "all-fields-session",
-      conversationId: "all-fields-conv-123",
-      requestId: "all-fields-req-abc",
-      traceName: "all-fields-trace",
-      operationName: "all-fields-operation",
-      metadata: { key1: "value1", key2: 42, key3: true },
-      customAttributes: {
-        "app.tenant": "test-tenant",
-        "app.version": 3,
-        "app.debug": true,
-      },
-    };
-
-    let contextChecksOk = false;
-
-    const result = await setLangfuseContext(allFields, async () => {
-      // Verify all fields are accessible inside the callback
-      const ctx = getLangfuseContext();
-
-      const checks = [
-        { name: "userId", ok: ctx?.userId === allFields.userId },
-        { name: "sessionId", ok: ctx?.sessionId === allFields.sessionId },
-        {
-          name: "conversationId",
-          ok: ctx?.conversationId === allFields.conversationId,
-        },
-        { name: "requestId", ok: ctx?.requestId === allFields.requestId },
-        { name: "traceName", ok: ctx?.traceName === allFields.traceName },
-        {
-          name: "operationName",
-          ok: ctx?.operationName === allFields.operationName,
-        },
-        { name: "metadata.key1", ok: ctx?.metadata?.key1 === "value1" },
-        {
-          name: "customAttributes.app.tenant",
-          ok: ctx?.customAttributes?.["app.tenant"] === "test-tenant",
-        },
-      ];
-
-      const passedChecks = checks.filter((c) => c.ok).length;
-      const failedNames = checks.filter((c) => !c.ok).map((c) => c.name);
-
-      if (passedChecks < checks.length) {
-        throw new Error(
-          `Context fields failed: [${failedNames.join(", ")}] (${passedChecks}/${checks.length})`,
-        );
-      }
-
-      contextChecksOk = true;
-
-      return await sdk.generate(
-        buildGenerateOptions({
-          input: { text: 'Say "context" and nothing else' },
-        }),
-      );
-    });
-
-    if (!result?.content || result.content.length === 0) {
-      logTest("All Context Fields", "FAIL", "No content");
-      return false;
-    }
-
-    // After generate(), get spans and check for extended field attributes
-    const spans = getFinishedSpans();
-
-    // Map of context field => expected span attribute key
-    const fieldToAttr: Array<{
-      field: string;
-      attrKey: string;
-      expected: string;
-    }> = [
-      { field: "userId", attrKey: "user.id", expected: allFields.userId },
-      {
-        field: "sessionId",
-        attrKey: "session.id",
-        expected: allFields.sessionId,
-      },
-      {
-        field: "conversationId",
-        attrKey: "conversation.id",
-        expected: allFields.conversationId,
-      },
-      {
-        field: "requestId",
-        attrKey: "request.id",
-        expected: allFields.requestId,
-      },
-    ];
-
-    const foundOnSpans: string[] = [];
-    const notFoundOnSpans: string[] = [];
-
-    for (const { field, attrKey, expected } of fieldToAttr) {
-      const spanWithAttr = spans.find(
-        (s) => s.attributes[attrKey] === expected,
-      );
-      if (spanWithAttr) {
-        foundOnSpans.push(`${field}=${attrKey}`);
-      } else {
-        notFoundOnSpans.push(`${field}=${attrKey}`);
-      }
-    }
-
-    if (foundOnSpans.length > 0) {
-      log(
-        `  [detail] Fields found on spans: [${foundOnSpans.join(", ")}]`,
-        "green",
-      );
-    }
-    if (notFoundOnSpans.length > 0) {
-      log(
-        `  [detail] Fields NOT on spans: [${notFoundOnSpans.join(", ")}]`,
-        "yellow",
-      );
-    }
-
-    // Gate PASS on at least context storage working correctly
-    if (!contextChecksOk) {
-      logTest("All Context Fields", "FAIL", "Context storage checks failed");
-      try {
-        await sdk.shutdown?.();
-      } catch {
-        /* ignore */
-      }
-      return false;
-    }
-
-    logTest(
-      "All Context Fields",
-      "PASS",
-      `All 8 context fields verified in ALS. ${foundOnSpans.length}/${fieldToAttr.length} found on spans. ${spans.length} total spans.`,
-    );
-    try {
-      await sdk.shutdown?.();
-    } catch {
-      /* ignore */
-    }
-    return true;
-  } catch (error) {
-    const msg = error instanceof Error ? error.message : String(error);
-    if (isExpectedProviderError(msg)) {
-      logTest(
-        "All Context Fields",
-        "SKIP",
-        "Provider credentials not configured",
-      );
-      return null;
-    }
-    logTest("All Context Fields", "FAIL", msg);
-    return false;
-  }
-}
-
-// ============================================================
-// TEST #12: CLI with Observability (subprocess with dummy env vars)
-// ============================================================
-
-async function testCLIWithObservability(): Promise<boolean | null> {
-  logSection("Test #12: CLI Generate with Observability env vars");
-  logTest("CLI with Observability", "TESTING");
-
-  try {
-    const cliArgs = [
-      "dist/cli/index.js",
-      "generate",
-      `--provider=${TEST_CONFIG.provider}`,
-      ...(TEST_CONFIG.model ? [`--model=${TEST_CONFIG.model}`] : []),
-      "--max-tokens=50",
-      'Say "observability" and nothing else',
-    ];
-
-    const result = await runCommand("node", cliArgs, {
-      env: {
-        LANGFUSE_PUBLIC_KEY: DUMMY_LANGFUSE.publicKey,
-        LANGFUSE_SECRET_KEY: DUMMY_LANGFUSE.secretKey,
-        LANGFUSE_BASE_URL: DUMMY_LANGFUSE.baseUrl,
-      },
-    });
-
-    if (!result.success) {
-      if (isExpectedProviderError(result.stderr)) {
-        logTest("CLI with Observability", "SKIP", "Provider not configured");
-        return null;
-      }
-      logTest(
-        "CLI with Observability",
-        "FAIL",
-        `Exit code: ${result.code}, Error: ${result.stderr.substring(0, 200)}`,
-      );
-      return false;
-    }
-
-    if (result.stdout.length > 0) {
-      logTest(
-        "CLI with Observability",
-        "PASS",
-        `CLI completed with observability env vars. Output: ${result.stdout.substring(0, 50)}`,
-      );
-      return true;
-    } else {
-      logTest("CLI with Observability", "FAIL", "No output from CLI");
-      return false;
-    }
-  } catch (error) {
-    const msg = error instanceof Error ? error.message : String(error);
-    if (isExpectedProviderError(msg)) {
-      logTest("CLI with Observability", "SKIP", msg);
-      return null;
-    }
-    logTest("CLI with Observability", "FAIL", msg);
-    return false;
-  }
-}
-
-// ============================================================
-// TEST #13: Operation Name Override
-// ============================================================
-
-async function testOperationNameOverride(): Promise<boolean | null> {
-  logSection("Test #13: Operation Name Override");
-  logTest("Operation Name Override", "TESTING");
-  resetSpans();
-
-  try {
-    const sdk = new NeuroLink({
-      observability: {
-        langfuse: {
-          enabled: true,
-          publicKey: DUMMY_LANGFUSE.publicKey,
-          secretKey: DUMMY_LANGFUSE.secretKey,
-          baseUrl: DUMMY_LANGFUSE.baseUrl,
-          useExternalTracerProvider: true,
-          autoDetectOperationName: true,
-        },
-      },
-    });
-
-    const overrideName = "custom-chat-operation";
-    let contextOverrideOk = false;
-
-    // Set explicit operationName — should override auto-detection
-    const result = await setLangfuseContext(
-      {
-        userId: "override-test-user",
-        operationName: overrideName,
-      },
-      async () => {
-        // Verify operationName is in context
-        const ctx = getLangfuseContext();
-        if (ctx?.operationName === overrideName) {
-          contextOverrideOk = true;
-        }
-        return await sdk.generate(
-          buildGenerateOptions({
-            input: { text: 'Say "override" and nothing else' },
-          }),
-        );
-      },
-    );
-
-    if (!result?.content || result.content.length === 0) {
-      logTest("Operation Name Override", "FAIL", "No content");
-      return false;
-    }
-
-    // Look for the override value in spans or context
-    const spans = getFinishedSpans();
-
-    const spanWithOverride = spans.find(
-      (s) => s.attributes["gen_ai.operation.name"] === overrideName,
-    );
-    const foundOnSpans = !!spanWithOverride;
-
-    if (foundOnSpans) {
-      log(
-        `  [detail] Override "${overrideName}" found on span "${spanWithOverride!.name}" as gen_ai.operation.name (verified)`,
-        "green",
-      );
-    } else {
-      // Also check trace.name for the override
-      const spanWithTraceOverride = spans.find((s) => {
-        const tn =
-          s.attributes["langfuse.trace.name"] || s.attributes["trace.name"];
-        return typeof tn === "string" && tn.includes(overrideName);
-      });
-      if (spanWithTraceOverride) {
-        log(
-          `  [detail] Override "${overrideName}" found in trace.name on span "${spanWithTraceOverride.name}" (verified)`,
-          "green",
-        );
-      } else {
-        log(
-          `  [detail] Override "${overrideName}" not found on spans, but verified in context: ${contextOverrideOk}`,
-          "yellow",
-        );
-      }
-    }
-
-    // Gate return on finding override in at least one place
-    if (!contextOverrideOk && !foundOnSpans) {
-      logTest(
-        "Operation Name Override",
-        "FAIL",
-        `Override "${overrideName}" not found in context or on spans`,
-      );
-      try {
-        await sdk.shutdown?.();
-      } catch {
-        /* ignore */
-      }
-      return false;
-    }
-
-    logTest(
-      "Operation Name Override",
-      "PASS",
-      `Override verified. inContext=${contextOverrideOk}, onSpans=${foundOnSpans}. ${spans.length} spans.`,
-    );
-    try {
-      await sdk.shutdown?.();
-    } catch {
-      /* ignore */
-    }
-    return true;
-  } catch (error) {
-    const msg = error instanceof Error ? error.message : String(error);
-    if (isExpectedProviderError(msg)) {
-      logTest(
-        "Operation Name Override",
-        "SKIP",
-        "Provider credentials not configured",
-      );
-      return null;
-    }
-    logTest("Operation Name Override", "FAIL", msg);
-    return false;
-  }
-}
-
-// ============================================================
-// TEST #14: Wrapper Span Support
-// ============================================================
-
-async function testWrapperSpanSupport(): Promise<boolean | null> {
-  logSection("Test #14: Wrapper Span Support");
-  logTest("Wrapper Span Support", "TESTING");
-  resetSpans();
-
-  try {
-    const sdk = new NeuroLink({
-      observability: {
-        langfuse: {
-          enabled: true,
-          publicKey: DUMMY_LANGFUSE.publicKey,
-          secretKey: DUMMY_LANGFUSE.secretKey,
-          baseUrl: DUMMY_LANGFUSE.baseUrl,
-          useExternalTracerProvider: true,
-          autoDetectOperationName: true,
-        },
-      },
-    });
-
-    await new Promise((r) => setTimeout(r, 300));
-
-    const tracer = getTracer("wrapper-test");
-
-    // Create a wrapper span (simulating a host app wrapping an AI call)
-    const wrapperSpan = tracer.startSpan("host-app-handler", {
-      attributes: {
-        "handler.name": "chat-endpoint",
-        "handler.type": "api",
-      },
-    });
-
-    let generateResult: { content?: string } | undefined;
-    try {
-      const langfuseResult = await setLangfuseContext(
-        { userId: "wrapper-test-user" },
-        async () => {
-          return await sdk.generate(
-            buildGenerateOptions({
-              input: { text: 'Say "wrapper" and nothing else' },
-            }),
-          );
-        },
-      );
-      generateResult = langfuseResult as { content?: string } | undefined;
-
-      wrapperSpan.setStatus({ code: SpanStatusCode.OK });
-    } catch (innerError) {
-      const innerMsg =
-        innerError instanceof Error ? innerError.message : String(innerError);
-      wrapperSpan.setStatus({ code: SpanStatusCode.ERROR, message: innerMsg });
-      throw innerError;
-    } finally {
-      wrapperSpan.end();
-    }
-
-    // Wait for span processing
-    await new Promise((r) => setTimeout(r, 200));
-
-    if (!generateResult?.content || generateResult.content.length === 0) {
-      logTest(
-        "Wrapper Span Support",
-        "FAIL",
-        "No content from generate within wrapper span",
-      );
-      return false;
-    }
-
-    const spans = getFinishedSpans();
-    const hostSpan = spans.find((s) => s.name === "host-app-handler");
-
-    // Gate return on wrapper span being found in exporter
-    if (!hostSpan) {
-      logTest(
-        "Wrapper Span Support",
-        "FAIL",
-        `Wrapper span "host-app-handler" not found in ${spans.length} captured spans: [${spans
-          .map((s) => s.name)
-          .slice(0, 5)
-          .join(", ")}]`,
-      );
-      try {
-        await sdk.shutdown?.();
-      } catch {
-        /* ignore */
-      }
-      return false;
-    }
-
-    const childSpanCount = spans.filter(
-      (s) =>
-        s.name !== "host-app-handler" &&
-        s.parentSpanContext?.spanId === hostSpan.spanContext().spanId,
-    ).length;
-
-    logTest(
-      "Wrapper Span Support",
-      "PASS",
-      `Wrapper span found. child spans: ${childSpanCount}, total: ${spans.length}. Content: ${generateResult.content.substring(0, 30)}`,
-    );
-    try {
-      await sdk.shutdown?.();
-    } catch {
-      /* ignore */
-    }
-    return true;
-  } catch (error) {
-    const msg = error instanceof Error ? error.message : String(error);
-    if (isExpectedProviderError(msg)) {
-      logTest(
-        "Wrapper Span Support",
-        "SKIP",
-        "Provider credentials not configured",
-      );
-      return null;
-    }
-    logTest("Wrapper Span Support", "FAIL", msg);
-    return false;
-  }
-}
-
-// ============================================================
-// REGRESSION: Issue #4 — generation:end emission count (Curator P2-4)
-// ============================================================
-//
-// Cost listeners that subscribe to generation:end may double-count when
-// both the provider-level emit and the SDK orchestration emit fire for
-// the same call. These tests verify exactly one emission per generate()
-// or stream() call against each configured provider.
-
-type Issue04ProviderTarget = {
-  provider: string;
-  envVars: string[];
-  modelEnv?: string;
-};
-
-const ISSUE04_TARGETS: Issue04ProviderTarget[] = [
-  {
-    provider: "openai",
-    envVars: ["OPENAI_API_KEY"],
-    modelEnv: "OPENAI_MODEL",
-  },
-  {
-    provider: "vertex",
-    envVars: ["GOOGLE_VERTEX_PROJECT", "GOOGLE_AUTH_CLIENT_EMAIL"],
-    modelEnv: "VERTEX_MODEL",
-  },
-  {
-    provider: "google-ai-studio",
-    envVars: ["GOOGLE_AI_API_KEY"],
-    modelEnv: "GOOGLE_AI_MODEL",
-  },
-  {
-    provider: "litellm",
-    envVars: ["LITELLM_BASE_URL", "LITELLM_API_KEY", "LITELLM_MODEL"],
-    modelEnv: "LITELLM_MODEL",
-  },
-];
-
-function issue04SkipIfEnvMissing(...vars: string[]): string | null {
-  const missing = vars.filter((v) => !process.env[v]);
-  return missing.length === 0 ? null : `missing env: ${missing.join(", ")}`;
-}
-
-async function issue04CountEmissionsForGenerate(
-  target: Issue04ProviderTarget,
-): Promise<boolean | null> {
-  const skip = issue04SkipIfEnvMissing(...target.envVars);
-  if (skip) {
-    return null;
-  }
-  const sdk = new NeuroLink();
-  const events: unknown[] = [];
-  sdk.getEventEmitter().on("generation:end", (e: unknown) => events.push(e));
-  try {
-    const model = target.modelEnv ? process.env[target.modelEnv] : undefined;
-    const result = await sdk.generate({
-      provider: target.provider as never,
-      ...(model && { model }),
-      input: { text: "Reply with the single word: hello" },
-      maxTokens: 32,
-      disableTools: true,
-    } as never);
-    if (events.length === 1) {
-      logTest(
-        `Issue#4 generate / ${target.provider}`,
-        "PASS",
-        `count=${events.length}; provider=${result.provider}; model=${result.model}`,
-      );
-      return true;
-    }
-    logTest(
-      `Issue#4 generate / ${target.provider}`,
-      "FAIL",
-      `expected 1, got ${events.length}: provider=${result.provider}`,
-    );
-    return false;
-  } catch (err) {
-    const msg = err instanceof Error ? err.message : String(err);
-    if (isExpectedProviderError(msg)) {
-      return null;
-    }
-    logTest(
-      `Issue#4 generate / ${target.provider}`,
-      "FAIL",
-      `unexpected error: ${msg.slice(0, 200)}`,
-    );
-    return false;
-  } finally {
-    await sdk.shutdown?.().catch(() => {});
-  }
-}
-
-async function issue04CountEmissionsForStream(
-  target: Issue04ProviderTarget,
-): Promise<boolean | null> {
-  const skip = issue04SkipIfEnvMissing(...target.envVars);
-  if (skip) {
-    return null;
-  }
-  const sdk = new NeuroLink();
-  const events: unknown[] = [];
-  sdk.getEventEmitter().on("generation:end", (e: unknown) => events.push(e));
-  try {
-    const model = target.modelEnv ? process.env[target.modelEnv] : undefined;
-    const r = await sdk.stream({
-      provider: target.provider as never,
-      ...(model && { model }),
-      input: { text: "Reply with the single word: hello" },
-      maxTokens: 32,
-      disableTools: true,
-    } as never);
-    let chunks = 0;
-    for await (const _ of r.stream) {
-      chunks++;
-    }
-    await new Promise((r) => setTimeout(r, 250));
-    if (events.length === 1) {
-      logTest(
-        `Issue#4 stream / ${target.provider}`,
-        "PASS",
-        `count=${events.length}; chunks=${chunks}; provider=${r.provider}`,
-      );
-      return true;
-    }
-    logTest(
-      `Issue#4 stream / ${target.provider}`,
-      "FAIL",
-      `expected 1, got ${events.length}: chunks=${chunks}`,
-    );
-    return false;
-  } catch (err) {
-    const msg = err instanceof Error ? err.message : String(err);
-    if (isExpectedProviderError(msg)) {
-      return null;
-    }
-    logTest(
-      `Issue#4 stream / ${target.provider}`,
-      "FAIL",
-      `unexpected error: ${msg.slice(0, 200)}`,
-    );
-    return false;
-  } finally {
-    await sdk.shutdown?.().catch(() => {});
-  }
-}
-
-// ============================================================
-// MERGED: tracing.ts — span chain validation tests
-// ============================================================
-//
-// 10 tests covering generate/stream span chains, message build span,
-// cost-on-spans, input recording, error tracing, tool execution span,
-// memory spans, parent-child relationships, span status. Originally lived
-// in continuous-test-suite-tracing.ts; the tracing exporter setup was
-// dropped in favor of observability.ts's existing spanExporter.
-
-// Tracing config (smaller scope than the main observability TEST_CONFIG)
-const TRACING_CONFIG = { interTestDelay: 5000 };
-
-async function tracingDelay(ms: number): Promise<void> {
-  return new Promise((r) => setTimeout(r, ms));
-}
-
-// ============================================================
-// TEST #1: Generate Span Chain
-// ============================================================
-
-async function test_generate_span_chain(): Promise<boolean | null> {
-  logSection("Test #1: Generate Span Chain");
-  logTest("Generate Span Chain", "TESTING");
-
-  spanExporter.reset();
-
-  const sdk = createSDK();
-
-  try {
-    const result = await sdk.generate({
-      input: { text: 'Say "hello" and nothing else.' },
-      provider: TEST_CONFIG.provider as string,
-      ...(TEST_CONFIG.model ? { model: TEST_CONFIG.model } : {}),
-      maxTokens: 50,
-    });
-
-    if (!result?.content) {
-      logTest(
-        "Generate Span Chain",
-        "FAIL",
-        "No content returned from generate",
-      );
-      return false;
-    }
-
-    // Wait briefly for async span completion
-    await tracingDelay(500);
-
-    const generateSpan = findSpan("neurolink.generate");
-    const providerGenSpan = findSpan("neurolink.provider.generate");
-    const executeGenSpan = findSpan("neurolink.executeGeneration");
-
-    if (!generateSpan) {
-      logTest("Generate Span Chain", "FAIL", "Missing neurolink.generate span");
-      return false;
-    }
-
-    if (!providerGenSpan) {
-      logTest(
-        "Generate Span Chain",
-        "FAIL",
-        "Missing neurolink.provider.generate span",
-      );
-      return false;
-    }
-
-    if (!executeGenSpan) {
-      logTest(
-        "Generate Span Chain",
-        "FAIL",
-        "Missing neurolink.executeGeneration span",
-      );
-      return false;
-    }
-
-    // Assert neurolink.provider has a non-empty string value
-    const providerAttr = getAttr(generateSpan, "neurolink.provider") as
-      | string
-      | undefined;
-    if (typeof providerAttr !== "string" || providerAttr.length === 0) {
-      logTest(
-        "Generate Span Chain",
-        "FAIL",
-        `neurolink.provider attribute missing or empty on neurolink.generate span`,
-      );
-      return false;
-    }
-
-    // Assert gen_ai.request.model matches configured model (if configured)
-    const modelAttr = getAttr(providerGenSpan, "gen_ai.request.model") as
-      | string
-      | undefined;
-    if (
-      TEST_CONFIG.model &&
-      typeof modelAttr === "string" &&
-      modelAttr !== TEST_CONFIG.model
-    ) {
-      logTest(
-        "Generate Span Chain",
-        "FAIL",
-        `gen_ai.request.model mismatch: expected "${TEST_CONFIG.model}", got "${modelAttr}"`,
-      );
-      return false;
-    }
-
-    // Verify token attributes exist on at least one span and values are > 0
-    const allSpans = spanExporter.getFinishedSpans();
-    let inputTokens: number | undefined;
-    let outputTokens: number | undefined;
-    for (const s of allSpans) {
-      const it =
-        getAttr(s, "gen_ai.usage.input_tokens") ??
-        getAttr(s, "neurolink.tokens.input");
-      const ot =
-        getAttr(s, "gen_ai.usage.output_tokens") ??
-        getAttr(s, "neurolink.tokens.output");
-      if (typeof it === "number" && it > 0) {
-        inputTokens = it;
-      }
-      if (typeof ot === "number" && ot > 0) {
-        outputTokens = ot;
-      }
-    }
-
-    if (inputTokens === undefined) {
-      logTest(
-        "Generate Span Chain",
-        "FAIL",
-        `No span has input token count > 0`,
-      );
-      return false;
-    }
-
-    if (outputTokens === undefined) {
-      logTest(
-        "Generate Span Chain",
-        "FAIL",
-        `No span has output token count > 0`,
-      );
-      return false;
-    }
-
-    logTest(
-      "Generate Span Chain",
-      "PASS",
-      `Found all 3 spans. provider="${providerAttr}", model="${modelAttr ?? "default"}", inputTokens=${inputTokens}, outputTokens=${outputTokens}`,
-    );
-    return true;
-  } catch (error) {
-    const msg = error instanceof Error ? error.message : String(error);
-    if (isExpectedProviderError(msg)) {
-      logTest("Generate Span Chain", "SKIP", `Provider error: ${msg}`);
-      return null;
-    }
-    logTest("Generate Span Chain", "FAIL", msg);
-    return false;
-  } finally {
-    try {
-      await (sdk as { shutdown?: () => Promise<void> }).shutdown?.();
-    } catch {
-      /* ignore */
-    }
-  }
-}
-
-// ============================================================
-// TEST #2: Stream Span Chain
-// ============================================================
-
-async function test_stream_span_chain(): Promise<boolean | null> {
-  logSection("Test #2: Stream Span Chain");
-  logTest("Stream Span Chain", "TESTING");
-
-  spanExporter.reset();
-
-  const sdk = createSDK();
-
-  try {
-    const streamResult = await sdk.stream({
-      input: { text: 'Say "streaming" and nothing else.' },
-      provider: TEST_CONFIG.provider as string,
-      ...(TEST_CONFIG.model ? { model: TEST_CONFIG.model } : {}),
-      maxTokens: 50,
-    });
-
-    // Consume the full stream
-    let content = "";
-    if (streamResult?.stream) {
-      for await (const chunk of streamResult.stream) {
-        if ("content" in chunk && typeof chunk.content === "string") {
-          content += chunk.content;
-        }
-      }
-    }
-
-    // Wait for async promise resolution and span flushing
-    await tracingDelay(2000);
-
-    const streamSpan = findSpan("neurolink.stream");
-    const providerStreamSpan =
-      findSpan("neurolink.provider.stream") ??
-      findSpan("neurolink.provider.streamText");
-
-    if (!streamSpan) {
-      logTest("Stream Span Chain", "FAIL", "Missing neurolink.stream span");
-      return false;
-    }
-
-    if (!providerStreamSpan) {
-      logTest(
-        "Stream Span Chain",
-        "FAIL",
-        "Missing neurolink.provider.stream/streamText span",
-      );
-      return false;
-    }
-
-    // Check for optional stream validation and analytics spans
-    const allStreamSpans = spanExporter.getFinishedSpans();
-    const validateSpan = allStreamSpans.find(
-      (s) => s.name === "neurolink.stream.validate",
-    );
-    const analyticsSpan = allStreamSpans.find(
-      (s) => s.name === "neurolink.stream.analytics",
-    );
-
-    const extras: string[] = [];
-    if (validateSpan) {
-      extras.push("stream.validate: found");
-    } else {
-      log(
-        "   [NOTE] neurolink.stream.validate span not found (may not be instrumented yet)",
-        "yellow",
-      );
-    }
-    if (analyticsSpan) {
-      extras.push("stream.analytics: found");
-    } else {
-      log(
-        "   [NOTE] neurolink.stream.analytics span not found (may not be instrumented yet)",
-        "yellow",
-      );
-    }
-
-    logTest(
-      "Stream Span Chain",
-      "PASS",
-      `Found neurolink.stream + neurolink.provider.stream. Content length: ${content.length}${extras.length > 0 ? `. ${extras.join(", ")}` : ""}`,
-    );
-    return true;
-  } catch (error) {
-    const msg = error instanceof Error ? error.message : String(error);
-    if (isExpectedProviderError(msg)) {
-      logTest("Stream Span Chain", "SKIP", `Provider error: ${msg}`);
-      return null;
-    }
-    logTest("Stream Span Chain", "FAIL", msg);
-    return false;
-  } finally {
-    try {
-      await (sdk as { shutdown?: () => Promise<void> }).shutdown?.();
-    } catch {
-      /* ignore */
-    }
-  }
-}
-
-// ============================================================
-// TEST #3: Message Build Span
-// ============================================================
-
-async function test_message_build_span(): Promise<boolean | null> {
-  logSection("Test #3: Message Build Span");
-  logTest("Message Build Span", "TESTING");
-
-  spanExporter.reset();
-
-  const sdk = createSDK();
-
-  try {
-    await sdk.generate({
-      input: { text: 'Say "build" and nothing else.' },
-      provider: TEST_CONFIG.provider as string,
-      ...(TEST_CONFIG.model ? { model: TEST_CONFIG.model } : {}),
-      maxTokens: 50,
-    });
-
-    await tracingDelay(500);
-
-    const msgBuildSpan = findSpan("neurolink.message.build");
-
-    if (!msgBuildSpan) {
-      // This span IS instrumented — FAIL if not found.
-      logTest(
-        "Message Build Span",
-        "FAIL",
-        "neurolink.message.build span not found (this span is expected to be instrumented)",
-      );
-      return false;
-    }
-
-    // Check for message count attribute under both possible names
-    const msgCount =
-      getAttr(msgBuildSpan, "message.count") ??
-      getAttr(msgBuildSpan, "message.build.count");
-    if (msgCount === undefined) {
-      logTest(
-        "Message Build Span",
-        "FAIL",
-        `neurolink.message.build span found but neither "message.count" nor "message.build.count" attribute present`,
-      );
-      return false;
-    }
-
-    logTest(
-      "Message Build Span",
-      "PASS",
-      `Found neurolink.message.build span. message count=${msgCount}`,
-    );
-    return true;
-  } catch (error) {
-    const msg = error instanceof Error ? error.message : String(error);
-    if (isExpectedProviderError(msg)) {
-      logTest("Message Build Span", "SKIP", `Provider error: ${msg}`);
-      return null;
-    }
-    logTest("Message Build Span", "FAIL", msg);
-    return false;
-  } finally {
-    try {
-      await (sdk as { shutdown?: () => Promise<void> }).shutdown?.();
-    } catch {
-      /* ignore */
-    }
-  }
-}
-
-// ============================================================
-// TEST #4: Cost on Spans
-// ============================================================
-
-async function test_cost_on_spans(): Promise<boolean | null> {
-  logSection("Test #4: Cost on Spans");
-  logTest("Cost on Spans", "TESTING");
-
-  spanExporter.reset();
-
-  const sdk = createSDK();
-
-  try {
-    await sdk.generate({
-      input: { text: 'Say "cost" and nothing else.' },
-      provider: TEST_CONFIG.provider as string,
-      ...(TEST_CONFIG.model ? { model: TEST_CONFIG.model } : {}),
-      maxTokens: 50,
-    });
-
-    await tracingDelay(500);
-
-    const allSpans = spanExporter.getFinishedSpans();
-    const costSpan = allSpans.find(
-      (s) => getAttr(s, "neurolink.cost") !== undefined,
-    );
-
-    if (!costSpan) {
-      // Cost attribute may not be set on all providers/paths yet.
-      // Check if neurolink.generate span exists at all.
-      const genSpan = findSpan("neurolink.generate");
-      if (!genSpan) {
-        logTest("Cost on Spans", "FAIL", "No neurolink.generate span at all");
-        return false;
-      }
-      logTest(
-        "Cost on Spans",
-        "SKIP",
-        "neurolink.cost attribute not found on any span (may not be instrumented for this provider yet)",
-      );
-      return null;
-    }
-
-    const costValue = getAttr(costSpan, "neurolink.cost") as number;
-    if (typeof costValue !== "number" || costValue <= 0) {
-      logTest(
-        "Cost on Spans",
-        "FAIL",
-        `neurolink.cost must be > 0, got: ${costValue}`,
-      );
-      return false;
-    }
-
-    logTest(
-      "Cost on Spans",
-      "PASS",
-      `Found neurolink.cost=${costValue} on span "${costSpan.name}"`,
-    );
-    return true;
-  } catch (error) {
-    const msg = error instanceof Error ? error.message : String(error);
-    if (isExpectedProviderError(msg)) {
-      logTest("Cost on Spans", "SKIP", `Provider error: ${msg}`);
-      return null;
-    }
-    logTest("Cost on Spans", "FAIL", msg);
-    return false;
-  } finally {
-    try {
-      await (sdk as { shutdown?: () => Promise<void> }).shutdown?.();
-    } catch {
-      /* ignore */
-    }
-  }
-}
-
-// ============================================================
-// TEST #5: Input Recording
-// ============================================================
-
-async function test_input_recording(): Promise<boolean | null> {
-  logSection("Test #5: Input Recording");
-  logTest("Input Recording", "TESTING");
-
-  spanExporter.reset();
-
-  const sdk = createSDK();
-
-  try {
-    await sdk.generate({
-      input: { text: 'Say "input-test" and nothing else.' },
-      provider: TEST_CONFIG.provider as string,
-      ...(TEST_CONFIG.model ? { model: TEST_CONFIG.model } : {}),
-      maxTokens: 50,
-    });
-
-    await tracingDelay(500);
-
-    // Look for the NeuroLink generate span. The `ai.` prefix below is the
-    // Vercel AI SDK's own auto-instrumentation, which nothing emits since the
-    // SDK was removed; it is kept only so the matcher stays permissive.
-    const allSpans = spanExporter.getFinishedSpans();
-    const aiSpan = allSpans.find(
-      (s) =>
-        s.name.startsWith("ai.") ||
-        s.name === "neurolink.generate" ||
-        s.name === "neurolink.executeGeneration",
-    );
-
-    if (!aiSpan) {
-      logTest("Input Recording", "FAIL", "No AI or generate span found");
-      return false;
-    }
-
-    // Check for input-related attributes across relevant spans
-    let foundInputLength: number | undefined;
-    let foundInputSource: string | undefined;
-
-    // Check the primary AI span
-    const inputLength = getAttr(aiSpan, "neurolink.input_length") as
-      | number
-      | undefined;
-    if (typeof inputLength === "number" && inputLength > 0) {
-      foundInputLength = inputLength;
-      foundInputSource = aiSpan.name;
-    }
-
-    // Also check the neurolink.generate span
-    if (foundInputLength === undefined) {
-      const genSpan = findSpan("neurolink.generate");
-      if (genSpan) {
-        const genInputLen = getAttr(genSpan, "neurolink.input_length") as
-          | number
-          | undefined;
-        if (typeof genInputLen === "number" && genInputLen > 0) {
-          foundInputLength = genInputLen;
-          foundInputSource = "neurolink.generate";
-        }
-      }
-    }
-
-    // Fallback: check gen_ai.usage.input_tokens
-    if (foundInputLength === undefined) {
-      const inputTokens = getAttr(aiSpan, "gen_ai.usage.input_tokens") as
-        | number
-        | undefined;
-      if (typeof inputTokens === "number" && inputTokens > 0) {
-        foundInputLength = inputTokens;
-        foundInputSource = `${aiSpan.name} (gen_ai.usage.input_tokens)`;
-      }
-    }
-
-    if (foundInputLength === undefined) {
-      logTest(
-        "Input Recording",
-        "FAIL",
-        `No input attributes found on span "${aiSpan.name}"`,
-      );
-      return false;
-    }
-
-    // The prompt 'Say "input-test" and nothing else.' is well over 10 chars
-    if (foundInputLength < 10) {
-      logTest(
-        "Input Recording",
-        "FAIL",
-        `Input length ${foundInputLength} is less than expected minimum 10 on "${foundInputSource}"`,
-      );
-      return false;
-    }
-
-    // Additionally check gen_ai.usage.output_tokens > 0 if present
-    const outputTokens = getAttr(aiSpan, "gen_ai.usage.output_tokens") as
-      | number
-      | undefined;
-    if (outputTokens !== undefined && outputTokens <= 0) {
-      logTest(
-        "Input Recording",
-        "FAIL",
-        `gen_ai.usage.output_tokens is present but not > 0: ${outputTokens}`,
-      );
-      return false;
-    }
-
-    const outputInfo =
-      outputTokens !== undefined ? `, output_tokens=${outputTokens}` : "";
-    logTest(
-      "Input Recording",
-      "PASS",
-      `Input length=${foundInputLength} on "${foundInputSource}"${outputInfo}`,
-    );
-    return true;
-  } catch (error) {
-    const msg = error instanceof Error ? error.message : String(error);
-    if (isExpectedProviderError(msg)) {
-      logTest("Input Recording", "SKIP", `Provider error: ${msg}`);
-      return null;
-    }
-    logTest("Input Recording", "FAIL", msg);
-    return false;
-  } finally {
-    try {
-      await (sdk as { shutdown?: () => Promise<void> }).shutdown?.();
-    } catch {
-      /* ignore */
-    }
-  }
-}
-
-// ============================================================
-// TEST #6: Error Tracing
-// ============================================================
-
-async function test_error_tracing(): Promise<boolean | null> {
-  logSection("Test #6: Error Tracing");
-  logTest("Error Tracing", "TESTING");
-
-  spanExporter.reset();
-
-  const sdk = createSDK();
-
-  try {
-    // Use an obviously invalid model name to trigger an error
-    await sdk.generate({
-      input: { text: "This should fail." },
-      provider: TEST_CONFIG.provider as string,
-      model: "nonexistent-model-that-does-not-exist-12345",
-      maxTokens: 50,
-    });
-
-    // If we get here, the generate succeeded (unexpected with bad model)
-    // Some providers may silently fall back - check spans anyway
-    await tracingDelay(500);
-
-    const allSpans = spanExporter.getFinishedSpans();
-    const errorSpan = allSpans.find(
-      (s) => s.status.code === SpanStatusCode.ERROR,
-    );
-
-    if (errorSpan) {
-      // Validate error attributes on the span
-      const errorType =
-        getAttr(errorSpan, "error.type") ??
-        getAttr(errorSpan, "exception.type");
-      const statusMessage = errorSpan.status.message;
-
-      const details: string[] = [`span="${errorSpan.name}"`];
-      if (errorType) {
-        details.push(`error.type="${errorType}"`);
-      }
-      if (statusMessage) {
-        details.push(`status.message="${statusMessage}"`);
-      }
-
-      logTest(
-        "Error Tracing",
-        "PASS",
-        `Found ERROR status (provider may have partially failed). ${details.join(", ")}`,
-      );
-      return true;
-    }
-
-    // Provider silently handled the bad model - skip
-    logTest(
-      "Error Tracing",
-      "SKIP",
-      "Provider handled bad model gracefully, no ERROR spans",
-    );
-    return null;
-  } catch {
-    // Expected: generate should throw with invalid model
-    await tracingDelay(500);
-
-    const allSpans = spanExporter.getFinishedSpans();
-    const errorSpan = allSpans.find(
-      (s) => s.status.code === SpanStatusCode.ERROR,
-    );
-
-    if (!errorSpan) {
-      // The error may have been thrown before any spans were created
-      // (e.g., model validation at factory level)
-      const anySpan = allSpans.length > 0;
-      if (!anySpan) {
-        logTest(
-          "Error Tracing",
-          "SKIP",
-          "Error thrown before span creation (no spans captured)",
-        );
-        return null;
-      }
-      logTest(
-        "Error Tracing",
-        "FAIL",
-        `${allSpans.length} spans found but none with ERROR status`,
-      );
-      return false;
-    }
-
-    // Assert error.type or exception.type attribute if present
-    const errorType =
-      getAttr(errorSpan, "error.type") ?? getAttr(errorSpan, "exception.type");
-    const statusMessage = errorSpan.status.message;
-
-    // Assert status.message is non-empty
-    if (typeof statusMessage !== "string" || statusMessage.length === 0) {
-      logTest(
-        "Error Tracing",
-        "FAIL",
-        `Error span "${errorSpan.name}" has ERROR status but status.message is empty or missing`,
-      );
-      return false;
-    }
-
-    const details: string[] = [
-      `span="${errorSpan.name}"`,
-      `status.message="${statusMessage}"`,
-    ];
-    if (errorType) {
-      details.push(`error/exception.type="${errorType}"`);
-    }
-
-    logTest(
-      "Error Tracing",
-      "PASS",
-      `Error correctly recorded. ${details.join(", ")}`,
-    );
-    return true;
-  } finally {
-    try {
-      await (sdk as { shutdown?: () => Promise<void> }).shutdown?.();
-    } catch {
-      /* ignore */
-    }
-  }
-}
-
-// ============================================================
-// TEST #7: Tool Execution Span
-// ============================================================
-
-async function test_tool_execution_span(): Promise<boolean | null> {
-  logSection("Test #7: Tool Execution Span");
-  logTest("Tool Execution Span", "TESTING");
-
-  spanExporter.reset();
-
-  const sdk = createSDK();
-
-  try {
-    // Call generate with a prompt that should trigger tool use
-    // Use built-in tools (getCurrentTime is always available)
-    await sdk.generate({
-      input: {
-        text: "What is the current time right now? Use a tool to check.",
-      },
-      provider: TEST_CONFIG.provider as string,
-      ...(TEST_CONFIG.model ? { model: TEST_CONFIG.model } : {}),
-      maxTokens: 200,
-      maxSteps: 3,
-    });
-
-    await tracingDelay(500);
-
-    const allSpans = spanExporter.getFinishedSpans();
-
-    // Look for tool execution spans
-    const toolSpan = allSpans.find(
-      (s) =>
-        s.name === "neurolink.tool.execute" ||
-        s.name.includes("tool") ||
-        getAttr(s, "gen_ai.tool.name") !== undefined,
-    );
-
-    if (!toolSpan) {
-      // Model did not invoke tool — non-deterministic, SKIP (return null)
-      logTest("Tool Execution Span", "SKIP", "Model did not invoke tool.");
-      return null;
-    }
-
-    // Never PASS without a valid tool span — verify it has tool name attribute
-    const toolName =
-      getAttr(toolSpan, "gen_ai.tool.name") ||
-      getAttr(toolSpan, "mcp.tool_name") ||
-      "unknown";
-    logTest(
-      "Tool Execution Span",
-      "PASS",
-      `Found tool span "${toolSpan.name}" (tool=${toolName})`,
-    );
-    return true;
-  } catch (error) {
-    const msg = error instanceof Error ? error.message : String(error);
-    if (isExpectedProviderError(msg)) {
-      logTest("Tool Execution Span", "SKIP", `Provider error: ${msg}`);
-      return null;
-    }
-    logTest("Tool Execution Span", "FAIL", msg);
-    return false;
-  } finally {
-    try {
-      await (sdk as { shutdown?: () => Promise<void> }).shutdown?.();
-    } catch {
-      /* ignore */
-    }
-  }
-}
-
-// ============================================================
-// TEST #8: Memory Spans
-// ============================================================
-
-async function test_memory_spans(): Promise<boolean | null> {
-  logSection("Test #8: Memory Spans");
-  logTest("Memory Spans", "TESTING");
-
-  spanExporter.reset();
-
-  try {
-    // Create SDK with conversation memory enabled
-    const sdk = new NeuroLink({
-      conversationMemory: {
-        enabled: true,
-        enableSummarization: false,
-      },
-    });
-
-    const testSessionId = `tracing-test-memory-${Date.now()}`;
-
-    // First call to establish memory (sessionId required for memory ops)
-    await sdk.generate({
-      input: { text: 'Say "first turn" and nothing else.' },
-      provider: TEST_CONFIG.provider as string,
-      ...(TEST_CONFIG.model ? { model: TEST_CONFIG.model } : {}),
-      maxTokens: 50,
-      context: { sessionId: testSessionId },
-    });
-
-    await tracingDelay(1000);
-
-    // Second call to trigger memory retrieval
-    await sdk.generate({
-      input: { text: 'Say "second turn" and nothing else.' },
-      provider: TEST_CONFIG.provider as string,
-      ...(TEST_CONFIG.model ? { model: TEST_CONFIG.model } : {}),
-      maxTokens: 50,
-      context: { sessionId: testSessionId },
-    });
-
-    await tracingDelay(500);
-
-    const allSpans = spanExporter.getFinishedSpans();
-    const storeSpans = allSpans.filter(
-      (s) =>
-        s.name === "neurolink.memory.storeTurn" ||
-        s.name === "neurolink.conversation.storeTurn",
-    );
-    const buildContextSpans = allSpans.filter(
-      (s) =>
-        s.name === "neurolink.memory.buildContext" ||
-        s.name === "neurolink.conversation.getMessages",
-    );
-
-    // Also check for any memory-related span by broader name matching
-    const anyMemorySpans = allSpans.filter(
-      (s) =>
-        s.name.includes("memory") ||
-        s.name.includes("conversation") ||
-        s.name.includes("storeTurn") ||
-        s.name.includes("buildContext"),
-    );
-
-    const totalMemorySpans =
-      storeSpans.length + buildContextSpans.length + anyMemorySpans.length;
-
-    if (totalMemorySpans === 0) {
-      // Memory is explicitly enabled — at least ONE memory-related span must exist. FAIL.
-      logTest(
-        "Memory Spans",
-        "FAIL",
-        "No memory-related spans found despite conversationMemory being enabled",
-      );
-      return false;
-    }
-
-    logTest(
-      "Memory Spans",
-      "PASS",
-      `storeTurn spans: ${storeSpans.length}, buildContext spans: ${buildContextSpans.length}, other memory spans: ${anyMemorySpans.length}`,
-    );
-    return true;
-  } catch (error) {
-    const msg = error instanceof Error ? error.message : String(error);
-    if (isExpectedProviderError(msg)) {
-      logTest("Memory Spans", "SKIP", `Provider error: ${msg}`);
-      return null;
-    }
-    logTest("Memory Spans", "FAIL", msg);
-    return false;
-  }
-}
-
-// ============================================================
-// TEST #9: Span Parent-Child Hierarchy
-// ============================================================
-
-async function test_span_parent_child(): Promise<boolean | null> {
-  logSection("Test #9: Span Parent-Child Hierarchy");
-  logTest("Span Parent-Child", "TESTING");
-
-  spanExporter.reset();
-
-  const sdk = createSDK();
-
-  try {
-    await sdk.generate({
-      input: { text: 'Say "hierarchy" and nothing else.' },
-      provider: TEST_CONFIG.provider as string,
-      ...(TEST_CONFIG.model ? { model: TEST_CONFIG.model } : {}),
-      maxTokens: 50,
-    });
-
-    await tracingDelay(500);
-
-    const generateSpan = findSpan("neurolink.generate");
-    const providerSpan = findSpan("neurolink.provider.generate");
-
-    if (!generateSpan || !providerSpan) {
-      logTest(
-        "Span Parent-Child",
-        "FAIL",
-        `Missing spans: generate=${!!generateSpan}, provider.generate=${!!providerSpan}`,
-      );
-      return false;
-    }
-
-    // Helper to get parentSpanId from a ReadableSpan
-    const getParentSpanId = (s: ReadableSpan): string | undefined =>
-      s.parentSpanContext?.spanId;
-
-    // Check that provider.generate is a descendant of generate in the span tree
-    const generateSpanId = generateSpan.spanContext().spanId;
-    const providerParentId = getParentSpanId(providerSpan);
-
-    // Verify both are in the same trace
-    const generateTraceId = generateSpan.spanContext().traceId;
-    const providerTraceId = providerSpan.spanContext().traceId;
-
-    if (generateTraceId !== providerTraceId) {
-      logTest(
-        "Span Parent-Child",
-        "FAIL",
-        `Spans in different traces: generate=${generateTraceId}, provider=${providerTraceId}`,
-      );
-      return false;
-    }
-
-    // Check if provider span is a descendant of generate span
-    const isDirectChild = providerParentId === generateSpanId;
-
-    // If not a direct child, walk up the parent chain
-    const allSpans = spanExporter.getFinishedSpans();
-    let isDescendant = isDirectChild;
-
-    if (!isDirectChild) {
-      let currentParentId = providerParentId;
-      const visited = new Set<string>();
-      while (currentParentId && !visited.has(currentParentId)) {
-        visited.add(currentParentId);
-        if (currentParentId === generateSpanId) {
-          isDescendant = true;
-          break;
-        }
-        const parentSpan = allSpans.find(
-          (s) => s.spanContext().spanId === currentParentId,
-        );
-        currentParentId = parentSpan ? getParentSpanId(parentSpan) : undefined;
-      }
-    }
-
-    if (!isDescendant) {
-      // Parent-child links may not be present when NeuroLink bundles its own @opentelemetry/api
-      // (separate global state from the test's OTEL). Same traceId is sufficient to prove correlation.
-      // Log the situation but PASS since both spans share the same trace.
-      log(
-        `  [detail] provider.generate has no parent link to generate (bundled OTEL API may have separate context). Same traceId confirms correlation.`,
-        "yellow",
-      );
-    }
-
-    // Verify 3-level hierarchy if possible:
-    // Look for executeGeneration span as an intermediate level
-    const executeSpan = findSpan("neurolink.executeGeneration");
-    let hierarchyDepth = 2; // generate -> provider.generate at minimum
-    if (executeSpan) {
-      const executeParentId = getParentSpanId(executeSpan);
-      const providerToExecute =
-        providerParentId === executeSpan.spanContext().spanId;
-      const executeToGenerate = executeParentId === generateSpanId;
-      if (providerToExecute && executeToGenerate) {
-        hierarchyDepth = 3;
-      }
-    }
-
-    logTest(
-      "Span Parent-Child",
-      "PASS",
-      `provider.generate is ${isDirectChild ? "direct child" : "descendant"} of generate (same trace: ${generateTraceId}). Hierarchy depth: ${hierarchyDepth}`,
-    );
-    return true;
-  } catch (error) {
-    const msg = error instanceof Error ? error.message : String(error);
-    if (isExpectedProviderError(msg)) {
-      logTest("Span Parent-Child", "SKIP", `Provider error: ${msg}`);
-      return null;
-    }
-    logTest("Span Parent-Child", "FAIL", msg);
-    return false;
-  } finally {
-    try {
-      await (sdk as { shutdown?: () => Promise<void> }).shutdown?.();
-    } catch {
-      /* ignore */
-    }
-  }
-}
-
-// ============================================================
-// TEST #10: All Spans Have Status
-// ============================================================
-
-async function test_all_spans_have_status(): Promise<boolean | null> {
-  logSection("Test #10: All Spans Have Status");
-  logTest("All Spans Have Status", "TESTING");
-
-  spanExporter.reset();
-
-  const sdk = createSDK();
-
-  try {
-    await sdk.generate({
-      input: { text: 'Say "status" and nothing else.' },
-      provider: TEST_CONFIG.provider as string,
-      ...(TEST_CONFIG.model ? { model: TEST_CONFIG.model } : {}),
-      maxTokens: 50,
-    });
-
-    await tracingDelay(500);
-
-    const allSpans = spanExporter.getFinishedSpans();
-
-    if (allSpans.length === 0) {
-      logTest("All Spans Have Status", "FAIL", "No spans captured at all");
-      return false;
-    }
-
-    // Filter to NeuroLink spans (exclude third-party/OTEL auto-instrumentation)
-    const neurolinkSpans = allSpans.filter(
-      (s) => s.name.startsWith("neurolink.") || s.name.startsWith("ai."),
-    );
-
-    if (neurolinkSpans.length === 0) {
-      logTest(
-        "All Spans Have Status",
-        "FAIL",
-        `No NeuroLink spans found among ${allSpans.length} total spans`,
-      );
-      return false;
-    }
-
-    const unsetSpans = neurolinkSpans.filter(
-      (s) => s.status.code === SpanStatusCode.UNSET,
-    );
-
-    if (unsetSpans.length > 0) {
-      const unsetNames = unsetSpans.map((s) => s.name).join(", ");
-      // Some spans may legitimately be UNSET (e.g., Vercel AI SDK spans)
-      // Only fail if NeuroLink's own spans are UNSET
-      const nlUnset = unsetSpans.filter((s) => s.name.startsWith("neurolink."));
-      if (nlUnset.length > 0) {
-        logTest(
-          "All Spans Have Status",
-          "FAIL",
-          `${nlUnset.length} NeuroLink spans have UNSET status: ${nlUnset.map((s) => s.name).join(", ")}`,
-        );
-        return false;
-      }
-    }
-
-    // Assert every NeuroLink-namespaced span has endTime > startTime (duration > 0)
-    const nlSpans = neurolinkSpans.filter((s) =>
-      s.name.startsWith("neurolink."),
-    );
-    const zeroDurationSpans = nlSpans.filter((s) => {
-      const startHr = s.startTime;
-      const endHr = s.endTime;
-      // HrTime is [seconds, nanoseconds] — convert to single comparable value
-      const startNs = startHr[0] * 1e9 + startHr[1];
-      const endNs = endHr[0] * 1e9 + endHr[1];
-      return endNs <= startNs;
-    });
-
-    if (zeroDurationSpans.length > 0) {
-      logTest(
-        "All Spans Have Status",
-        "FAIL",
-        `${zeroDurationSpans.length} NeuroLink spans have zero or negative duration: ${zeroDurationSpans.map((s) => s.name).join(", ")}`,
-      );
-      return false;
-    }
-
-    const unsetCount = unsetSpans.length;
-    const statusDetail =
-      unsetCount > 0
-        ? `All ${neurolinkSpans.length - unsetCount} NeuroLink spans have OK status (${unsetCount} third-party spans UNSET)`
-        : `All ${neurolinkSpans.length} spans have non-UNSET status`;
-
-    logTest(
-      "All Spans Have Status",
-      "PASS",
-      `${statusDetail}. All ${nlSpans.length} neurolink.* spans have duration > 0`,
-    );
-    return true;
-  } catch (error) {
-    const msg = error instanceof Error ? error.message : String(error);
-    if (isExpectedProviderError(msg)) {
-      logTest("All Spans Have Status", "SKIP", `Provider error: ${msg}`);
-      return null;
-    }
-    logTest("All Spans Have Status", "FAIL", msg);
-    return false;
-  } finally {
-    try {
-      await (sdk as { shutdown?: () => Promise<void> }).shutdown?.();
-    } catch {
-      /* ignore */
-    }
-  }
-}
-
-// ============================================================
-// MAIN RUNNER
-// ============================================================
-
-// ============================================================
-// MERGED: telemetry-gaps.ts — Curator P0–P2 reproductions
-// ============================================================
-//
-// 6 reproduce* functions covering Langfuse/OTel telemetry gaps:
-//   P0-1, P0-2: TOOL observations + level on errors
-//   P1-3, P1-4: mcp.tool.call SPAN duplicates / missing fields
-//   P2-5: GENERATION statusMessage on abort/timeout/empty
-//   P2-6: TOOL <-> SPAN correlation
-// Imports contextEnricher / langfuseShouldExportSpan from dist/index.js,
-// then registers them as additional processors on observability's tracer.
-
-function recordTelemetry(
-  name: string,
-  outcome: "PASS" | "FAIL" | "SKIP",
-  detail: string,
-): void {
-  recordTest(name, outcome === "PASS", outcome === "SKIP", detail);
-}
-
-function getSpanByName(name: string): ReadableSpan | undefined {
-  return spanExporter.getFinishedSpans().find((s) => s.name === name);
-}
-
-function reset(): void {
-  spanExporter.reset();
-}
-
-// ---------------------------------------------------------------
-// Issue 1 + 2: ai.toolCall with isError:true must set langfuse.level=ERROR
-//                and langfuse.status_message (Pipeline A)
-// ---------------------------------------------------------------
-async function reproduceIssue_1_2(): Promise<void> {
-  section("Issue 1+2: ai.toolCall with isError → ERROR + status_message");
-  reset();
-
-  // Replicate exactly what the Vercel AI SDK emits for a tool call that
-  // returned { isError: true, content: [...] } — i.e. MCP protocol error.
-  const span = tracer.startSpan("ai.toolCall", {
-    attributes: {
-      "ai.toolCall.name": "mcp__bitbucket__list_branches",
-      "ai.toolCall.id": "call_abc123",
-      "ai.toolCall.args": JSON.stringify({
-        workspace: "BRBZ",
-        repo: "harbour",
-      }),
-    },
-  });
-  // AI SDK treats a returned { isError:true } as success — span stays UNSET.
-  span.setAttribute(
-    "ai.toolCall.result",
-    JSON.stringify({
-      content: [
-        { type: "text", text: "Not found: listing branches in BRBZ/harbour" },
-      ],
-      isError: true,
+function listen(server: Server): Promise<number> {
+  return new Promise((resolve) =>
+    server.listen(0, "127.0.0.1", () => {
+      const address = server.address();
+      resolve(typeof address === "object" && address ? address.port : 0);
     }),
   );
-  span.end(); // triggers ContextEnricher.onEnd()
+}
 
-  const captured = getSpanByName("ai.toolCall");
-  if (!captured) {
-    recordTelemetry(
-      "Issue 1+2: ai.toolCall captured",
-      "FAIL",
-      "span was not captured by exporter",
+function closeServer(server: Server, held: Set<ServerResponse>): Promise<void> {
+  return new Promise((resolve) => {
+    for (const response of held) {
+      response.destroy();
+    }
+    server.close(() => resolve());
+  });
+}
+
+type FakeUpstream = {
+  port: number;
+  baseURL: string;
+  requests: JsonBody[];
+  close: () => Promise<void>;
+};
+
+function chunkFrame(model: string, delta: object, finish: string | null) {
+  return `data: ${JSON.stringify({
+    id: "chatcmpl-fake",
+    object: "chat.completion.chunk",
+    created: 1,
+    model,
+    choices: [{ index: 0, delta, finish_reason: finish }],
+  })}\n\n`;
+}
+
+const LOOKUP_ARGS = { q: "needle" };
+const LOOKUP_ARGS_JSON = JSON.stringify(LOOKUP_ARGS);
+
+const TOOL_CALL = {
+  id: "call_1",
+  type: "function",
+  function: { name: "lookup", arguments: LOOKUP_ARGS_JSON },
+};
+
+function chatBody(model: string, behavior: Behavior, toolDone: boolean) {
+  const calling = behavior === "tool" && !toolDone;
+  return {
+    id: "chatcmpl-fake",
+    object: "chat.completion",
+    created: 1,
+    model,
+    choices: [
+      {
+        index: 0,
+        message: calling
+          ? { role: "assistant", content: null, tool_calls: [TOOL_CALL] }
+          : { role: "assistant", content: "hello there" },
+        finish_reason: calling
+          ? "tool_calls"
+          : behavior === "length"
+            ? "length"
+            : "stop",
+      },
+    ],
+    usage: {
+      prompt_tokens: 12,
+      completion_tokens: 5,
+      total_tokens: 17,
+      prompt_tokens_details: { cached_tokens: 3 },
+      completion_tokens_details: { reasoning_tokens: 2 },
+    },
+  };
+}
+
+function streamChat(
+  res: ServerResponse,
+  model: string,
+  behavior: Behavior,
+  toolDone: boolean,
+  held: Set<ServerResponse>,
+): void {
+  res.writeHead(200, { "content-type": "text/event-stream" });
+  if (behavior === "tool" && !toolDone) {
+    res.write(
+      chunkFrame(
+        model,
+        { role: "assistant", tool_calls: [{ index: 0, ...TOOL_CALL }] },
+        null,
+      ),
     );
+    res.write(chunkFrame(model, {}, "tool_calls"));
+  } else {
+    res.write(chunkFrame(model, { role: "assistant", content: "hel" }, null));
+    if (behavior === "hold") {
+      held.add(res);
+      res.on("close", () => held.delete(res));
+      return;
+    }
+    setTimeout(() => {
+      res.write(chunkFrame(model, { content: "lo" }, null));
+      res.write(
+        chunkFrame(model, {}, behavior === "length" ? "length" : "stop"),
+      );
+      res.write(
+        `data: ${JSON.stringify({
+          id: "chatcmpl-fake",
+          object: "chat.completion.chunk",
+          created: 1,
+          model,
+          choices: [],
+          usage: { prompt_tokens: 12, completion_tokens: 5, total_tokens: 17 },
+        })}\n\n`,
+      );
+      res.end("data: [DONE]\n\n");
+    }, 20);
     return;
   }
-
-  const level = captured.attributes["langfuse.level"];
-  const statusMessage = captured.attributes["langfuse.status_message"];
-
-  const expectedLevel = "ERROR";
-  const levelOk = level === expectedLevel;
-  const statusOk =
-    typeof statusMessage === "string" && statusMessage.length > 0;
-
-  recordTelemetry(
-    "Issue 1: langfuse.status_message populated",
-    statusOk ? "PASS" : "FAIL",
-    `expected non-empty string, got ${JSON.stringify(statusMessage)}`,
+  res.write(
+    `data: ${JSON.stringify({
+      id: "chatcmpl-fake",
+      object: "chat.completion.chunk",
+      created: 1,
+      model,
+      choices: [],
+      usage: { prompt_tokens: 5, completion_tokens: 3, total_tokens: 8 },
+    })}\n\n`,
   );
-  recordTelemetry(
-    "Issue 2: langfuse.level === ERROR",
-    levelOk ? "PASS" : "FAIL",
-    `expected "ERROR", got ${JSON.stringify(level)}`,
+  res.end("data: [DONE]\n\n");
+}
+
+async function startOpenAI(): Promise<FakeUpstream> {
+  const requests: JsonBody[] = [];
+  const held = new Set<ServerResponse>();
+  const server = createServer(async (req, res) => {
+    const body = await readBody(req);
+    requests.push(body);
+    const model = String(body.model ?? "gpt-4o-mini");
+    const behavior = behaviorOf(model);
+    if (behavior === "reject") {
+      res.writeHead(400, { "content-type": "application/json" });
+      res.end(
+        JSON.stringify({
+          error: { message: "rejected", type: "invalid_request_error" },
+        }),
+      );
+      return;
+    }
+    const toolDone = JSON.stringify(body.messages ?? []).includes(
+      "tool_call_id",
+    );
+    if (body.stream === true) {
+      streamChat(res, model, behavior, toolDone, held);
+      return;
+    }
+    res.writeHead(200, { "content-type": "application/json" });
+    res.end(JSON.stringify(chatBody(model, behavior, toolDone)));
+  });
+  const port = await listen(server);
+  return {
+    port,
+    baseURL: `http://127.0.0.1:${port}/v1`,
+    requests,
+    close: () => closeServer(server, held),
+  };
+}
+
+function frame(event: string, payload: JsonBody): string {
+  return `event: ${event}\ndata: ${JSON.stringify({ type: event, ...payload })}\n\n`;
+}
+
+function anthropicCallsTool(body: JsonBody): boolean {
+  return (
+    Array.isArray(body.tools) &&
+    body.tools.length > 0 &&
+    !JSON.stringify(body.messages ?? []).includes("tool_result")
   );
 }
 
-// ---------------------------------------------------------------
-// Issue 3: structural duplicate spans per tool call
-//
-// The fix marks pure-wrapper spans with langfuse.internal=true and the
-// LangfuseSpanProcessor's shouldExportSpan drops those. We verify both:
-//  - the wrapper span creation sites in the source carry the marker
-//  - the runtime shouldExportSpan filter keeps only non-internal spans
-// ---------------------------------------------------------------
-type WrapperSpanSite = { file: string; spanName: string };
+function anthropicMessage(body: JsonBody) {
+  const calling = anthropicCallsTool(body);
+  return {
+    id: "msg_1",
+    type: "message",
+    role: "assistant",
+    model: body.model,
+    content: calling
+      ? [
+          {
+            type: "tool_use",
+            id: "toolu_1",
+            name: "lookup",
+            input: LOOKUP_ARGS,
+          },
+        ]
+      : [{ type: "text", text: "from claude" }],
+    stop_reason: calling ? "tool_use" : "end_turn",
+    usage: {
+      input_tokens: 5,
+      output_tokens: 4,
+      cache_read_input_tokens: 7,
+      cache_creation_input_tokens: 2,
+    },
+  };
+}
 
-// Pure-wrapper spans that MUST carry `langfuse.internal: true`. The public
-// `NeuroLink.executeTool()` span (`neurolink.tool.execute` in neurolink.ts)
-// is INTENTIONALLY NOT marked internal — it's the only non-internal span for
-// direct-API (non-AI-SDK) tool invocations. See PR #979 cycle-3 review.
-const WRAPPER_SPAN_SITES: WrapperSpanSite[] = [
-  {
-    file: "src/lib/core/modules/ToolsManager.ts",
-    spanName: "neurolink.tools.execute_custom",
+function anthropicFrames(body: JsonBody): string[] {
+  const calling = anthropicCallsTool(body);
+  return [
+    frame("message_start", {
+      message: {
+        id: "msg_1",
+        usage: {
+          input_tokens: 5,
+          output_tokens: 0,
+          cache_read_input_tokens: 7,
+          cache_creation_input_tokens: 2,
+        },
+      },
+    }),
+    frame("content_block_start", {
+      index: 0,
+      content_block: calling
+        ? { type: "tool_use", id: "toolu_1", name: "lookup", input: {} }
+        : { type: "text", text: "" },
+    }),
+    frame("content_block_delta", {
+      index: 0,
+      delta: calling
+        ? { type: "input_json_delta", partial_json: LOOKUP_ARGS_JSON }
+        : { type: "text_delta", text: "from claude" },
+    }),
+    frame("content_block_stop", { index: 0 }),
+    frame("message_delta", {
+      delta: { stop_reason: calling ? "tool_use" : "end_turn" },
+      usage: { output_tokens: 4 },
+    }),
+    frame("message_stop", {}),
+  ];
+}
+
+async function startAnthropic(): Promise<FakeUpstream> {
+  const requests: JsonBody[] = [];
+  const server = createServer(async (req, res) => {
+    const body = await readBody(req);
+    requests.push(body);
+    if (body.stream !== true) {
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify(anthropicMessage(body)));
+      return;
+    }
+    res.writeHead(200, { "content-type": "text/event-stream" });
+    for (const entry of anthropicFrames(body)) {
+      res.write(entry);
+    }
+    res.end();
+  });
+  const port = await listen(server);
+  return {
+    port,
+    baseURL: `http://127.0.0.1:${port}`,
+    requests,
+    close: () => closeServer(server, new Set()),
+  };
+}
+
+const LAYA_REPLY = {
+  model: "laya-rl-agent",
+  answers: {
+    urgent: {
+      type: "noul",
+      noul: 0.91,
+      confidence: 0.91,
+      action: { act_probability: 0.5 },
+    },
   },
-  {
-    file: "src/lib/mcp/toolRegistry.ts",
-    spanName: "neurolink.tool.registry.execute",
-  },
+  usage: { input_tokens: 96, output_tokens: 0 },
+  routing: { model: "typed-decisions", reason: "explicit" },
+};
+
+async function startLaya(): Promise<FakeUpstream> {
+  const requests: JsonBody[] = [];
+  const server = createServer(async (req, res) => {
+    requests.push(await readBody(req));
+    res.writeHead(200, {
+      "content-type": "application/json",
+      "x-litellm-call-id": "call-laya-1",
+    });
+    res.end(JSON.stringify(LAYA_REPLY));
+  });
+  const port = await listen(server);
+  return {
+    port,
+    baseURL: `http://127.0.0.1:${port}`,
+    requests,
+    close: () => closeServer(server, new Set()),
+  };
+}
+
+type OtlpMode = "ok" | "partial" | "flaky" | "unauthorized";
+type OtlpHit = {
+  path: string;
+  authorization: string | undefined;
+  headers: Record<string, string | string[] | undefined>;
+  status: number;
+  spans: DecodedSpan[];
+};
+type DecodedSpan = {
+  traceId: string;
+  spanId: string;
+  parentSpanId?: string;
+  name: string;
+  statusCode: number;
+  attributes: JsonBody;
+};
+
+function decodeValue(value: JsonBody): Json | undefined {
+  if (value.arrayValue) {
+    const values = (value.arrayValue as { values?: JsonBody[] }).values;
+    return (values ?? []).map(decodeValue);
+  }
+  if (value.intValue !== undefined) {
+    return Number(value.intValue);
+  }
+  return value.stringValue ?? value.doubleValue ?? value.boolValue;
+}
+
+function decodeSpans(payload: JsonBody): DecodedSpan[] {
+  type Raw = {
+    traceId: string;
+    spanId: string;
+    parentSpanId?: string;
+    name: string;
+    status: { code: number };
+    attributes: { key: string; value: JsonBody }[];
+  };
+  const resources = (payload.resourceSpans ?? []) as {
+    scopeSpans: { spans: Raw[] }[];
+  }[];
+  return resources
+    .flatMap((resource) => resource.scopeSpans)
+    .flatMap((scope) => scope.spans)
+    .map((span) => ({
+      traceId: span.traceId,
+      spanId: span.spanId,
+      parentSpanId: span.parentSpanId,
+      name: span.name,
+      statusCode: span.status.code,
+      attributes: Object.fromEntries(
+        span.attributes.map((entry) => [entry.key, decodeValue(entry.value)]),
+      ),
+    }));
+}
+
+async function startLangfuse(mode: OtlpMode = "ok"): Promise<{
+  baseUrl: string;
+  hits: OtlpHit[];
+  sends: Map<string, number>;
+  close: () => Promise<void>;
+}> {
+  const hits: OtlpHit[] = [];
+  const sends = new Map<string, number>();
+  const server = createServer(async (req, res) => {
+    const spans = decodeSpans(await readBody(req));
+    const answer = (status: number, body: Json): void => {
+      hits.push({
+        path: req.url ?? "",
+        authorization: req.headers.authorization,
+        headers: req.headers,
+        status,
+        spans,
+      });
+      res.writeHead(status, { "content-type": "application/json" });
+      res.end(JSON.stringify(body));
+    };
+    if (mode === "unauthorized") {
+      answer(401, { message: "Invalid credentials" });
+      return;
+    }
+    if (mode === "flaky" && hits.length === 0) {
+      answer(500, { message: "boom" });
+      return;
+    }
+    spans.forEach((span) =>
+      sends.set(span.spanId, (sends.get(span.spanId) ?? 0) + 1),
+    );
+    answer(
+      200,
+      mode === "partial"
+        ? {
+            partialSuccess: {
+              rejectedSpans: "1",
+              errorMessage: "invalid span",
+            },
+          }
+        : {},
+    );
+  });
+  const port = await listen(server);
+  return {
+    baseUrl: `http://127.0.0.1:${port}`,
+    hits,
+    sends,
+    close: () => closeServer(server, new Set()),
+  };
+}
+
+const seen = new Set<ReadableSpan>();
+
+async function exported(): Promise<ReadableSpan[]> {
+  await hostProvider.forceFlush();
+  const spans = langfuseSpans.getFinishedSpans();
+  spans.forEach((span) => seen.add(span));
+  return spans;
+}
+
+async function everySpan(): Promise<ReadableSpan[]> {
+  await hostProvider.forceFlush();
+  const spans = allSpans.getFinishedSpans();
+  spans.forEach((span) => seen.add(span));
+  return spans;
+}
+
+function clear(): void {
+  langfuseSpans.reset();
+  allSpans.reset();
+}
+
+function named(spans: ReadableSpan[], name: string): ReadableSpan[] {
+  return spans.filter(
+    (span) =>
+      span.name === name &&
+      span.attributes["langfuse.observation.type"] !== "generation",
+  );
+}
+
+function only(spans: ReadableSpan[], name: string): ReadableSpan {
+  const matches = named(spans, name);
+  assertEqual(matches.length, 1, `expected exactly one ${name} span`);
+  return matches[0];
+}
+
+function ofType(spans: ReadableSpan[], type: string): ReadableSpan[] {
+  return spans.filter(
+    (span) => span.attributes["langfuse.observation.type"] === type,
+  );
+}
+
+function text(span: ReadableSpan, key: string): string {
+  return String(span.attributes[key] ?? "");
+}
+
+function parsed(span: ReadableSpan, key: string): JsonBody {
+  const raw = span.attributes[key];
+  assert(typeof raw === "string", `${span.name} has no ${key}`);
+  return JSON.parse(raw as string) as JsonBody;
+}
+
+type ChatMessage = {
+  role: string;
+  content: Json;
+  tool_calls?: Array<{ function: { name: string; arguments?: string } }>;
+};
+
+function messages(span: ReadableSpan, key: string): ChatMessage[] {
+  const raw = span.attributes[key];
+  assert(typeof raw === "string", `${span.name} has no ${key}`);
+  const value = JSON.parse(raw as string);
+  assert(Array.isArray(value), `${span.name} ${key} is not a message array`);
+  for (const message of value) {
+    assert(
+      typeof message.role === "string",
+      `${span.name} ${key} holds a message without a role`,
+    );
+  }
+  return value as ChatMessage[];
+}
+
+function assistantText(span: ReadableSpan, key: string): Json | undefined {
+  const reply = messages(span, key);
+  assertEqual(reply.length, 1, `${span.name} ${key} should be one message`);
+  assertEqual(reply[0].role, "assistant");
+  return reply[0].content;
+}
+
+function level(span: ReadableSpan): Json | undefined {
+  return span.attributes["langfuse.observation.level"];
+}
+
+function traceIds(spans: ReadableSpan[]): Set<string> {
+  return new Set(spans.map((span) => span.spanContext().traceId));
+}
+
+async function settle(name: string): Promise<void> {
+  let previous = -1;
+  for (let attempt = 0; attempt < 40; attempt++) {
+    const spans = await exported();
+    if (named(spans, name).length > 0 && spans.length === previous) {
+      return;
+    }
+    previous = spans.length;
+    await new Promise((resolve) => setTimeout(resolve, 50));
+  }
+}
+
+const fake = await startOpenAI();
+const credentials = { openai: { apiKey: "test-key", baseURL: fake.baseURL } };
+const nl = new NeuroLink();
+
+function request(model: string, extra: RequestExtra = {}) {
+  return {
+    input: { text: "hi" },
+    provider: "openai",
+    model,
+    credentials,
+    disableTools: true,
+    disableInternalFallback: true,
+    context,
+    ...extra,
+  } as never;
+}
+
+function lookupTool(calls: { count: number }) {
+  return {
+    lookup: {
+      description: "look a value up",
+      inputSchema: jsonSchema({
+        type: "object",
+        properties: { q: { type: "string" } },
+        additionalProperties: true,
+      }),
+      execute: async () => {
+        calls.count++;
+        return { found: true };
+      },
+    },
+  };
+}
+
+async function drain<T>(stream: AsyncIterable<T>): Promise<void> {
+  for await (const chunk of stream) {
+    void chunk;
+  }
+}
+
+section("generate");
+
+await test("one trace per generate call with root input and output", async () => {
+  clear();
+  const result = await nl.generate(request("gpt-4o-mini"));
+  assertEqual(result.content, "hello there", "generate returned other content");
+  const spans = await exported();
+  const root = only(spans, "generate");
+  assertEqual(text(root, "langfuse.observation.type"), "agent");
+  assert(
+    text(root, "langfuse.observation.input").includes("hi"),
+    "root span has no input",
+  );
+  assertEqual(
+    assistantText(root, "langfuse.observation.output"),
+    "hello there",
+  );
+  assertEqual(traceIds(await everySpan()).size, 1, "call spread over traces");
+});
+
+const MODEL_KEYS = [
+  "langfuse.observation.model.name",
+  "gen_ai.request.model",
+  "gen_ai.response.model",
+  "langfuse.observation.usage_details",
+  "langfuse.observation.cost_details",
 ];
 
-function readSource(rel: string): string {
-  return fs.readFileSync(path.join(REPO_ROOT, rel), "utf8");
-}
-
-function sourceHasMarkerNearSpanName(
-  source: string,
-  spanName: string,
-): boolean {
-  const idx = source.indexOf(`"${spanName}"`);
-  if (idx === -1) {
-    return false;
-  }
-  // Look ±600 chars around the span definition for the marker.
-  const start = Math.max(0, idx - 100);
-  const end = Math.min(source.length, idx + 600);
-  return source.slice(start, end).includes(`"langfuse.internal": true`);
-}
-
-async function reproduceIssue_3(): Promise<void> {
-  section("Issue 3: duplicate spans per tool call");
-  reset();
-
-  // Part A — source-level verification: each wrapper span declaration must
-  // carry the `langfuse.internal: true` marker so LangfuseSpanProcessor drops it.
-  for (const site of WRAPPER_SPAN_SITES) {
-    const src = readSource(site.file);
-    const has = sourceHasMarkerNearSpanName(src, site.spanName);
-    recordTelemetry(
-      `Issue 3a: ${site.spanName} marked langfuse.internal`,
-      has ? "PASS" : "FAIL",
-      has ? "marker found near span declaration" : `missing in ${site.file}`,
+function assertOnlyModelCallsCarryModel(spans: ReadableSpan[]): void {
+  const generations = ofType(spans, "generation");
+  assert(generations.length > 0, "expected at least one generation");
+  for (const generation of generations) {
+    assert(
+      generation.attributes["langfuse.observation.model.name"] !== undefined,
+      `${generation.name} lost its model`,
     );
   }
-
-  // Part B — runtime filter verification: replicate the shouldExportSpan logic
-  // from createLangfuseProcessor() and prove it keeps only 1–2 spans per call.
-  const aiSdkSpan = tracer.startSpan("ai.toolCall", {
-    attributes: {
-      "ai.toolCall.name": "example_tool",
-      "ai.toolCall.id": "call_1",
-    },
-  });
-  await otelContext.with(
-    trace.setSpan(otelContext.active(), aiSdkSpan),
-    async () => {
-      const customSpan = tracer.startSpan("neurolink.tools.execute_custom", {
-        attributes: { "tool.name": "example_tool", "langfuse.internal": true },
-      });
-      await otelContext.with(
-        trace.setSpan(otelContext.active(), customSpan),
-        async () => {
-          // neurolink.tool.execute is intentionally NOT marked internal —
-          // it's the only Langfuse observation for direct-API tool calls.
-          const toolExecSpan = tracer.startSpan("neurolink.tool.execute", {
-            attributes: { "tool.name": "example_tool" },
-          });
-          await otelContext.with(
-            trace.setSpan(otelContext.active(), toolExecSpan),
-            async () => {
-              const registrySpan = tracer.startSpan(
-                "neurolink.tool.registry.execute",
-                {
-                  attributes: {
-                    "tool.name": "example_tool",
-                    "langfuse.internal": true,
-                  },
-                },
-              );
-              await otelContext.with(
-                trace.setSpan(otelContext.active(), registrySpan),
-                async () => {
-                  const mcpCallSpan = tracer.startSpan(
-                    "neurolink.mcp.callTool",
-                    { attributes: { "mcp.tool_name": "example_tool" } },
-                  );
-                  mcpCallSpan.setStatus({ code: SpanStatusCode.OK });
-                  mcpCallSpan.end();
-                },
-              );
-              registrySpan.end();
-            },
-          );
-          toolExecSpan.end();
-        },
-      );
-      customSpan.end();
-    },
-  );
-  aiSdkSpan.end();
-
-  // Use the actual exported filter helper so the test and the Langfuse
-  // processor stay in lock-step.
-  const spans = spanExporter.getFinishedSpans();
-  const exportable = spans.filter((s) =>
-    langfuseShouldExportSpan({ otelSpan: { attributes: s.attributes } }),
-  );
-  const exportableNames = exportable.map((s) => s.name).sort();
-
-  // After filtering the internal wrappers (execute_custom + registry.execute),
-  // the exporter keeps ai.toolCall (AI SDK), neurolink.tool.execute (public
-  // API), and neurolink.mcp.callTool (MCP layer). This matches cycle-3 review:
-  // neurolink.tool.execute must stay observable so direct-API calls produce
-  // at least one Langfuse observation.
-  const expected = [
-    "ai.toolCall",
-    "neurolink.mcp.callTool",
-    "neurolink.tool.execute",
-  ];
-  const pass =
-    exportable.length === expected.length &&
-    expected.every((n) => exportableNames.includes(n));
-  recordTelemetry(
-    "Issue 3b: shouldExportSpan drops internal wrappers, keeps primary + public-API spans",
-    pass ? "PASS" : "FAIL",
-    `kept ${exportable.length} spans: [${exportableNames.join(", ")}], expected [${expected.join(", ")}]`,
-  );
+  for (const span of spans) {
+    const type = span.attributes["langfuse.observation.type"];
+    if (type === "generation" || type === "embedding") {
+      continue;
+    }
+    const leaked = Object.keys(span.attributes).filter(
+      (key) => MODEL_KEYS.includes(key) || key.startsWith("gen_ai.usage."),
+    );
+    assertEqual(leaked.length, 0, `${span.name} carries model or usage`);
+  }
 }
 
-// ---------------------------------------------------------------
-// Issue 4: neurolink.mcp.callTool missing ai.tool.name / input / output
-//
-// The fix adds ai.tool.name, gen_ai.tool.name, gen_ai.request, gen_ai.response
-// attributes directly inside ToolDiscoveryService.executeTool's startActiveSpan
-// call. We verify the source contains these additions AND that ContextEnricher
-// doesn't strip them when a span carries them.
-// ---------------------------------------------------------------
-async function reproduceIssue_4(): Promise<void> {
-  section("Issue 4: neurolink.mcp.callTool SPAN attributes");
-  reset();
+await test("a generate carries model, usage and cost on generations only", async () => {
+  clear();
+  await nl.generate(request("gpt-4o-mini"));
+  assertOnlyModelCallsCarryModel(await exported());
+});
 
-  // Part A — source-level verification: toolDiscoveryService.ts must set
-  // ai.tool.name / gen_ai.request / gen_ai.response when creating the span.
-  // Widen the window to cover the post-normalization gen_ai.response set.
-  const toolDiscoverySrc = readSource("src/lib/mcp/toolDiscoveryService.ts");
-  const mcpCallToolIdx = toolDiscoverySrc.indexOf('"neurolink.mcp.callTool"');
-  const window =
-    mcpCallToolIdx >= 0
-      ? toolDiscoverySrc.slice(mcpCallToolIdx, mcpCallToolIdx + 7000)
-      : "";
-  const hasAiToolNameInSrc = window.includes('"ai.tool.name"');
-  const hasGenAiRequestInSrc = window.includes('"gen_ai.request"');
-  const hasGenAiResponseInSrc = window.includes('"gen_ai.response"');
+await test("a stream carries model, usage and cost on generations only", async () => {
+  clear();
+  const result = await nl.stream(request("gpt-4o-mini"));
+  await drain(result.stream);
+  assertOnlyModelCallsCarryModel(await exported());
+});
 
-  recordTelemetry(
-    "Issue 4a: toolDiscoveryService sets ai.tool.name",
-    hasAiToolNameInSrc ? "PASS" : "FAIL",
-    hasAiToolNameInSrc
-      ? "attribute found in source near span"
-      : "missing in source",
+await test("exactly one generation per model request with full usage and cost", async () => {
+  clear();
+  await nl.generate(request("gpt-4o-mini"));
+  const spans = await exported();
+  const generations = ofType(spans, "generation");
+  assertEqual(generations.length, 1, "expected a single generation");
+  const generation = generations[0];
+  assertEqual(generation.name, "generate");
+  assertEqual(
+    text(generation, "langfuse.observation.metadata.provider"),
+    "openai",
   );
-  recordTelemetry(
-    "Issue 4a: toolDiscoveryService sets gen_ai.request",
-    hasGenAiRequestInSrc ? "PASS" : "FAIL",
-    hasGenAiRequestInSrc
-      ? "attribute found in source near span"
-      : "missing in source",
+  assertEqual(
+    text(generation, "langfuse.observation.model.name"),
+    "gpt-4o-mini",
   );
-  recordTelemetry(
-    "Issue 4a: toolDiscoveryService sets gen_ai.response",
-    hasGenAiResponseInSrc ? "PASS" : "FAIL",
-    hasGenAiResponseInSrc
-      ? "attribute found in source near span"
-      : "missing in source",
+  assert(
+    "maxTokens" in parsed(generation, "langfuse.observation.model.parameters"),
+    "model parameters were not recorded",
   );
+  const usage = parsed(generation, "langfuse.observation.usage_details");
+  assertEqual(usage.output, 5, "output tokens");
+  assertEqual(usage.cache_read_input_tokens, 3, "cache read tokens");
+  assertEqual(usage.reasoning, 2, "reasoning tokens");
+  const cost = parsed(generation, "langfuse.observation.cost_details");
+  assert(Number(cost.total) > 0, "cost was not recorded");
+  assert(
+    text(generation, "langfuse.observation.input").includes("hi"),
+    "generation has no input",
+  );
+  assert(
+    text(generation, "langfuse.observation.output").includes("hello there"),
+    "generation has no output",
+  );
+});
 
-  // Part B — behavior: once those attributes exist on an mcp.callTool span,
-  // ContextEnricher / InMemorySpanExporter must preserve them for Langfuse to
-  // pick up as input/output previews.
-  const span = tracer.startSpan("neurolink.mcp.callTool", {
-    attributes: {
-      "mcp.server_id": "bitbucket",
-      "mcp.tool_name": "search_code",
-      "mcp.timeout_ms": 60000,
-      "ai.tool.name": "search_code",
-      "gen_ai.tool.name": "search_code",
-      "gen_ai.request": JSON.stringify({
-        name: "search_code",
-        arguments: { workspace: "BZ", query: "foo" },
+await test("an env-style secret in a prompt is redacted on the generation input", async () => {
+  clear();
+  await nl.generate(
+    request("gpt-4o-mini", {
+      input: {
+        text: "deploy with OPENAI_API_KEY=sk-abcdefghijklmnopqrstuvwxyz012345 and DB_PASSWORD=hunter2hunter2",
+      },
+    }),
+  );
+  const generation = ofType(await exported(), "generation")[0];
+  const input = text(generation, "langfuse.observation.input");
+  assert(input.includes("[REDACTED]"), "generation input was not redacted");
+  assert(!input.includes("abcdefghijklmnop"), "api key reached the span");
+  assert(!input.includes("hunter2"), "password reached the span");
+});
+
+await test("a base64 data URL in a prompt is replaced by a size placeholder", async () => {
+  clear();
+  await nl.generate(
+    request("gpt-4o-mini", {
+      input: {
+        text: `look at data:image/png;base64,${"QUJD".repeat(500)} please`,
+      },
+    }),
+  );
+  const generation = ofType(await exported(), "generation")[0];
+  const input = text(generation, "langfuse.observation.input");
+  assert(input.includes("[1500 bytes image/png]"), "no media placeholder");
+  assert(!input.includes("QUJDQUJD"), "base64 payload reached the span");
+});
+
+await test("user, session, tags and metadata ride on every span", async () => {
+  clear();
+  await nl.generate(request("gpt-4o-mini"));
+  const spans = await everySpan();
+  assert(spans.length > 1, "expected more than the root span");
+  for (const span of spans) {
+    assertEqual(span.attributes["user.id"], USER, `${span.name} user.id`);
+    assertEqual(
+      span.attributes["session.id"],
+      SESSION,
+      `${span.name} session.id`,
+    );
+    assertEqual(
+      String(span.attributes["langfuse.trace.tags"]),
+      TAG,
+      `${span.name} tags`,
+    );
+    assertEqual(
+      span.attributes["langfuse.trace.metadata.feature"],
+      "obs",
+      `${span.name} metadata`,
+    );
+  }
+});
+
+await test("environment and release come from the environment on every span", async () => {
+  clear();
+  await nl.generate(request("gpt-4o-mini"));
+  for (const span of await everySpan()) {
+    assertEqual(span.attributes["langfuse.environment"], "test-env");
+    assertEqual(span.attributes["langfuse.release"], "test-release");
+  }
+});
+
+await test("setLangfuseContext propagates attributes without a context option", async () => {
+  clear();
+  await setLangfuseContext(
+    { userId: "ctx-user", sessionId: "ctx-session" },
+    () => nl.generate(request("gpt-4o-mini", { context: undefined })),
+  );
+  const root = only(await exported(), "generate");
+  assertEqual(root.attributes["user.id"], "ctx-user");
+  assertEqual(root.attributes["session.id"], "ctx-session");
+});
+
+await test("a failed attempt and its fallback stay in one trace", async () => {
+  clear();
+  const result = await nl.generate(
+    request("reject-model", {
+      providerFallback: async () => ({
+        provider: "openai",
+        model: "gpt-4o-mini",
       }),
-    },
-  });
-  span.setAttribute(
-    "gen_ai.response",
-    JSON.stringify({ content: [{ type: "text", text: "ok" }] }),
+    }),
   );
-  span.setStatus({ code: SpanStatusCode.OK });
-  span.end();
+  assertEqual(result.content, "hello there", "fallback did not answer");
+  const spans = await exported();
+  const generations = ofType(spans, "generation");
+  assertEqual(generations.length, 2, "expected one generation per request");
+  const failed = generations.find(
+    (span) => text(span, "langfuse.observation.model.name") === "reject-model",
+  );
+  assert(failed !== undefined, "failed generation was not exported");
+  assertEqual(failed?.status.code, 2, "failed generation is not an error");
+  assertEqual(named(spans, "generate.attempt").length, 2);
+  assertEqual(traceIds(spans).size, 1, "attempts spread over traces");
+  assertEqual(only(spans, "generate").status.code, 1);
+});
 
-  const captured = getSpanByName("neurolink.mcp.callTool");
-  if (!captured) {
-    recordTelemetry(
-      "Issue 4b: mcp.callTool span captured",
-      "FAIL",
-      "span not captured",
+await test("a length finish marks the generation and the root WARNING", async () => {
+  clear();
+  await nl.generate(request("length-model"));
+  const spans = await exported();
+  assertEqual(level(ofType(spans, "generation")[0]), "WARNING");
+  assertEqual(level(only(spans, "generate")), "WARNING");
+});
+
+section("stream");
+
+await test("a stream records one generation with first-token time and usage", async () => {
+  clear();
+  const result = await nl.stream(request("gpt-4o-mini"));
+  await drain(result.stream);
+  const spans = await exported();
+  const root = only(spans, "stream");
+  assertEqual(assistantText(root, "langfuse.observation.output"), "hello");
+  assertEqual(root.status.code, 1, "root did not finish OK");
+  const generations = ofType(spans, "generation");
+  assertEqual(generations.length, 1, "expected a single generation");
+  const generation = generations[0];
+  assert(
+    generation.attributes["langfuse.observation.completion_start_time"] !==
+      undefined,
+    "completion start time was not recorded",
+  );
+  const usage = parsed(generation, "langfuse.observation.usage_details");
+  assertEqual(usage.input, 12, "input tokens");
+  assertEqual(usage.output, 5, "output tokens");
+  assert(
+    text(generation, "langfuse.observation.output").includes("hello"),
+    "generation has no output",
+  );
+  assert(
+    named(spans, "stream.attempt").length === 1,
+    "expected one attempt span",
+  );
+  assertEqual(traceIds(await everySpan()).size, 1, "call spread over traces");
+});
+
+await test("stream spans carry user, session and tags", async () => {
+  clear();
+  const result = await nl.stream(request("gpt-4o-mini"));
+  await drain(result.stream);
+  for (const span of await everySpan()) {
+    assertEqual(span.attributes["user.id"], USER, `${span.name} user.id`);
+    assertEqual(
+      span.attributes["session.id"],
+      SESSION,
+      `${span.name} session.id`,
     );
-    return;
+    assertEqual(String(span.attributes["langfuse.trace.tags"]), TAG);
   }
-  const hasAiToolName = typeof captured.attributes["ai.tool.name"] === "string";
-  const hasInput = typeof captured.attributes["gen_ai.request"] === "string";
-  const hasOutput = typeof captured.attributes["gen_ai.response"] === "string";
-  recordTelemetry(
-    "Issue 4b: ai.tool.name preserved through exporter",
-    hasAiToolName ? "PASS" : "FAIL",
-    `present=${hasAiToolName}`,
-  );
-  recordTelemetry(
-    "Issue 4b: gen_ai.request preserved through exporter",
-    hasInput ? "PASS" : "FAIL",
-    `present=${hasInput}`,
-  );
-  recordTelemetry(
-    "Issue 4b: gen_ai.response preserved through exporter",
-    hasOutput ? "PASS" : "FAIL",
-    `present=${hasOutput}`,
-  );
-}
+});
 
-// ---------------------------------------------------------------
-// Issue 5: GENERATION statusMessage on abort/timeout/empty-output
-// ---------------------------------------------------------------
-async function reproduceIssue_5(): Promise<void> {
-  section("Issue 5: GENERATION statusMessage on non-API errors");
-  reset();
+await test("a length finish on a stream marks the generation WARNING", async () => {
+  clear();
+  const result = await nl.stream(request("length-model"));
+  await drain(result.stream);
+  const spans = await exported();
+  assertEqual(level(ofType(spans, "generation")[0]), "WARNING");
+  assertEqual(level(only(spans, "stream")), "WARNING");
+});
 
-  // Case 5a — client abort: AI SDK sets ai.finishReason=aborted and leaves
-  // the span status=UNSET. We expect WARNING + a message that mentions abort.
-  {
-    const span = tracer.startSpan("ai.generateText");
-    span.setAttribute("ai.finishReason", "aborted");
-    span.end();
-    const captured = spanExporter
-      .getFinishedSpans()
-      .find((s) => s.name === "ai.generateText");
-    const level = captured?.attributes["langfuse.level"];
-    const statusMessage = captured?.attributes["langfuse.status_message"];
-    const statusStr = typeof statusMessage === "string" ? statusMessage : "";
-    recordTelemetry(
-      "Issue 5a: aborted generation → level=WARNING + abort statusMessage",
-      level === "WARNING" && /abort/i.test(statusStr) ? "PASS" : "FAIL",
-      `level=${JSON.stringify(level)}, statusMessage=${JSON.stringify(statusMessage)}`,
-    );
+await test("breaking out of a stream ends the root span at WARNING", async () => {
+  clear();
+  const result = await nl.stream(request("gpt-4o-mini"));
+  for await (const chunk of result.stream) {
+    void chunk;
+    break;
   }
-
-  reset();
-  // Case 5b — timeout via AI SDK exception path. When the TimeoutError
-  // propagates through streamText/generateText, the AI SDK's recordSpan
-  // wrapper sets span.status = ERROR + message. ContextEnricher's
-  // SpanStatusCode.ERROR branch surfaces level=ERROR + status_message.
-  {
-    const span = tracer.startSpan("ai.streamText");
-    span.setStatus({
-      code: SpanStatusCode.ERROR,
-      message: "openai stream operation timed out after 30000",
-    });
-    span.end();
-    const captured = spanExporter
-      .getFinishedSpans()
-      .find((s) => s.name === "ai.streamText");
-    const level = captured?.attributes["langfuse.level"];
-    const statusMessage = captured?.attributes["langfuse.status_message"];
-    const statusStr = typeof statusMessage === "string" ? statusMessage : "";
-    recordTelemetry(
-      "Issue 5b: timeout → level=ERROR + statusMessage mentions timeout",
-      level === "ERROR" && /(timeout|timed out)/i.test(statusStr)
-        ? "PASS"
-        : "FAIL",
-      `level=${JSON.stringify(level)}, statusMessage=${JSON.stringify(statusMessage)}`,
-    );
-  }
-
-  reset();
-  // Case 5c — empty output: exercise the real producer path. StreamHandler's
-  // NoOutputGeneratedError catch block reads `trace.getSpan(context.active())`
-  // and stamps `neurolink.no_output` on whichever span is active. We replicate
-  // that exact sequence here so the test fails if the producer stops stamping.
-  {
-    const span = tracer.startSpan("ai.streamText");
-    await otelContext.with(
-      trace.setSpan(otelContext.active(), span),
-      async () => {
-        const activeSpan = trace.getSpan(otelContext.active());
-        if (activeSpan) {
-          activeSpan.setAttribute("neurolink.no_output", true);
-        }
-      },
-    );
-    span.end();
-    const captured = spanExporter
-      .getFinishedSpans()
-      .find((s) => s.name === "ai.streamText");
-    const level = captured?.attributes["langfuse.level"];
-    const statusMessage = captured?.attributes["langfuse.status_message"];
-    const statusStr = typeof statusMessage === "string" ? statusMessage : "";
-    const noOutputMarker = captured?.attributes["neurolink.no_output"];
-    recordTelemetry(
-      "Issue 5c: empty output → level=WARNING + no-output statusMessage",
-      noOutputMarker === true &&
-        level === "WARNING" &&
-        /no output|NoOutputGeneratedError/i.test(statusStr)
-        ? "PASS"
-        : "FAIL",
-      `no_output_marker=${noOutputMarker}, level=${JSON.stringify(level)}, statusMessage=${JSON.stringify(statusMessage)}`,
-    );
-  }
-}
-
-// ---------------------------------------------------------------
-// Issue 6: TOOL↔SPAN correlation via captured span ID.
-//   When the AI SDK ai.toolCall span is active, any downstream
-//   neurolink.mcp.callTool span inside the same context should
-//   have the ai.toolCall span as its parent.
-// ---------------------------------------------------------------
-async function reproduceIssue_6(): Promise<void> {
-  section(
-    "Issue 6: parent-child link between ai.toolCall and neurolink.mcp.callTool",
+  await settle("stream");
+  const root = only(await exported(), "stream");
+  assertEqual(level(root), "WARNING");
+  assert(
+    text(root, "langfuse.observation.status_message").length > 0,
+    "early close has no status message",
   );
-  reset();
+});
 
-  const aiSdkSpan = tracer.startSpan("ai.toolCall", {
-    attributes: {
-      "ai.toolCall.name": "bitbucket.search",
-      "ai.toolCall.id": "call_corr_1",
-    },
-  });
-  const aiSdkSpanId = aiSdkSpan.spanContext().spanId;
-
-  await otelContext.with(
-    trace.setSpan(otelContext.active(), aiSdkSpan),
-    async () => {
-      const mcpSpan = tracer.startSpan("neurolink.mcp.callTool", {
-        attributes: { "mcp.tool_name": "search" },
-      });
-      mcpSpan.end();
-    },
+await test("aborting a stream ends the root span at WARNING", async () => {
+  clear();
+  const controller = new AbortController();
+  const result = await nl.stream(
+    request("hold-model", { abortSignal: controller.signal }),
   );
-  aiSdkSpan.end();
-
-  const mcpSpan = getSpanByName("neurolink.mcp.callTool");
-  if (!mcpSpan) {
-    recordTelemetry("Issue 6: mcp span captured", "FAIL", "missing");
-    return;
+  try {
+    for await (const chunk of result.stream) {
+      void chunk;
+      controller.abort();
+    }
+  } catch {
+    assert(controller.signal.aborted, "stream failed without an abort");
   }
-  const parentSpanId =
-    (
-      mcpSpan as unknown as {
-        parentSpanContext?: { spanId?: string };
-        parentSpanId?: string;
-      }
-    ).parentSpanContext?.spanId ??
-    (mcpSpan as unknown as { parentSpanId?: string }).parentSpanId;
+  await settle("stream");
+  assertEqual(level(only(await exported(), "stream")), "WARNING");
+});
 
-  recordTelemetry(
-    "Issue 6: mcp.callTool parent === ai.toolCall spanId",
-    parentSpanId === aiSdkSpanId ? "PASS" : "FAIL",
-    `aiSdkSpanId=${aiSdkSpanId}, parentSpanId=${parentSpanId}`,
+await test("a stream that is never iterated and then returned still ends its root span", async () => {
+  clear();
+  const result = await nl.stream(request("gpt-4o-mini"));
+  await (result.stream as AsyncGenerator).return(undefined);
+  await settle("stream");
+  const roots = named(await exported(), "stream");
+  assertEqual(roots.length, 1, "root span was never ended");
+});
+
+function assertGenerationCarriesToolArguments(spans: ReadableSpan[]): void {
+  const recorded = ofType(spans, "generation").flatMap((generation) =>
+    messages(generation, "langfuse.observation.output").flatMap(
+      (message) => message.tool_calls ?? [],
+    ),
+  );
+  assertEqual(recorded.length, 1, "expected one recorded tool call");
+  assertEqual(
+    recorded[0].function.arguments,
+    text(only(spans, "lookup"), "langfuse.observation.input"),
+    "generation output lost the tool call arguments",
   );
 }
 
-// ---------------------------------------------------------------
-// Main
-// ---------------------------------------------------------------
+section("tools");
 
-async function runTracingTests(): Promise<void> {
-  const tracingTests: Array<{
-    name: string;
-    fn: () => Promise<boolean | null>;
-  }> = [
-    { name: "Tracing: Generate Span Chain", fn: test_generate_span_chain },
-    { name: "Tracing: Stream Span Chain", fn: test_stream_span_chain },
-    { name: "Tracing: Message Build Span", fn: test_message_build_span },
-    { name: "Tracing: Cost on Spans", fn: test_cost_on_spans },
-    { name: "Tracing: Input Recording", fn: test_input_recording },
-    { name: "Tracing: Error Tracing", fn: test_error_tracing },
-    { name: "Tracing: Tool Execution Span", fn: test_tool_execution_span },
-    { name: "Tracing: Memory Spans", fn: test_memory_spans },
-    { name: "Tracing: Span Parent-Child", fn: test_span_parent_child },
-    { name: "Tracing: All Spans Have Status", fn: test_all_spans_have_status },
-  ];
-  for (const t of tracingTests) {
-    try {
-      const result = await t.fn();
-      recordTest(
-        t.name,
-        result === true,
-        result === null,
-        result === null ? "skipped" : result === true ? undefined : "failed",
-      );
-    } catch (error) {
-      const msg = error instanceof Error ? error.message : String(error);
-      recordTest(t.name, false, false, msg);
-    }
-    await tracingDelay(TRACING_CONFIG.interTestDelay);
-  }
-}
-
-async function runTelemetryGapsTests(): Promise<void> {
-  await reproduceIssue_1_2();
-  await reproduceIssue_3();
-  await reproduceIssue_4();
-  await reproduceIssue_5();
-  await reproduceIssue_6();
-}
-// ============================================================
-// OTLP INITIALIZATION READINESS
-// ============================================================
-
-async function testOtlpInitializationReadiness(): Promise<boolean | null> {
-  logSection("OTLP initialization readiness");
-  // registerHooks() is available from Node 22.15.0; the package's own engine
-  // floor (>=22.0.0) is older, so a contributor on an in-between minor can't
-  // run this probe. Skip rather than fail — CI's Node is well past 22.15.
-  const [major, minor] = process.versions.node.split(".").map(Number);
-  if (major < 22 || (major === 22 && minor < 15)) {
-    logTest(
-      "OTLP initialization readiness",
-      "SKIP",
-      `registerHooks needs Node >=22.15.0, running ${process.version}`,
-    );
-    return null;
-  }
-  const script = `
-    import { registerHooks } from "node:module";
-    globalThis.__loggerProviders = 0;
-    globalThis.__failRegister = false;
-    registerHooks({
-      load(url, context, next) {
-        const loaded = next(url, context);
-        if (
-          url.includes("/@opentelemetry/sdk-trace-node/") &&
-          url.endsWith("/build/src/NodeTracerProvider.js")
-        ) {
-          return {
-            ...loaded,
-            source: String(loaded.source).replace(
-              "register(config = {}) {",
-              "register(config = {}) { if (globalThis.__failRegister) throw new Error('forced registration failure');",
-            ),
-          };
-        }
-        if (
-          !url.includes("/@opentelemetry/sdk-logs/") ||
-          !url.endsWith("/build/src/LoggerProvider.js")
-        ) {
-          return loaded;
-        }
-        return {
-          ...loaded,
-          source: String(loaded.source).replace(
-            "constructor(config = {}) {",
-            "constructor(config = {}) { globalThis.__loggerProviders++;",
-          ),
-        };
-      },
-    });
-    process.env.OTEL_EXPORTER_OTLP_ENDPOINT = "http://127.0.0.1:1";
-    const [{ NeuroLink }, otel] = await Promise.all([
-      import("./dist/index.js"),
-      import("./dist/services/server/ai/observability/instrumentation.js"),
-    ]);
-    const config = { enabled: false, useExternalTracerProvider: true };
-
-    await Promise.all(
-      Array.from({ length: 20 }, () => otel.initializeOpenTelemetry(config)),
-    );
-    if (globalThis.__loggerProviders !== 1) {
-      throw new Error("expected 1 LoggerProvider construction, got " + globalThis.__loggerProviders);
-    }
-    await otel.shutdownOpenTelemetry();
-
-    // A direct shutdown, with no flush in front of it, must still wait for an
-    // initialization that is already running.
-    const pending = otel.initializeOpenTelemetry(config);
-    await otel.shutdownOpenTelemetry();
-    await pending;
-    if (otel.getLoggerProvider() !== null) {
-      throw new Error("a direct shutdown returned before in-flight initialization finished");
-    }
-
-    const sdk = new NeuroLink({ observability: { langfuse: config } });
-    await sdk.shutdown();
-    if (otel.getLoggerProvider() !== null) {
-      throw new Error("NeuroLink shutdown returned while the log provider was still live");
-    }
-    await new Promise((resolve) => setTimeout(resolve, 200));
-    if (otel.getLoggerProvider() !== null) {
-      throw new Error("a provider appeared after NeuroLink shutdown completed");
-    }
-
-    // A flush that races an initialization which then fails must skip, as it
-    // did before initialization was shared, rather than reject.
-    globalThis.__failRegister = true;
-    const failing = otel
-      .initializeOpenTelemetry({ enabled: false })
-      .then(() => "resolved", () => "rejected");
-    const flushed = otel
-      .flushOpenTelemetry()
-      .then(() => "resolved", () => "rejected");
-    if ((await failing) !== "rejected") {
-      throw new Error("precondition: the forced initialization failure did not happen");
-    }
-    if ((await flushed) !== "resolved") {
-      throw new Error("flush rejected because a concurrent initialization failed");
-    }
-    globalThis.__failRegister = false;
-    await otel.shutdownOpenTelemetry();
-    console.log("OTLP_READY_AND_SHUT_DOWN");
-  `;
-
-  const result = await runCommand(process.execPath, [
-    "--input-type=module",
-    "-e",
-    script,
-  ]);
-  if (!result.success || !result.stdout.includes("OTLP_READY_AND_SHUT_DOWN")) {
-    logTest(
-      "OTLP initialization readiness",
-      "FAIL",
-      `initialization and immediate shutdown did not complete in order — exit=${result.code}; stderr=${result.stderr.slice(-1000)}`,
-    );
-    return false;
-  }
-  logTest("OTLP initialization readiness", "PASS");
-  return true;
-}
-
-// ============================================================
-// SHUTDOWN-DURING-INIT
-// ============================================================
-
-/**
- * An initializeOpenTelemetry() call that starts while shutdownOpenTelemetry()
- * is mid-teardown must not be orphaned: isInitialized reads stale (still
- * true) until teardown actually finishes, so a naive check lets the caller
- * believe it succeeded moments before teardown nulls out every provider it
- * was relying on.
- *
- * A controllable gate is spliced into the teardown's try block via a load
- * hook, exactly where the OTLP readiness case above splices its own hooks.
- * This makes the race deterministic — no timing, no retries — by pausing
- * teardown at a known point and controlling exactly when it resumes.
- */
-async function testShutdownDuringInit(): Promise<boolean | null> {
-  logSection("Shutdown during init");
-  const [major, minor] = process.versions.node.split(".").map(Number);
-  if (major < 22 || (major === 22 && minor < 15)) {
-    logTest(
-      "Shutdown during init",
-      "SKIP",
-      `registerHooks needs Node >=22.15.0, running ${process.version}`,
-    );
-    return null;
-  }
-  const script = `
-    import { registerHooks } from "node:module";
-    registerHooks({
-      load(url, context, next) {
-        const loaded = next(url, context);
-        if (!url.endsWith("/services/server/ai/observability/instrumentation.js")) {
-          return loaded;
-        }
-        return {
-          ...loaded,
-          source: String(loaded.source).replace(
-            "async function shutdownOpenTelemetryOnce() {",
-            "async function shutdownOpenTelemetryOnce() { await globalThis.__shutdownGate;",
-          ),
-        };
-      },
-    });
-    process.env.OTEL_EXPORTER_OTLP_ENDPOINT = "http://127.0.0.1:1";
-    const otel = await import("./dist/services/server/ai/observability/instrumentation.js");
-    const config = { enabled: false, useExternalTracerProvider: true };
-
-    await otel.initializeOpenTelemetry(config);
-    if (otel.getLoggerProvider() === null) {
-      throw new Error("precondition: expected a provider after the initial init");
-    }
-
-    let release;
-    globalThis.__shutdownGate = new Promise((r) => { release = r; });
-    const pendingShutdown = otel.shutdownOpenTelemetry();
-
-    // Started while shutdown is paused mid-teardown, with isInitialized
-    // still (stale-)true.
-    const pendingReinit = otel.initializeOpenTelemetry(config);
-
-    release();
-    await pendingShutdown;
-    await pendingReinit;
-
-    if (otel.getLoggerProvider() === null) {
-      throw new Error("an init that started during shutdown teardown left no provider behind");
-    }
-    console.log("SHUTDOWN_DURING_INIT_OK");
-  `;
-
-  const result = await runCommand(process.execPath, [
-    "--input-type=module",
-    "-e",
-    script,
-  ]);
-  if (!result.success || !result.stdout.includes("SHUTDOWN_DURING_INIT_OK")) {
-    logTest(
-      "Shutdown during init",
-      "FAIL",
-      `an init started during teardown was orphaned — exit=${result.code}; stderr=${result.stderr.slice(-1000)}`,
-    );
-    return false;
-  }
-  logTest("Shutdown during init", "PASS");
-  return true;
-}
-
-// ============================================================
-// BUFFERED METRIC DURING ASYNC INIT
-// ============================================================
-
-/**
- * `TelemetryService`'s constructor fires its async `initializeTelemetry()`
- * without awaiting it (must stay synchronous — see that constructor's own
- * comment on why, and `getInstance()`'s). That leaves a real window, between
- * `getInstance()` returning and the dynamic OTel imports resolving, where
- * `enabled` is already true but no counter/histogram exists yet. A recording
- * call landing in that window must be buffered and replayed once ready, not
- * dropped — losing it would silently blackhole the exact cold-start metrics
- * `TelemetryHandler.recordPerformanceMetrics`/`recordTTSFailure`,
- * `proxyTracer.recordMetrics()`, and `externalServerManager`'s
- * `recordMCPToolCall()` sites emit with no `await` between `getInstance()`
- * and the record call.
- *
- * A controllable gate is spliced into `initializeTelemetry()` via a load
- * hook, exactly where `testShutdownDuringInit` above splices its own gate
- * into `shutdownOpenTelemetryOnce()`. This makes the race deterministic — no
- * timing, no retries: the recording call is made while the gate provably
- * has not resolved, and "was it recorded" is answered by counting
- * invocations of the underlying OTel `Counter.add()` (via a second load hook
- * over `@opentelemetry/api`'s NoopMeter — no live collector needed, since
- * nothing in this bare subprocess registers a global MeterProvider) rather
- * than by polling or sleeping.
- */
-async function testTelemetryBufferedDuringAsyncInit(): Promise<boolean | null> {
-  logSection("Telemetry buffered metric during async init");
-  const [major, minor] = process.versions.node.split(".").map(Number);
-  if (major < 22 || (major === 22 && minor < 15)) {
-    logTest(
-      "Telemetry buffered metric during async init",
-      "SKIP",
-      `registerHooks needs Node >=22.15.0, running ${process.version}`,
-    );
-    return null;
-  }
-  const script = `
-    import { registerHooks } from "node:module";
-    let releaseGate;
-    globalThis.__telemetryInitGate = new Promise((r) => { releaseGate = r; });
-    globalThis.__noopCounterAdds = 0;
-    registerHooks({
-      load(url, context, next) {
-        const loaded = next(url, context);
-        if (url.endsWith("/dist/telemetry/telemetryService.js")) {
-          const patched = String(loaded.source).replace(
-            "async initializeTelemetry() {\\n        try {",
-            "async initializeTelemetry() {\\n        await globalThis.__telemetryInitGate;\\n        try {",
-          );
-          if (patched === String(loaded.source)) {
-            throw new Error("precondition: initializeTelemetry() anchor not found — dist may be stale or the method was reshaped");
-          }
-          return { ...loaded, source: patched };
-        }
-        if (
-          url.includes("/@opentelemetry/api/") &&
-          url.endsWith("/build/src/metrics/NoopMeter.js")
-        ) {
-          const patched = String(loaded.source).replace(
-            "add(_value, _attributes) { }",
-            "add(_value, _attributes) { globalThis.__noopCounterAdds++; }",
-          );
-          if (patched === String(loaded.source)) {
-            throw new Error("precondition: NoopCounterMetric.add anchor not found");
-          }
-          return { ...loaded, source: patched };
-        }
-        return loaded;
-      },
-    });
-
-    process.env.NEUROLINK_TELEMETRY_ENABLED = "true";
-    process.env.OTEL_EXPORTER_OTLP_ENDPOINT = "http://127.0.0.1:1";
-
-    const { TelemetryService } = await import("./dist/telemetry/telemetryService.js");
-    const telemetry = TelemetryService.getInstance();
-
-    // Precondition: the gate is genuinely blocking construction right now —
-    // otherwise the rest of this script would prove nothing about buffering.
-    if (telemetry.isReady) {
-      throw new Error("precondition: instruments were already ready before the gate was released");
-    }
-
-    // A recording call made in the enabled-but-not-ready window.
-    telemetry.recordCustomMetric("buffer_probe", 1, { probe: "telemetry-buffering" });
-
-    // It must not have reached OTel yet (buffered, not emitted early).
-    if (globalThis.__noopCounterAdds !== 0) {
-      throw new Error("precondition: counter.add() fired before init resolved — nothing left to prove about buffering");
-    }
-    // And it must not have been silently dropped either: this is the same
-    // failure the break-on-purpose revert (a bare no-op-if-not-ready) produces,
-    // just caught one step earlier than the final add()-count assertion below.
-    if (telemetry.pendingCalls.length !== 1) {
-      throw new Error("BUFFERED_METRIC_DROPPED: the 'buffer_probe' custom metric recorded before async init resolved was not buffered (expected 1 pending call, got " + telemetry.pendingCalls.length + ") — it was silently dropped instead");
-    }
-
-    releaseGate();
-    await telemetry.readyPromise;
-
-    if (!telemetry.isReady) {
-      throw new Error("readyPromise resolved but isReady is still false");
-    }
-    if (telemetry.pendingCalls.length !== 0) {
-      throw new Error("buffer was not drained after init became ready");
-    }
-    if (globalThis.__noopCounterAdds !== 1) {
-      throw new Error("BUFFERED_METRIC_DROPPED: expected the counter's add() to fire exactly once after drain, got " + globalThis.__noopCounterAdds);
-    }
-    console.log("TELEMETRY_BUFFER_DRAINED_OK");
-  `;
-
-  const result = await runCommand(process.execPath, [
-    "--input-type=module",
-    "-e",
-    script,
-  ]);
-  if (
-    !result.success ||
-    !result.stdout.includes("TELEMETRY_BUFFER_DRAINED_OK")
-  ) {
-    logTest(
-      "Telemetry buffered metric during async init",
-      "FAIL",
-      `a metric recorded before async init resolved was not replayed — exit=${result.code}; stderr=${result.stderr.slice(-1000)}`,
-    );
-    return false;
-  }
-  logTest("Telemetry buffered metric during async init", "PASS");
-  return true;
-}
-
-// ============================================================
-// PROXY OTEL LOGS: LAZY SDK IMPORT
-// ============================================================
-
-/**
- * `otelLogSink.ts`'s `initializeProxyOtelLogs()` validates the configured
- * OTLP endpoint (HTTPS required for a non-loopback collector) with zero
- * heavy imports, then requires `@opentelemetry/sdk-logs` / `resources` /
- * `core` (via `require()`, not a top-level import) only once validation
- * passes. The security property this must preserve: a misconfigured
- * endpoint fails *before* the SDK is ever required, so a caller can't
- * silently proceed with a cleartext collector just because it constructed
- * the endpoint from untrusted config.
- */
-async function testProxyOtelLogsValidateBeforeImport(): Promise<
-  boolean | null
-> {
-  logSection("Proxy OTel logs validate before importing the SDK");
-  const [major, minor] = process.versions.node.split(".").map(Number);
-  if (major < 22 || (major === 22 && minor < 15)) {
-    logTest(
-      "Proxy OTel logs validate before importing the SDK",
-      "SKIP",
-      `registerHooks needs Node >=22.15.0, running ${process.version}`,
-    );
-    return null;
-  }
-  const script = `
-    import { registerHooks } from "node:module";
-    let sdkLogsTouched = false;
-    registerHooks({
-      load(url, context, next) {
-        if (url.includes("/@opentelemetry/sdk-logs/")) {
-          sdkLogsTouched = true;
-        }
-        return next(url, context);
-      },
-    });
-    process.env.NEUROLINK_PROXY_LOG_SINK = "otel";
-    process.env.OTEL_EXPORTER_OTLP_LOGS_ENDPOINT = "http://example.com/v1/logs";
-    const { initializeProxyOtelLogs } = await import("./dist/proxy/otelLogSink.js");
-    let message = "";
-    try {
-      initializeProxyOtelLogs();
-    } catch (err) {
-      message = err instanceof Error ? err.message : String(err);
-    }
-    if (!message.includes("HTTPS")) {
-      throw new Error("precondition: expected a synchronous HTTPS-required throw, got: " + message);
-    }
-    if (sdkLogsTouched) {
-      throw new Error("validation ran after the heavy SDK import started, not before it");
-    }
-    console.log("VALIDATE_BEFORE_IMPORT_OK");
-  `;
-  const result = await runCommand(process.execPath, [
-    "--input-type=module",
-    "-e",
-    script,
-  ]);
-  if (!result.success || !result.stdout.includes("VALIDATE_BEFORE_IMPORT_OK")) {
-    logTest(
-      "Proxy OTel logs validate before importing the SDK",
-      "FAIL",
-      `endpoint validation did not fail synchronously before the SDK import — exit=${result.code}; stderr=${result.stderr.slice(-1000)}`,
-    );
-    return false;
-  }
-  logTest("Proxy OTel logs validate before importing the SDK", "PASS");
-  return true;
-}
-
-// ============================================================
-// MAIN RUNNER
-// ============================================================
-
-async function runAllTests(): Promise<void> {
-  const startTime = Date.now();
-  log("\n--- NeuroLink Continuous Test Suite: Observability ---", "bright");
-  log(
-    `   Provider: ${TEST_CONFIG.provider}, Model: ${TEST_CONFIG.model || "default"}`,
-    "cyan",
+await test("a tool result with a data array is exported intact", async () => {
+  clear();
+  const payload = { data: [{ id: 1 }], total: 1 };
+  const tools = {
+    lookup: {
+      ...lookupTool({ count: 0 }).lookup,
+      execute: async () => payload,
+    },
+  };
+  const result = await nl.stream(
+    request("tool-model", { tools, disableTools: false, maxSteps: 3 }),
   );
-  log(
-    `   Mode: Local (InMemorySpanExporter — no Langfuse credentials needed)`,
-    "green",
+  await drain(result.stream);
+  const output = text(
+    only(await exported(), "lookup"),
+    "langfuse.observation.output",
   );
+  assert(
+    !output.includes("undefined bytes"),
+    "tool output became a placeholder",
+  );
+  assertEqual(JSON.stringify(JSON.parse(output)), JSON.stringify(payload));
+});
 
-  // Prerequisite checks
-  if (!fs.existsSync("dist") || !fs.existsSync("dist/index.js")) {
-    // Throw so the harness owns the exit path (prints summary, cleanup).
-    throw new Error("Build not found. Run: pnpm run build");
+await test("telemetry reports enabled when the Langfuse keys are set", async () => {
+  assertEqual(nl.isTelemetryEnabled(), true);
+});
+
+await test("a streamed tool call becomes a tool observation with input and output", async () => {
+  clear();
+  const calls = { count: 0 };
+  const result = await nl.stream(
+    request("tool-model", {
+      tools: lookupTool(calls),
+      disableTools: false,
+      maxSteps: 3,
+    }),
+  );
+  await drain(result.stream);
+  assertEqual(calls.count, 1, "the tool did not run once");
+  const spans = await exported();
+  const tool = only(spans, "lookup");
+  assertEqual(text(tool, "langfuse.observation.type"), "tool");
+  assert(
+    text(tool, "langfuse.observation.input").includes("needle"),
+    "tool span has no input",
+  );
+  assert(
+    text(tool, "langfuse.observation.output").includes("found"),
+    "tool span has no output",
+  );
+  assertEqual(
+    ofType(spans, "generation").length,
+    2,
+    "expected one generation per model request",
+  );
+  assertEqual(traceIds(spans).size, 1, "tool call left the trace");
+  assertEqual(tool.attributes["user.id"], USER);
+  assertGenerationCarriesToolArguments(spans);
+});
+
+await test("a tool observation is named after the tool", async () => {
+  clear();
+  await nl.generate(
+    request("tool-model", {
+      tools: lookupTool({ count: 0 }),
+      disableTools: false,
+      maxSteps: 3,
+    }),
+  );
+  const tools = ofType(await exported(), "tool");
+  assert(tools.length > 0, "no tool observation was exported");
+  for (const tool of tools) {
+    assertEqual(tool.name, "lookup");
   }
+});
 
-  const tests: Array<{ name: string; fn: () => Promise<boolean | null> }> = [
-    {
-      name: "OTLP Initialization Readiness",
-      fn: testOtlpInitializationReadiness,
-    },
-    { name: "Shutdown During Init", fn: testShutdownDuringInit },
-    {
-      name: "Telemetry Buffered Metric During Async Init",
-      fn: testTelemetryBufferedDuringAsyncInit,
-    },
-    {
-      name: "Proxy OTel Logs Validate Before Import",
-      fn: testProxyOtelLogsValidateBeforeImport,
-    },
-    { name: "Telemetry Service Init", fn: testTelemetryServiceInit },
-    {
-      name: "External TracerProvider Mode",
-      fn: testExternalTracerProviderMode,
-    },
-    { name: "getSpanProcessors", fn: testGetSpanProcessors },
-    {
-      name: "setLangfuseContext / getLangfuseContext",
-      fn: testSetLangfuseContext,
-    },
-    {
-      name: "Context Callback + Generate",
-      fn: testSetLangfuseContextWithCallback,
-    },
-    {
-      name: "Operation Name Auto-Detection",
-      fn: testOperationNameAutoDetection,
-    },
-    { name: "Trace Name Format", fn: testTraceNameFormat },
-    { name: "Custom Metadata in Context", fn: testCustomMetadataInContext },
-    {
-      name: "OTEL Exports Availability",
-      fn: testOTELExportsAvailability,
-    },
-    { name: "getTracer for Custom Spans", fn: testGetTracer },
-    { name: "Trace Tags in Context", fn: testTagsInContext },
-    { name: "All Extended Context Fields", fn: testAllContextFields },
-    { name: "CLI with Observability", fn: testCLIWithObservability },
-    { name: "Operation Name Override", fn: testOperationNameOverride },
-    { name: "Wrapper Span Support", fn: testWrapperSpanSupport },
-    ...ISSUE04_TARGETS.flatMap((t) => [
-      {
-        name: `Issue#4 generate / ${t.provider} — generation:end emissions`,
-        fn: () => issue04CountEmissionsForGenerate(t),
-      },
-      {
-        name: `Issue#4 stream / ${t.provider} — generation:end emissions`,
-        fn: () => issue04CountEmissionsForStream(t),
-      },
-    ]),
-  ];
+await test("a generate tool call becomes a tool observation in the same trace", async () => {
+  clear();
+  const calls = { count: 0 };
+  await nl.generate(
+    request("tool-model", {
+      tools: lookupTool(calls),
+      disableTools: false,
+      maxSteps: 3,
+    }),
+  );
+  assertEqual(calls.count, 1, "the tool did not run once");
+  const spans = await exported();
+  const tool = only(spans, "lookup");
+  assertEqual(text(tool, "langfuse.observation.type"), "tool");
+  assertEqual(ofType(spans, "generation").length, 2);
+  assertEqual(traceIds(spans).size, 1, "tool call left the trace");
+  assertGenerationCarriesToolArguments(spans);
+});
 
-  for (const test of tests) {
-    try {
-      const result = await withCaseTimeout(test.name, test.fn);
-      if (result === null) {
-        recordTest(test.name, false, true, "skipped");
+await test("a per-call tool yields exactly one tool observation per execution", async () => {
+  clear();
+  const calls = { count: 0 };
+  await nl.generate(
+    request("tool-model", {
+      tools: lookupTool(calls),
+      disableTools: false,
+      maxSteps: 3,
+    }),
+  );
+  assertEqual(calls.count, 1, "the tool did not run once");
+  assertEqual(
+    ofType(await exported(), "tool").length,
+    1,
+    "a per-call tool was observed more than once",
+  );
+});
+
+await test("a registered tool yields exactly one tool observation per execution", async () => {
+  clear();
+  const registered = new NeuroLink();
+  const calls = { count: 0 };
+  registered.registerTool("lookup", {
+    name: "lookup",
+    description: "look a value up",
+    inputSchema: z.object({ q: z.string().optional() }),
+    execute: async () => {
+      calls.count++;
+      return { found: true };
+    },
+  } as never);
+  await registered.generate(
+    request("tool-model", { disableTools: false, maxSteps: 3 }),
+  );
+  assertEqual(calls.count, 1, "the tool did not run once");
+  assertEqual(
+    ofType(await exported(), "tool").length,
+    1,
+    "a registered tool was observed more than once",
+  );
+});
+
+section("providers");
+
+async function withFakeAnthropic(run: () => Promise<void>): Promise<void> {
+  const anthropic = await startAnthropic();
+  const saved = {
+    ANTHROPIC_API_KEY: process.env.ANTHROPIC_API_KEY,
+    ANTHROPIC_BASE_URL: process.env.ANTHROPIC_BASE_URL,
+    ANTHROPIC_AUTH_METHOD: process.env.ANTHROPIC_AUTH_METHOD,
+  };
+  process.env.ANTHROPIC_API_KEY = "test-key";
+  process.env.ANTHROPIC_BASE_URL = anthropic.baseURL;
+  process.env.ANTHROPIC_AUTH_METHOD = "api_key";
+  try {
+    await run();
+  } finally {
+    for (const [name, value] of Object.entries(saved)) {
+      if (value === undefined) {
+        delete process.env[name];
       } else {
-        recordTest(
-          test.name,
-          result,
-          false,
-          result ? undefined : "assertion failed",
-        );
-      }
-    } catch (error) {
-      const msg = error instanceof Error ? error.message : String(error);
-      recordTest(test.name, false, false, msg);
-
-      // A case bound is not an ordinary failure: Promise.race cannot cancel, so
-      // the abandoned case is still running. Continuing would run the loop's
-      // cleanup and inter-case delay underneath live work, and record every
-      // remaining case as "not run". Stop at the first one.
-      if (isCaseTimeout(error)) {
-        log(
-          `\n\u{1F6D1} ABORTING: "${test.name}" was abandoned by its timeout and is still executing. ` +
-            `Remaining cases are NOT run — this process no longer has clean state.`,
-          "red",
-        );
-        break;
+        process.env[name] = value;
       }
     }
-    await new Promise((r) => setTimeout(r, TEST_CONFIG.interTestDelay));
+    await anthropic.close();
   }
-
-  // Merged tracing + telemetry-gaps families
-  await runTracingTests();
-  await runTelemetryGapsTests();
 }
 
-// ============================================================
-// CLI ARGS + EXECUTION
-// ============================================================
+await test("a native Anthropic generation records cache usage", () =>
+  withFakeAnthropic(async () => {
+    clear();
+    const result = await nl.stream({
+      input: { text: "hi" },
+      provider: "anthropic",
+      model: "claude-3-5-sonnet-20241022",
+      maxTokens: 32,
+      disableTools: true,
+      disableInternalFallback: true,
+      context,
+    } as never);
+    await drain(result.stream);
+    const generations = ofType(await exported(), "generation");
+    assertEqual(generations.length, 1, "expected a single generation");
+    assertEqual(generations[0].name, "stream");
+    assertEqual(
+      text(generations[0], "langfuse.observation.metadata.provider"),
+      "anthropic",
+    );
+    const usage = parsed(generations[0], "langfuse.observation.usage_details");
+    assertEqual(usage.cache_read_input_tokens, 7, "cache read tokens");
+    assertEqual(usage.cache_creation_input_tokens, 2, "cache write tokens");
+  }));
 
-function parseArguments(): { provider?: string; model?: string } {
-  const args: { provider?: string; model?: string } = {};
-  for (const arg of process.argv.slice(2)) {
-    if (arg.startsWith("--provider=")) {
-      args.provider = arg.split("=")[1];
+for (const mode of ["stream", "generate"] as const) {
+  await test(`a native Anthropic ${mode} tool call keeps its arguments in the generation`, () =>
+    withFakeAnthropic(async () => {
+      clear();
+      const calls = { count: 0 };
+      const options = {
+        input: { text: "look it up" },
+        provider: "anthropic",
+        model: "claude-3-5-sonnet-20241022",
+        maxTokens: 32,
+        tools: lookupTool(calls),
+        disableTools: false,
+        maxSteps: 3,
+        disableInternalFallback: true,
+        context,
+      } as never;
+      if (mode === "stream") {
+        await drain((await nl.stream(options)).stream);
+      } else {
+        await nl.generate(options);
+      }
+      assertEqual(calls.count, 1, "the tool did not run once");
+      assertGenerationCarriesToolArguments(await exported());
+    }));
+}
+
+await test("decide with no provider is a WARNING generation and returns null", async () => {
+  clear();
+  const answer = await nl.tryDecide({
+    state: "ticket text",
+    questions: { urgent: { type: "boolean", instructions: "Urgent?" } },
+  } as never);
+  assertEqual(answer, null, "tryDecide should fail open");
+  const decisions = ofType(await exported(), "generation").filter(
+    (span) => span.name === "decide",
+  );
+  assertEqual(decisions.length, 1, "expected one decide generation");
+  assertEqual(level(decisions[0]), "WARNING");
+});
+
+await test("tryDecide puts its per-call context on the decision spans", async () => {
+  clear();
+  await nl.tryDecide({
+    state: "ticket text",
+    questions: { urgent: { type: "boolean", instructions: "Urgent?" } },
+    context: {
+      userId: "decide-user",
+      sessionId: "decide-session",
+      tags: ["decide-tag"],
+    },
+  } as never);
+  const decisions = ofType(await everySpan(), "generation").filter(
+    (span) => span.name === "decide",
+  );
+  assertEqual(decisions.length, 1, "expected one decide generation");
+  assertEqual(decisions[0].attributes["user.id"], "decide-user");
+  assertEqual(decisions[0].attributes["session.id"], "decide-session");
+  assertEqual(
+    String(decisions[0].attributes["langfuse.trace.tags"]),
+    "decide-tag",
+  );
+});
+
+await test("decide against a configured provider is a generation with output", async () => {
+  const laya = await startLaya();
+  process.env.LAYA_API_KEY = "laya-test";
+  process.env.LAYA_BASE_URL = laya.baseURL;
+  try {
+    clear();
+    const result = await nl.decide({
+      state: "ticket text",
+      questions: { urgent: { type: "boolean", instructions: "Urgent?" } },
+      context,
+    } as never);
+    assertEqual(laya.requests.length, 1, "decision endpoint was not called");
+    assert(result.answers.urgent !== undefined, "no answer was returned");
+    const decisions = ofType(await exported(), "generation").filter(
+      (span) => span.name === "decide",
+    );
+    assertEqual(decisions.length, 1, "expected one decide generation");
+    assertEqual(
+      text(decisions[0], "langfuse.observation.model.name"),
+      result.model,
+    );
+    assertEqual(
+      text(decisions[0], "langfuse.observation.metadata.provider"),
+      "laya",
+    );
+    assert(level(decisions[0]) === undefined, "a good decision was flagged");
+    assert(
+      text(decisions[0], "langfuse.observation.output").length > 0,
+      "decision has no output",
+    );
+  } finally {
+    delete process.env.LAYA_API_KEY;
+    delete process.env.LAYA_BASE_URL;
+    await laya.close();
+  }
+});
+
+section("naming");
+
+function traceNameOf(span: ReadableSpan): Json | undefined {
+  return span.attributes["langfuse.trace.name"];
+}
+
+await test("a trace takes the caller's traceName", async () => {
+  clear();
+  await nl.generate(
+    request("gpt-4o-mini", { context: { ...context, traceName: "checkout" } }),
+  );
+  const generateRoot = only(await exported(), "generate");
+  assertEqual(traceNameOf(generateRoot), "checkout");
+  clear();
+  const result = await nl.stream(
+    request("gpt-4o-mini", { context: { ...context, traceName: "chat" } }),
+  );
+  await drain(result.stream);
+  assertEqual(traceNameOf(only(await exported(), "stream")), "chat");
+});
+
+await test("without a traceName the trace is named after the operation", async () => {
+  clear();
+  await nl.generate(request("gpt-4o-mini"));
+  const generateRoot = only(await exported(), "generate");
+  assertEqual(generateRoot.parentSpanContext, undefined, "root has a parent");
+  assert(
+    traceNameOf(generateRoot) === undefined,
+    "an unrequested trace name was invented",
+  );
+  clear();
+  const result = await nl.stream(request("gpt-4o-mini"));
+  await drain(result.stream);
+  const streamRoot = only(await exported(), "stream");
+  assertEqual(streamRoot.parentSpanContext, undefined, "root has a parent");
+});
+
+await test("every model request is named after the API call", async () => {
+  clear();
+  await nl.generate(request("gpt-4o-mini"));
+  const generations = ofType(await exported(), "generation");
+  assert(generations.length > 0, "no generation was exported");
+  for (const generation of generations) {
+    assertEqual(generation.name, "generate");
+    assert(
+      text(generation, "langfuse.observation.model.name") !== "",
+      "the model is missing from the generation",
+    );
+  }
+  clear();
+  const result = await nl.stream(request("gpt-4o-mini"));
+  await drain(result.stream);
+  for (const generation of ofType(await exported(), "generation")) {
+    assertEqual(generation.name, "stream");
+  }
+});
+
+await test("the root observation and the trace carry the output", async () => {
+  clear();
+  await nl.generate(request("gpt-4o-mini"));
+  const generateRoot = only(await exported(), "generate");
+  assertEqual(
+    assistantText(generateRoot, "langfuse.trace.output"),
+    "hello there",
+  );
+  clear();
+  const result = await nl.stream(request("gpt-4o-mini"));
+  await drain(result.stream);
+  const streamRoot = only(await exported(), "stream");
+  assertEqual(
+    assistantText(streamRoot, "langfuse.observation.output"),
+    "hello",
+  );
+  assertEqual(assistantText(streamRoot, "langfuse.trace.output"), "hello");
+});
+
+await test("a failed run still gives the root an output", async () => {
+  clear();
+  await nl.generate(request("reject-model")).then(
+    () => undefined,
+    () => undefined,
+  );
+  const generateRoot = only(await exported(), "generate");
+  assert(
+    text(generateRoot, "langfuse.observation.output").length > 0,
+    "failed root has no output",
+  );
+});
+
+await test("generations and the root read as a conversation", async () => {
+  clear();
+  await nl.generate(request("gpt-4o-mini", { systemPrompt: "be brief" }));
+  const spans = await exported();
+  const generation = ofType(spans, "generation")[0];
+  const sent = messages(generation, "langfuse.observation.input");
+  assertEqual(sent[0].role, "system");
+  assertEqual(sent[0].content, "be brief");
+  assert(
+    sent.some((entry) => entry.role === "user"),
+    "the generation input has no user message",
+  );
+  assertEqual(
+    assistantText(generation, "langfuse.observation.output"),
+    "hello there",
+  );
+  const rootInput = messages(
+    only(spans, "generate"),
+    "langfuse.observation.input",
+  );
+  assert(
+    rootInput.every((entry) => entry.role === "user"),
+    "the root input holds more than the user messages",
+  );
+});
+
+await test("tool steps are grouped under step spans", async () => {
+  clear();
+  await nl.generate(
+    request("tool-model", {
+      tools: lookupTool({ count: 0 }),
+      disableTools: false,
+      maxSteps: 3,
+    }),
+  );
+  const spans = await exported();
+  const steps = named(spans, "step");
+  assertEqual(steps.length, 2, "expected two step spans");
+  assertEqual(
+    steps
+      .map((step) => text(step, "langfuse.observation.metadata.step_index"))
+      .sort()
+      .join(","),
+    "1,2",
+  );
+  for (const step of steps) {
+    assertEqual(text(step, "langfuse.observation.type"), "span");
+    assert(
+      step.attributes["langfuse.observation.model.name"] === undefined &&
+        step.attributes["langfuse.observation.usage_details"] === undefined,
+      "a step span carries model or usage",
+    );
+  }
+  const stepIds = new Set(steps.map((step) => step.spanContext().spanId));
+  const parentOf = (span: ReadableSpan): string | undefined =>
+    span.parentSpanContext?.spanId;
+  const generations = ofType(spans, "generation");
+  assertEqual(generations.length, 2);
+  for (const generation of generations) {
+    assert(
+      stepIds.has(parentOf(generation) ?? ""),
+      "a generation is not parented by a step",
+    );
+  }
+  const tool = only(spans, "lookup");
+  assert(stepIds.has(parentOf(tool) ?? ""), "the tool is not under a step");
+  const first = generations.find((entry) =>
+    messages(entry, "langfuse.observation.output").some(
+      (message) => message.tool_calls?.[0]?.function.name === "lookup",
+    ),
+  );
+  assert(first !== undefined, "the tool call is not in the assistant message");
+});
+
+const INFRASTRUCTURE_SPANS = [
+  "tools.register",
+  "tools.getAll",
+  "message.build_for_stream",
+  "generateTextInternal",
+  "provider.generate",
+  "provider.stream",
+  "executeGeneration",
+];
+
+function isLinked(span: ReadableSpan): boolean {
+  return (
+    span.name === "step" ||
+    ["generation", "tool"].includes(text(span, "langfuse.observation.type"))
+  );
+}
+
+function assertCleanExport(spans: ReadableSpan[]): void {
+  const names = spans.map((span) => span.name);
+  for (const name of INFRASTRUCTURE_SPANS) {
+    assert(!names.includes(name), `${name} was exported`);
+  }
+  const untyped = spans.filter(
+    (span) => span.attributes["langfuse.observation.type"] === undefined,
+  );
+  assertEqual(
+    untyped.length,
+    0,
+    `exported without an observation type: ${untyped.map((span) => span.name).join(", ")}`,
+  );
+  const ids = new Set(spans.map((span) => span.spanContext().spanId));
+  for (const span of spans.filter(isLinked)) {
+    const parent = span.parentSpanContext?.spanId;
+    assert(
+      parent !== undefined && ids.has(parent),
+      `${span.name} is not parented by an exported span`,
+    );
+  }
+}
+
+await test("a generate exports observations only", async () => {
+  clear();
+  await nl.generate(
+    request("tool-model", {
+      tools: lookupTool({ count: 0 }),
+      disableTools: false,
+      maxSteps: 3,
+    }),
+  );
+  assertCleanExport(await exported());
+});
+
+await test("a stream with a tool exports observations only", async () => {
+  clear();
+  const result = await nl.stream(
+    request("tool-model", {
+      tools: lookupTool({ count: 0 }),
+      disableTools: false,
+      maxSteps: 3,
+    }),
+  );
+  await drain(result.stream);
+  assertCleanExport(await exported());
+});
+
+const PRODUCT = /neurolink/i;
+
+function productHits(span: ReadableSpan): string[] {
+  const hits: string[] = [];
+  const check = (where: string, value: Json): void => {
+    if (PRODUCT.test(typeof value === "string" ? value : "")) {
+      hits.push(`${span.name}: ${where}`);
     }
-    if (arg.startsWith("--model=")) {
-      args.model = arg.split("=")[1];
-    }
-    if (arg === "--help") {
-      console.log(
-        "Usage: npx tsx test/continuous-test-suite-observability.ts [--provider=X] [--model=Y]",
-      );
-      console.log(
-        "\nTests OTel instrumentation, context management, span processors.",
-      );
-      console.log(
-        "Runs locally with InMemorySpanExporter — no Langfuse credentials needed.",
-      );
-      console.log("Default provider: vertex");
-      process.exit(0);
+  };
+  check("name", span.name);
+  check("scope", span.instrumentationScope.name);
+  for (const [key, value] of Object.entries(span.resource.attributes)) {
+    check(`resource ${key}`, key);
+    check(`resource ${key}`, value);
+  }
+  for (const [key, value] of Object.entries(span.attributes)) {
+    check(`attribute key ${key}`, key);
+    check(`attribute ${key}`, value);
+  }
+  for (const event of span.events) {
+    check(`event ${event.name}`, event.name);
+    for (const [key, value] of Object.entries(event.attributes ?? {})) {
+      check(`event ${event.name} ${key}`, `${key}${String(value)}`);
     }
   }
-  return args;
+  return hits;
 }
 
-const cliArgs = parseArguments();
-if (cliArgs.provider) {
-  TEST_CONFIG.provider = cliArgs.provider;
+await test("only model calls carry an attribute Langfuse reads as a model", async () => {
+  await exported();
+  const stray = [...seen].filter(
+    (span) =>
+      "model" in span.attributes ||
+      ("llm.model_name" in span.attributes &&
+        span.attributes["langfuse.observation.type"] !== "generation"),
+  );
+  assertEqual(
+    stray.length,
+    0,
+    `model attribute on ${stray.map((span) => span.name).join(", ")}`,
+  );
+});
+
+await test("no exported span names the product anywhere", async () => {
+  await everySpan();
+  await exported();
+  assert(seen.size > 20, "too few spans were collected to scan");
+  const hits = [...seen].flatMap(productHits);
+  assertEqual(
+    hits.length,
+    0,
+    `product name found at ${hits.slice(0, 5).join(" | ")}`,
+  );
+});
+
+section("export boundaries");
+
+await test("a provider health check exports no spans", async () => {
+  clear();
+  await nl.testProvider("openai");
+  assert((await everySpan()).length > 0, "no span was recorded at all");
+  const spans = await exported();
+  assertEqual(spans.length, 0, "a health check leaked into the export");
+});
+
+await test("a direct provider generate exports a generate generation", async () => {
+  clear();
+  const provider = await AIProviderFactory.createProvider(
+    "openai",
+    "gpt-4o-mini",
+    false,
+    undefined,
+    undefined,
+    credentials as never,
+  );
+  await provider.generate({
+    input: { text: "hi" },
+    disableTools: true,
+  } as never);
+  const generations = ofType(await exported(), "generation");
+  assert(
+    generations.some((span) => span.name === "generate"),
+    "no generate generation was exported",
+  );
+});
+
+await test("the host provider is detected and only a Langfuse exporter is registered", async () => {
+  const status = getLangfuseHealthStatus();
+  assert(status.usingExternalProvider, "host provider was not detected");
+  assert(status.hasProcessor, "the Langfuse exporter was not registered");
+  assert(status.isHealthy, "health ignored the registered exporter");
+});
+
+const nullIdentity: NonNullable<GenerateOptions["context"]> = {
+  userId: null,
+  sessionId: null,
+  conversationId: null,
+  requestId: null,
+  traceName: null,
+};
+
+await test("a context with null identity fields is accepted and traced", async () => {
+  clear();
+  await nl.generate(
+    request("gpt-4o-mini", { context: nullIdentity as RequestExtra }),
+  );
+  const root = only(await exported(), "generate");
+  assertEqual(root.attributes["user.id"], undefined);
+  assertEqual(root.attributes["session.id"], undefined);
+});
+
+await test("shutting down another instance keeps this one exporting", async () => {
+  const sibling = new NeuroLink();
+  await sibling.shutdown();
+  clear();
+  await nl.generate(request("gpt-4o-mini"));
+  assertEqual(named(await exported(), "generate").length, 1);
+});
+
+section("owned provider");
+
+const CHILD = join(tempDir("neurolink-obs-child-"), "child.mjs");
+writeFileSync(
+  CHILD,
+  `
+import { AIProviderFactory, NeuroLink, flushOpenTelemetry, getLangfuseHealthStatus, shutdownOpenTelemetry } from ${JSON.stringify(
+    pathToFileURL(join(process.cwd(), "dist/index.js")).href,
+  )};
+if (process.env.OBS_DIRECT_URL) {
+  const provider = await AIProviderFactory.createProvider("openai", "gpt-4o-mini", false, undefined, undefined, { openai: { apiKey: "k", baseURL: process.env.OBS_DIRECT_URL } });
+  await provider.generate({ input: { text: "hi" }, disableTools: true });
+} else {
+  const config = process.env.OBS_CONFIG ? JSON.parse(process.env.OBS_CONFIG) : undefined;
+  const nl = new NeuroLink(config ? { observability: config } : undefined);
+  await nl.tryDecide({ state: "x", questions: { q: { type: "boolean", instructions: "?" } } });
 }
-if (cliArgs.model) {
-  TEST_CONFIG.model = cliArgs.model;
-}
-if (!TEST_CONFIG.maxTokens) {
-  TEST_CONFIG.maxTokens = PROVIDER_MAX_TOKENS[TEST_CONFIG.provider] || 1024;
+await flushOpenTelemetry().catch(() => undefined);
+const status = getLangfuseHealthStatus();
+await shutdownOpenTelemetry();
+console.log("STATUS " + JSON.stringify(status));
+process.exit(0);
+`,
+);
+
+function parseStatus<T>(stdout: string): T {
+  const line = stdout.split("\n").find((l) => l.startsWith("STATUS "));
+  assert(line !== undefined, "process printed no status");
+  return JSON.parse((line as string).slice("STATUS ".length));
 }
 
-await runSuite(runAllTests);
+async function runChild(
+  env: Record<string, string>,
+): Promise<{ hasProcessor: boolean; usingExternalProvider: boolean }> {
+  const result = await runCommand(process.execPath, [CHILD], {
+    cwd: process.cwd(),
+    timeoutMs: 45_000,
+    env: {
+      PATH: process.env.PATH,
+      HOME: process.env.HOME,
+      DOTENV_CONFIG_PATH: "/dev/null",
+      NEUROLINK_SKIP_MCP: "true",
+      ...env,
+    },
+  });
+  assertEqual(result.exitCode, 0, "child process failed");
+  return parseStatus(result.stdout);
+}
+
+await test("without keys NeuroLink creates no Langfuse processor", async () => {
+  const status = await runChild({});
+  assert(!status.hasProcessor, "a processor was created without keys");
+});
+
+await test("LANGFUSE keys in the environment enable the processor and export to Langfuse", async () => {
+  const langfuse = await startLangfuse();
+  try {
+    const status = await runChild({
+      LANGFUSE_PUBLIC_KEY: "pk-child",
+      LANGFUSE_SECRET_KEY: "sk-child",
+      LANGFUSE_BASE_URL: langfuse.baseUrl,
+    });
+    assert(status.hasProcessor, "keys did not enable the processor");
+    assert(
+      !status.usingExternalProvider,
+      "NeuroLink should own the provider here",
+    );
+    const hit = langfuse.hits.find((entry) =>
+      entry.path.includes("/api/public/otel/v1/traces"),
+    );
+    assert(hit !== undefined, "Langfuse received no trace export");
+    assertEqual(
+      hit?.authorization,
+      `Basic ${Buffer.from("pk-child:sk-child").toString("base64")}`,
+      "export used other credentials",
+    );
+  } finally {
+    await langfuse.close();
+  }
+});
+
+await test("a direct provider call with no NeuroLink instance starts telemetry and exports", async () => {
+  const langfuse = await startLangfuse();
+  try {
+    const status = await runChild({
+      LANGFUSE_PUBLIC_KEY: "pk-child",
+      LANGFUSE_SECRET_KEY: "sk-child",
+      LANGFUSE_BASE_URL: langfuse.baseUrl,
+      OBS_DIRECT_URL: fake.baseURL,
+    });
+    assert(
+      status.hasProcessor,
+      "a direct provider call did not start telemetry",
+    );
+    assert(
+      langfuse.hits.some((entry) =>
+        entry.path.includes("/api/public/otel/v1/traces"),
+      ),
+      "Langfuse received no trace export from the direct call",
+    );
+  } finally {
+    await langfuse.close();
+  }
+});
+
+await test("observability langfuse false disables the processor despite keys", async () => {
+  const status = await runChild({
+    LANGFUSE_PUBLIC_KEY: "pk-child",
+    LANGFUSE_SECRET_KEY: "sk-child",
+    OBS_CONFIG: JSON.stringify({ langfuse: false }),
+  });
+  assert(!status.hasProcessor, "langfuse false still created a processor");
+});
+
+await test("an observability langfuse object enables the processor without env keys", async () => {
+  const status = await runChild({
+    OBS_CONFIG: JSON.stringify({
+      langfuse: {
+        publicKey: "pk-config",
+        secretKey: "sk-config",
+        baseUrl: "http://127.0.0.1:9",
+      },
+    }),
+  });
+  assert(status.hasProcessor, "the config object did not enable the processor");
+});
+
+section("trace delivery");
+
+const SCENARIO = join(tempDir("neurolink-obs-scenario-"), "scenario.mjs");
+writeFileSync(
+  SCENARIO,
+  `
+import { NeuroLink, AIProviderFactory, flushOpenTelemetry, jsonSchema, setLangfuseContext, shutdownOpenTelemetry } from ${JSON.stringify(
+    pathToFileURL(join(process.cwd(), "dist/index.js")).href,
+  )};
+const env = process.env;
+const scenario = env.OBS_SCENARIO;
+const credentials = { openai: { apiKey: "k", baseURL: env.OBS_OPENAI_URL } };
+const context = { userId: "u-int", sessionId: "s-int", tags: ["t1"], metadata: { feature: "obs" } };
+const call = (model, extra = {}) => ({ input: { text: "hi" }, provider: "openai", model, credentials, disableTools: true, disableInternalFallback: true, context, ...extra });
+const drain = async (stream) => { for await (const chunk of stream) void chunk; };
+const mask = scenario === "mask" ? () => "masked-text" : undefined;
+const nl = new NeuroLink({ observability: { langfuse: { baseUrl: env.OBS_INGEST_URL, publicKey: "pk-i", secretKey: "sk-i", mask } } });
+const lookup = { lookup: { description: "look a value up", inputSchema: jsonSchema({ type: "object", properties: { q: { type: "string" } }, additionalProperties: true }), execute: async () => ({ found: true }) } };
+if (scenario === "outer") {
+  await setLangfuseContext({ userId: "email", traceName: "name" }, () => nl.generate(call("gpt-4o-mini", { context: { ...context, userId: "composite" } })));
+} else if (scenario === "nested") {
+  const nesting = { lookup: { ...lookup.lookup, execute: async () => { await nl.generate(call("gpt-4o-mini", { input: { text: "inner question" } })); return { found: true }; } } };
+  const turn = await nl.stream(call("tool-model", { disableTools: false, maxSteps: 3, tools: nesting }));
+  await drain(turn.stream);
+} else if (scenario === "meta") {
+  const url = "https://example.com/" + "a".repeat(310);
+  const nesting = { lookup: { ...lookup.lookup, execute: async () => { await nl.generate(call("gpt-4o-mini", { input: { text: "inner question" } })); return { found: true }; } } };
+  await setLangfuseContext({ metadata: { applicationLogs: url, platformIntegrations: ["a", "b"], short: "x", winner: "outer" } }, async () => {
+    const turn = await nl.stream(call("tool-model", { disableTools: false, maxSteps: 3, tools: nesting, context: { ...context, metadata: { winner: "inner", perCall: url } } }));
+    await drain(turn.stream);
+  });
+} else if (scenario === "named") {
+  await nl.generate(call("gpt-4o-mini", { context: { ...context, traceName: "trace-x", observationName: "orchestrator-llm-generation" } }));
+  await nl.generate(call("gpt-4o-mini"));
+} else if (scenario === "full") {
+  await nl.generate(call("gpt-4o-mini", { context: { ...context, traceName: "custom-name" } }));
+  const withTool = await nl.stream(call("tool-model", { disableTools: false, maxSteps: 3, tools: lookup }));
+  await drain(withTool.stream);
+  const early = await nl.stream(call("gpt-4o-mini"));
+  for await (const chunk of early.stream) { void chunk; break; }
+  await new Promise((resolve) => setTimeout(resolve, 300));
+  await nl.generate(call("reject-model")).catch(() => undefined);
+  await nl.tryDecide({ state: "x", questions: { q: { type: "boolean", instructions: "?" } }, context });
+  const provider = await AIProviderFactory.createProvider("openai", "gpt-4o-mini", false, undefined, undefined, credentials);
+  await provider.generate({ input: { text: "hi" }, disableTools: true });
+} else if (scenario === "many") {
+  for (let i = 0; i < 20; i++) await nl.generate(call("gpt-4o-mini"));
+} else if (scenario === "unauthorized") {
+  await nl.generate(call("gpt-4o-mini"));
+  await flushOpenTelemetry();
+  await nl.generate(call("gpt-4o-mini"));
+} else {
+  await nl.generate(call("gpt-4o-mini"));
+}
+if (scenario !== "shutdown") await flushOpenTelemetry();
+await shutdownOpenTelemetry();
+process.exit(0);
+`,
+);
+
+async function runScenario(
+  scenario: string,
+  mode: OtlpMode = "ok",
+): Promise<{
+  hits: OtlpHit[];
+  spans: DecodedSpan[];
+  sends: Map<string, number>;
+  output: string;
+}> {
+  const receiver = await startLangfuse(mode);
+  try {
+    const result = await runCommand(process.execPath, [SCENARIO], {
+      cwd: process.cwd(),
+      timeoutMs: 50_000,
+      env: {
+        PATH: process.env.PATH,
+        HOME: process.env.HOME,
+        DOTENV_CONFIG_PATH: "/dev/null",
+        NEUROLINK_SKIP_MCP: "true",
+        NEUROLINK_DEBUG: "true",
+        NEUROLINK_LOG_LEVEL: "warn",
+        LANGFUSE_TRACING_ENVIRONMENT: "test-env",
+        LANGFUSE_RELEASE: "test-release",
+        OBS_SCENARIO: scenario,
+        OBS_INGEST_URL: receiver.baseUrl,
+        OBS_OPENAI_URL: fake.baseURL,
+      },
+    });
+    assertEqual(result.exitCode, 0, `scenario ${scenario} failed`);
+    return {
+      hits: receiver.hits,
+      spans: receiver.hits.flatMap((entry) => entry.spans),
+      sends: receiver.sends,
+      output: `${result.stdout}\n${result.stderr}`,
+    };
+  } finally {
+    await receiver.close();
+  }
+}
+
+function kind(span: DecodedSpan): Json | undefined {
+  return span.attributes["langfuse.observation.type"];
+}
+
+function byName(spans: DecodedSpan[], name: string): DecodedSpan[] {
+  return spans.filter((span) => span.name === name);
+}
+
+function rootOf(spans: DecodedSpan[], name: string): DecodedSpan {
+  const root = byName(spans, name).find((span) => kind(span) === "agent");
+  assert(root !== undefined, `no ${name} agent root`);
+  return root as DecodedSpan;
+}
+
+const full = await runScenario("full");
+
+await test("observations keep their native Langfuse types", async () => {
+  const types = new Set(full.spans.map(kind));
+  for (const expected of ["agent", "generation", "tool", "span"]) {
+    assert(types.has(expected), `no ${expected} observation was exported`);
+  }
+  assertEqual(kind(byName(full.spans, "lookup")[0]), "tool");
+});
+
+await test("a string returned by mask is exported without extra quoting", async () => {
+  const masked = await runScenario("mask");
+  const root = rootOf(masked.spans, "generate");
+  assertEqual(root.attributes["langfuse.observation.input"], "masked-text");
+  assertEqual(root.attributes["langfuse.observation.output"], "masked-text");
+});
+
+await test("every observation carries user, session, tags and metadata", async () => {
+  const traced = full.spans.filter(
+    (span) => span.attributes["user.id"] === "u-int",
+  );
+  assert(traced.length > 0, "no span carries the user");
+  for (const span of traced) {
+    assertEqual(span.attributes["session.id"], "s-int", `${span.name} session`);
+    assertEqual(String(span.attributes["langfuse.trace.tags"]), "t1");
+    assertEqual(
+      span.attributes["langfuse.trace.metadata.feature"],
+      "obs",
+      `${span.name} metadata`,
+    );
+  }
+  const untraced = full.spans.filter(
+    (span) => span.attributes["user.id"] === undefined,
+  );
+  assert(untraced.length > 0, "the direct call lost its own trace");
+  assert(
+    traced.length > untraced.length,
+    "identity did not reach the observations below the root",
+  );
+});
+
+await test("the root carries the configured trace name, input and output", async () => {
+  const generate = rootOf(full.spans, "generate");
+  assertEqual(generate.attributes["langfuse.trace.name"], "custom-name");
+  assert(
+    String(generate.attributes["langfuse.trace.input"]).includes("hi"),
+    "trace input",
+  );
+  assert(
+    generate.attributes["langfuse.trace.output"] !== undefined,
+    "trace output",
+  );
+});
+
+await test("an outer setLangfuseContext wins over the per-call context for user and trace name", async () => {
+  const outer = await runScenario("outer");
+  const traced = outer.spans.filter(
+    (span) => span.attributes["user.id"] !== undefined,
+  );
+  assert(traced.length > 0, "no span carries the user");
+  for (const span of traced) {
+    assertEqual(span.attributes["user.id"], "email", `${span.name} user`);
+    assertEqual(
+      span.attributes["langfuse.trace.name"],
+      "name",
+      `${span.name} trace name`,
+    );
+    assertEqual(span.attributes["session.id"], "s-int", `${span.name} session`);
+  }
+});
+
+await test("a generate nested in a turn does not overwrite the trace input and output", async () => {
+  const nested = await runScenario("nested");
+  assert(
+    byName(nested.spans, "generate").length > 0,
+    "the nested generate did not run",
+  );
+  const inputs = nested.spans
+    .map((span) => span.attributes["langfuse.trace.input"])
+    .filter((value) => value !== undefined)
+    .map(String);
+  const outputs = nested.spans
+    .map((span) => span.attributes["langfuse.trace.output"])
+    .filter((value) => value !== undefined)
+    .map(String);
+  assert(inputs.length > 0 && outputs.length > 0, "the root wrote no trace io");
+  assert(
+    inputs.every((value) => !value.includes("inner question")),
+    "the nested turn wrote the trace input",
+  );
+  assert(
+    outputs.every((value) => !value.includes("hello there")),
+    "the nested turn wrote the trace output",
+  );
+});
+
+await test("environment and release reach every span", async () => {
+  for (const span of full.spans) {
+    assertEqual(
+      span.attributes["langfuse.environment"],
+      "test-env",
+      `${span.name} environment`,
+    );
+    assertEqual(
+      span.attributes["langfuse.release"],
+      "test-release",
+      `${span.name} release`,
+    );
+  }
+});
+
+await test("observations form root, attempt, step and generation", async () => {
+  const root = rootOf(full.spans, "generate");
+  const attempt = byName(full.spans, "generate.attempt").find(
+    (span) => span.parentSpanId === root.spanId,
+  ) as DecodedSpan;
+  assert(attempt !== undefined, "no attempt under the root");
+  const step = byName(full.spans, "step").find(
+    (span) => span.parentSpanId === attempt.spanId,
+  ) as DecodedSpan;
+  assert(step !== undefined, "no step under the attempt");
+  const generation = byName(full.spans, "generate").find(
+    (span) => kind(span) === "generation" && span.parentSpanId === step.spanId,
+  ) as DecodedSpan;
+  assert(generation !== undefined, "no generation under the step");
+  assertEqual(
+    generation.attributes["langfuse.observation.model.name"],
+    "gpt-4o-mini",
+  );
+  assert(
+    generation.attributes["langfuse.observation.model.parameters"] !==
+      undefined,
+    "modelParameters",
+  );
+  assert(
+    JSON.parse(
+      String(generation.attributes["langfuse.observation.usage_details"]),
+    ).input > 0,
+    "usage input",
+  );
+  assert(
+    generation.attributes["langfuse.observation.cost_details"] !== undefined,
+    "cost details",
+  );
+  assert(
+    String(generation.attributes["langfuse.observation.input"]).includes(
+      '"role":"user"',
+    ),
+    "chat input",
+  );
+});
+
+await test("a streamed tool call carries arguments and a tool observation named by the tool", async () => {
+  const tool = byName(full.spans, "lookup")[0];
+  assert(tool !== undefined, "no tool observation");
+  assert(
+    tool.attributes["langfuse.observation.input"] !== undefined,
+    "tool input",
+  );
+  assert(
+    tool.attributes["langfuse.observation.output"] !== undefined,
+    "tool output",
+  );
+  const generations = full.spans.filter(
+    (span) => kind(span) === "generation" && span.traceId === tool.traceId,
+  );
+  assert(
+    generations.some((span) =>
+      String(span.attributes["langfuse.observation.output"]).includes(
+        "tool_calls",
+      ),
+    ),
+    "no generation recorded the tool call",
+  );
+  assert(
+    generations.some(
+      (span) =>
+        span.attributes["langfuse.observation.completion_start_time"] !==
+        undefined,
+    ),
+    "completionStartTime",
+  );
+});
+
+await test("an early-closed stream is a WARNING with a status message", async () => {
+  const warned = byName(full.spans, "stream").filter(
+    (span) =>
+      span.attributes["langfuse.observation.level"] === "WARNING" &&
+      kind(span) === "agent",
+  );
+  assert(warned.length > 0, "no WARNING root");
+  assert(
+    String(warned[0].attributes["langfuse.observation.status_message"]).length >
+      0,
+    "no status message",
+  );
+});
+
+await test("a failed model call is an ERROR generation", async () => {
+  const failed = full.spans.filter(
+    (span) =>
+      kind(span) === "generation" &&
+      span.attributes["langfuse.observation.model.name"] === "reject-model",
+  );
+  assert(failed.length > 0, "no generation for the rejected model");
+  assertEqual(failed[0].attributes["langfuse.observation.level"], "ERROR");
+  assertEqual(failed[0].statusCode, 2, "OTLP status code");
+});
+
+await test("decide with no provider is a WARNING generation", async () => {
+  const decision = byName(full.spans, "decide")[0];
+  assert(decision !== undefined, "no decide observation");
+  assertEqual(kind(decision), "generation");
+  assertEqual(decision.attributes["langfuse.observation.level"], "WARNING");
+});
+
+await test("a direct provider call is exported without trace context", async () => {
+  const bare = full.spans.filter(
+    (span) =>
+      span.parentSpanId === undefined &&
+      span.attributes["user.id"] === undefined,
+  );
+  assert(bare.length > 0, "the direct call produced no root");
+});
+
+await test("nothing the exporter sends names the product", async () => {
+  assert(
+    !/neurolink/i.test(JSON.stringify(full.spans)),
+    "the product name reached Langfuse",
+  );
+  for (const hit of full.hits) {
+    assert(
+      !/neurolink/i.test(JSON.stringify(hit.headers)),
+      "the product name is in a request header",
+    );
+  }
+});
+
+await test("requests are authenticated with the configured keys and posted as JSON", async () => {
+  for (const hit of full.hits) {
+    assertEqual(
+      hit.authorization,
+      `Basic ${Buffer.from("pk-i:sk-i").toString("base64")}`,
+    );
+    assertEqual(hit.headers["content-type"], "application/json");
+    assertEqual(hit.path, "/api/public/otel/v1/traces");
+  }
+});
+
+await test("many spans are batched into fewer requests", async () => {
+  const many = await runScenario("many");
+  assert(many.spans.length > 60, "too few spans to test batching");
+  assert(many.hits.length * 3 < many.spans.length, "spans were not batched");
+  for (const hit of many.hits) {
+    assert(hit.spans.length <= 500, "a request exceeded the span cap");
+  }
+});
+
+await test("a rejected span is reported once and never re-sent", async () => {
+  const partial = await runScenario("partial", "partial");
+  assert(partial.spans.length > 0, "no span was sent");
+  for (const count of partial.sends.values()) {
+    assertEqual(count, 1, "a rejected span was retried");
+  }
+  assert(partial.output.includes("spans rejected"), "no rejection warning");
+});
+
+await test("a 500 is retried and the batch is delivered", async () => {
+  const flaky = await runScenario("single", "flaky");
+  assertEqual(flaky.hits[0].status, 500);
+  assert(flaky.hits.length >= 2, "the failed request was not retried");
+  assertEqual(flaky.hits[flaky.hits.length - 1].status, 200);
+  assert(byName(flaky.spans, "generate").length > 0, "nothing was delivered");
+});
+
+await test("a 401 is not retried and is logged once", async () => {
+  const rejected = await runScenario("unauthorized", "unauthorized");
+  assertEqual(rejected.hits.length, 2, "401 batches were retried");
+  const warnings =
+    rejected.output.split("Langfuse credentials rejected").length - 1;
+  assertEqual(warnings, 1, "credentials warning count");
+});
+
+await test("shutdown delivers everything still queued", async () => {
+  const shutdown = await runScenario("shutdown");
+  assert(
+    byName(shutdown.spans, "generate").length > 0,
+    "queued spans were lost on shutdown",
+  );
+});
+
+section("trace metadata and root naming");
+
+const meta = await runScenario("meta");
+const metaUrl = `https://example.com/${"a".repeat(310)}`;
+const metaKey = "langfuse.trace.metadata.";
+
+await test("long and array trace metadata reach the trace in full, written once", async () => {
+  assertEqual(metaUrl.length, 330);
+  const roots = meta.spans.filter(
+    (span) => span.attributes[`${metaKey}applicationLogs`] !== undefined,
+  );
+  assertEqual(roots.length, 1, "metadata was not written exactly once");
+  const root = roots[0] as DecodedSpan;
+  assertEqual(root.name, "stream");
+  assertEqual(root.attributes[`${metaKey}applicationLogs`], metaUrl);
+  assertEqual(
+    String(root.attributes[`${metaKey}platformIntegrations`]),
+    JSON.stringify(["a", "b"]),
+  );
+  assertEqual(root.attributes[`${metaKey}perCall`], metaUrl);
+});
+
+await test("short metadata stays on child observations and inner keys win", async () => {
+  const children = meta.spans.filter((span) => span.name === "stream.attempt");
+  assert(children.length > 0, "no attempt span exported");
+  for (const span of children) {
+    assertEqual(span.attributes[`${metaKey}short`], "x", `${span.name} short`);
+    assertEqual(span.attributes[`${metaKey}winner`], "inner");
+    assertEqual(span.attributes[`${metaKey}feature`], undefined);
+  }
+  assertEqual(
+    meta.spans.filter(
+      (span) => span.attributes[`${metaKey}applicationLogs`] !== undefined,
+    ).length,
+    1,
+    "a child observation carried the long value",
+  );
+});
+
+const renamed = await runScenario("named");
+
+await test("observationName renames the root agent observation only", async () => {
+  const root = rootOf(renamed.spans, "orchestrator-llm-generation");
+  assertEqual(root.attributes["langfuse.trace.name"], "trace-x");
+  const attempt = byName(renamed.spans, "generate.attempt").find(
+    (span) => span.parentSpanId === root.spanId,
+  );
+  assert(attempt !== undefined, "attempt is not parented by the renamed root");
+  assertEqual(
+    byName(renamed.spans, "orchestrator-llm-generation").length,
+    1,
+    "the name reached a child",
+  );
+  assertEqual(
+    renamed.spans.filter(
+      (span) => span.name === "generate" && kind(span) === "agent",
+    ).length,
+    1,
+    "the default root is not named generate",
+  );
+});
+
+section("host provider");
+
+const HOST = join(tempDir("neurolink-obs-host-"), "host.mjs");
+writeFileSync(
+  HOST,
+  `
+import { NeuroLink, createExporterSpanProcessor, flushOpenTelemetry, getLangfuseHealthStatus, setLangfuseContext, shutdownOpenTelemetry } from ${JSON.stringify(
+    pathToFileURL(join(process.cwd(), "dist/index.js")).href,
+  )};
+import { NodeTracerProvider } from ${JSON.stringify(
+    import.meta.resolve("@opentelemetry/sdk-trace-node"),
+  )};
+import { ROOT_CONTEXT, TraceFlags, context, trace } from ${JSON.stringify(
+    import.meta.resolve("@opentelemetry/api"),
+  )};
+const env = process.env;
+const host = new NodeTracerProvider({ spanProcessors: env.HOST_PROCESSOR === "1" ? [createExporterSpanProcessor()] : [] });
+host.register();
+const langfuse = env.HOST_KEYS === "1" ? { publicKey: "pk-host", secretKey: "sk-host", baseUrl: env.OBS_INGEST_URL } : undefined;
+const make = () => new NeuroLink(langfuse ? { observability: { langfuse } } : undefined);
+const credentials = { openai: { apiKey: "k", baseURL: env.OBS_OPENAI_URL } };
+const call = { input: { text: "hi" }, provider: "openai", model: "gpt-4o-mini", credentials, disableTools: true, disableInternalFallback: true };
+const first = make();
+const second = make();
+await setLangfuseContext({ userId: "u-host", sessionId: "s-host", traceName: "host-trace", tags: ["agent", "agent:a1"] }, () => first.generate(call));
+await second.generate(call);
+if (env.HOST_REMOTE === "1") {
+  const remote = trace.setSpanContext(ROOT_CONTEXT, { traceId: "0af7651916cd43dd8448eb211c80319c", spanId: "b7ad6b7169203331", traceFlags: TraceFlags.SAMPLED, isRemote: true });
+  await context.with(remote, () => first.generate(call));
+}
+await flushOpenTelemetry();
+await host.forceFlush();
+const status = getLangfuseHealthStatus();
+await shutdownOpenTelemetry();
+await host.shutdown();
+console.log("STATUS " + JSON.stringify(status));
+process.exit(0);
+`,
+);
+
+async function runHost(env: Record<string, string>): Promise<{
+  status: { isHealthy: boolean; hasProcessor: boolean };
+  spans: DecodedSpan[];
+  sends: Map<string, number>;
+}> {
+  const receiver = await startLangfuse();
+  try {
+    const result = await runCommand(process.execPath, [HOST], {
+      cwd: process.cwd(),
+      timeoutMs: 50_000,
+      env: {
+        PATH: process.env.PATH,
+        HOME: process.env.HOME,
+        DOTENV_CONFIG_PATH: "/dev/null",
+        NEUROLINK_SKIP_MCP: "true",
+        OBS_INGEST_URL: receiver.baseUrl,
+        OBS_OPENAI_URL: fake.baseURL,
+        ...env,
+      },
+    });
+    assertEqual(result.exitCode, 0, "host scenario failed");
+    return {
+      status: parseStatus(result.stdout),
+      spans: receiver.hits.flatMap((entry) => entry.spans),
+      sends: receiver.sends,
+    };
+  } finally {
+    await receiver.close();
+  }
+}
+
+await test("a host provider with the exporter processor exports configured Langfuse keys, identity and tags", async () => {
+  const run = await runHost({ HOST_PROCESSOR: "1", HOST_KEYS: "1" });
+  assert(run.status.isHealthy, "host mode with an exporter was not healthy");
+  assert(run.status.hasProcessor, "no exporter was registered");
+  const traced = run.spans.filter(
+    (span) => span.attributes["user.id"] === "u-host",
+  );
+  assert(traced.length > 0, "no span reached Langfuse with the user");
+  for (const span of traced) {
+    assertEqual(
+      span.attributes["session.id"],
+      "s-host",
+      `${span.name} session`,
+    );
+    assertEqual(
+      span.attributes["langfuse.trace.name"],
+      "host-trace",
+      `${span.name} trace name`,
+    );
+    assertEqual(
+      String(span.attributes["langfuse.trace.tags"]),
+      "agent,agent:a1",
+      `${span.name} tags`,
+    );
+  }
+  assertEqual(
+    run.spans.filter(
+      (span) =>
+        span.name === "generate" &&
+        span.attributes["langfuse.observation.type"] === "agent",
+    ).length,
+    2,
+    "two instances should export two generate roots",
+  );
+});
+
+await test("a root under an unknown remote parent exports as a top-level observation", async () => {
+  const run = await runHost({
+    HOST_PROCESSOR: "1",
+    HOST_KEYS: "1",
+    HOST_REMOTE: "1",
+  });
+  const remote = run.spans.filter(
+    (span) => span.traceId === "0af7651916cd43dd8448eb211c80319c",
+  );
+  const root = remote.find(
+    (span) => span.name === "generate" && kind(span) === "agent",
+  );
+  assert(root !== undefined, "the remote-parented call was not exported");
+  assert(!(root as DecodedSpan).parentSpanId, "the root kept a parent");
+  const attempt = remote.find((span) => span.name === "generate.attempt");
+  assertEqual(attempt?.parentSpanId, (root as DecodedSpan).spanId);
+});
+
+await test("two NeuroLink instances never register a second exporter", async () => {
+  const run = await runHost({ HOST_PROCESSOR: "1", HOST_KEYS: "1" });
+  assert(run.sends.size > 0, "nothing was delivered");
+  for (const [spanId, count] of run.sends) {
+    assertEqual(count, 1, `span ${spanId} was delivered more than once`);
+  }
+});
+
+await test("a host provider without Langfuse configured registers no exporter and is unhealthy", async () => {
+  const run = await runHost({ HOST_PROCESSOR: "1" });
+  assert(!run.status.isHealthy, "health claimed an exporter that is not there");
+  assert(!run.status.hasProcessor, "an exporter was registered without keys");
+  assertEqual(run.spans.length, 0, "spans were exported without keys");
+});
+
+await runSuite();

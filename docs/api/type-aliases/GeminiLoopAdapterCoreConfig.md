@@ -22,6 +22,14 @@ Used in log lines and generated tool-call ids.
 
 ---
 
+### provider
+
+> **provider**: `string`
+
+Provider name recorded on each step's generation and used to price it.
+
+---
+
 ### maxSteps
 
 > **maxSteps**: `number`
@@ -30,7 +38,7 @@ Used in log lines and generated tool-call ids.
 
 ### buildRequest
 
-> **buildRequest**: (`conversation`, `step`) => `unknown`
+> **buildRequest**: (`conversation`, `step`) => [`GeminiStepRequest`](GeminiStepRequest.md)
 
 Build one step's request object (model, contents, config).
 
@@ -46,7 +54,7 @@ Build one step's request object (model, contents, config).
 
 #### Returns
 
-`unknown`
+[`GeminiStepRequest`](GeminiStepRequest.md)
 
 ---
 

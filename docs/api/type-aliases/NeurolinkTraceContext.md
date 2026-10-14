@@ -1,0 +1,77 @@
+[**NeuroLink API Reference**](../README.md)
+
+---
+
+[NeuroLink API Reference](../README.md) / NeurolinkTraceContext
+
+# Type Alias: NeurolinkTraceContext
+
+> **NeurolinkTraceContext** = `object`
+
+## Description
+
+Per-call trace attributes propagated to every span created inside the call.
+
+## Properties
+
+### userId?
+
+> `optional` **userId?**: `string` \| `null`
+
+End user the trace belongs to.
+
+---
+
+### sessionId?
+
+> `optional` **sessionId?**: `string` \| `null`
+
+Session that groups related traces.
+
+---
+
+### conversationId?
+
+> `optional` **conversationId?**: `string` \| `null`
+
+Conversation identifier, recorded as trace metadata.
+
+---
+
+### requestId?
+
+> `optional` **requestId?**: `string` \| `null`
+
+Request identifier, recorded as trace metadata.
+
+---
+
+### traceName?
+
+> `optional` **traceName?**: `string` \| `null`
+
+Trace name shown in Langfuse.
+
+---
+
+### tags?
+
+> `optional` **tags?**: `string`[]
+
+Trace tags.
+
+---
+
+### metadata?
+
+> `optional` **metadata?**: `Record`\<`string`, [`SpanContent`](SpanContent.md) \| `undefined`\>
+
+Trace metadata; values up to 200 characters once stringified are on every observation, longer values and arrays only on the trace.
+
+---
+
+### observationName?
+
+> `optional` **observationName?**: `string` \| `null`
+
+Name of the root observation of this `generate` or `stream` call; not propagated to child observations and not the trace name.

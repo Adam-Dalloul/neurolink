@@ -47,6 +47,7 @@ import { sanitizeForLog } from "../utils/logSanitize.js";
 import type {
   CodexStreamUsage,
   CodexStreamEvidence,
+  JsonObject,
   ProxyCancellableTransformer,
 } from "../types/index.js";
 
@@ -327,6 +328,15 @@ export function createCodexUsageTap(): {
         ) {
           evidence.firstUsefulOutputAt = Date.now();
           evidence.firstUsefulOutputEvent = String(type);
+        }
+        if (
+          typeof type === "string" &&
+          type.startsWith("response.") &&
+          completedResponse &&
+          typeof completedResponse === "object" &&
+          "output" in completedResponse
+        ) {
+          evidence.response = completedResponse as JsonObject;
         }
         if (type === "response.completed") {
           evidence.completed = true;

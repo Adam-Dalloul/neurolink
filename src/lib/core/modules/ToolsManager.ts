@@ -9,7 +9,13 @@ import type {
   JsonObject,
   ToolOutputPreviewOptions,
 } from "../../types/index.js";
-import { tracers, ATTR, withSpan } from "../../telemetry/index.js";
+import {
+  tracers,
+  ATTR,
+  observe,
+  toolSpanName,
+  withSpan,
+} from "../../telemetry/index.js";
 import { SpanStatusCode } from "@opentelemetry/api";
 import { logger } from "../../utils/logger.js";
 import { TOOL_EVENTS_WRAPPED } from "../../types/index.js";
@@ -650,7 +656,6 @@ export class ToolsManager {
       return execute;
     }
     const wrapped = async (params: unknown, execOptions?: unknown) => {
-      const startTime = Date.now();
       // The loop's execute options carry the model's tool_call id, which is
       // what lets a listener pair concurrent same-name start/end events.
       const toolCallId =
@@ -661,33 +666,51 @@ export class ToolsManager {
         typeof toolCallId === "string" && toolCallId.length > 0
           ? { toolCallId }
           : {};
-      this.emitToolEvent("tool:start", toolName, {
-        input: params,
-        ...idField,
-      });
+      return withSpan(
+        {
+          name: toolSpanName(toolName),
+          tracer: tracers.mcp,
+          attributes: { "tool.name": toolName, ...idField },
+        },
+        async (span) => {
+          observe(span, "tool", { input: params });
+          const startTime = Date.now();
+          this.emitToolEvent("tool:start", toolName, {
+            input: params,
+            ...idField,
+          });
 
-      let result: unknown;
-      try {
-        result = await execute(params, execOptions);
-      } catch (error) {
-        const errorMsg = error instanceof Error ? error.message : String(error);
-        this.emitToolEvent("tool:end", toolName, {
-          error: errorMsg,
-          success: false,
-          responseTime: Date.now() - startTime,
-          ...idField,
-        });
-        throw error;
-      }
-      const isErrorText = extractIsErrorText(result);
-      this.emitToolEvent("tool:end", toolName, {
-        result,
-        success: isErrorText === undefined,
-        ...(isErrorText !== undefined ? { error: isErrorText } : {}),
-        responseTime: Date.now() - startTime,
-        ...idField,
-      });
-      return result;
+          let result: unknown;
+          try {
+            result = await execute(params, execOptions);
+          } catch (error) {
+            const errorMsg =
+              error instanceof Error ? error.message : String(error);
+            this.emitToolEvent("tool:end", toolName, {
+              error: errorMsg,
+              success: false,
+              responseTime: Date.now() - startTime,
+              ...idField,
+            });
+            throw error;
+          }
+          const isErrorText = extractIsErrorText(result);
+          observe(span, "tool", {
+            output: result,
+            ...(isErrorText !== undefined
+              ? { level: "ERROR", statusMessage: isErrorText }
+              : {}),
+          });
+          this.emitToolEvent("tool:end", toolName, {
+            result,
+            success: isErrorText === undefined,
+            ...(isErrorText !== undefined ? { error: isErrorText } : {}),
+            responseTime: Date.now() - startTime,
+            ...idField,
+          });
+          return result;
+        },
+      );
     };
     this.eventWrappedExecutes.add(wrapped);
     return wrapped;
@@ -763,7 +786,7 @@ export class ToolsManager {
     },
     functionTag: string,
   ): void {
-    const span = tracers.sdk.startSpan("neurolink.tools.register", {
+    const span = tracers.sdk.startSpan("tools.register", {
       attributes: {
         [ATTR.NL_PROVIDER]: this.providerName,
         "tools.custom_count": sdk.customTools.size,
@@ -806,7 +829,7 @@ export class ToolsManager {
   async getAllTools(): Promise<Record<string, Tool>> {
     return withSpan(
       {
-        name: "neurolink.tools.getAll",
+        name: "tools.getAll",
         tracer: tracers.sdk,
         attributes: {
           [ATTR.NL_PROVIDER]: this.providerName,
@@ -1114,15 +1137,11 @@ export class ToolsManager {
           inputSchema: finalSchema, // AI SDK v6 uses inputSchema (not parameters)
           execute: async (params: unknown) => {
             const customToolSpan = tracers.sdk.startSpan(
-              "neurolink.tools.execute_custom",
+              "tools.execute_custom",
               {
                 attributes: {
                   "tool.name": toolName,
                   "tool.type": "custom",
-                  // Curator P1-3: pure wrapper — duplicates the AI SDK's
-                  // ai.toolCall observation in Langfuse. Keep the OTel span
-                  // for internal metrics; filter from Langfuse export.
-                  "langfuse.internal": true,
                 },
               },
             );

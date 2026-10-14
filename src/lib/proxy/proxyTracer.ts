@@ -6,15 +6,14 @@
  *   receive -> account_selection -> upstream (per retry) -> stream -> end
  *
  * Uses the existing instrumentation infrastructure:
- * - getTracer() from instrumentation.ts for span creation
  * - setLangfuseContext() for Langfuse enrichment
- * - OtelBridge for context propagation to/from upstream
+ * - OTel propagation API for context propagation to/from upstream
  * - SpanAttributes from spanTypes.ts for attribute naming
  * - calculateCost() from pricing.ts for cost tracking
- * - TelemetryService for metrics recording
  */
 
 import {
+  type Context,
   type Meter,
   type Span,
   SpanStatusCode,
@@ -26,18 +25,21 @@ import {
   metrics,
   trace,
 } from "@opentelemetry/api";
+import { setLangfuseContext } from "../services/server/ai/observability/instrumentation.js";
+import { spanContentAttribute } from "../telemetry/attributes.js";
 import {
-  getTracer,
-  setLangfuseContext,
-} from "../services/server/ai/observability/instrumentation.js";
-import { OtelBridge } from "../observability/otelBridge.js";
+  observationLevel,
+  observe,
+  observeTrace,
+  usageDetails,
+} from "../telemetry/observation.js";
+import { generationName } from "../telemetry/observationNames.js";
 import { proxyTokenUsage } from "./proxyTokenUsage.js";
 import {
   calculateCost,
   hasPricing,
   isExactPricingMatch,
 } from "../utils/pricing.js";
-import { TelemetryService } from "../telemetry/telemetryService.js";
 import { logger } from "../utils/logger.js";
 import {
   registerProxyRequestTraceContext,
@@ -45,6 +47,8 @@ import {
 } from "./proxyTraceContext.js";
 import type {
   AccountSelectionContext,
+  JsonValue,
+  ObservationLevel,
   ProxyMetrics,
   ProxyRequestContext,
   ProxyRequestOrigin,
@@ -55,8 +59,6 @@ import type {
   RuntimeRequestMetadata,
   ProxyLogTraceContext,
 } from "../types/index.js";
-
-const LOG_PREFIX = "[ProxyTracer]";
 
 // ---------------------------------------------------------------------------
 // OTEL Metric Instruments — lazy singleton
@@ -75,7 +77,7 @@ function getProxyMetrics(): ProxyMetrics {
     return _metrics;
   }
 
-  const meter: Meter = metrics.getMeter("neurolink.proxy", "1.0.0");
+  const meter: Meter = metrics.getMeter("proxy", "1.0.0");
 
   const createdMetrics: ProxyMetrics = {
     requestsTotal: meter.createCounter("proxy_requests_total", {
@@ -252,6 +254,14 @@ function buildBodyEventAttributes(
   };
 }
 
+function parseBody(body: string): JsonValue {
+  try {
+    return JSON.parse(body);
+  } catch {
+    return body;
+  }
+}
+
 // ---------------------------------------------------------------------------
 // Client app detection
 // ---------------------------------------------------------------------------
@@ -275,8 +285,8 @@ function detectClientApp(userAgent?: string): string {
 
 class ProxyTracer {
   private readonly rootSpan: Span;
-  private readonly proxyTracer = getTracer("neurolink.proxy");
-  private readonly bridge = new OtelBridge();
+  private readonly traceContext: Context;
+  private readonly proxyTracer = trace.getTracer("proxy");
   private readonly requestId: string;
   /**
    * Model used for costing. Starts as the model the client asked for and is
@@ -301,17 +311,29 @@ class ProxyTracer {
   private mode: "full" | "passthrough" | "passthrough-cli" = "full";
   /** Where the Claude-shaped request originated, for cache/cost attribution. */
   private requestOrigin: ProxyRequestOrigin = "native";
+  private readonly requestedModel: string;
+  private input?: JsonValue;
+  private output?: JsonValue | ResponseInfoContext["output"];
+  private responseModel?: string;
+  private finishReason?: string;
+  private firstOutputAt?: number;
+  private upstreamStartedAt?: number;
+  private cost?: number;
+  private statusMessage?: string;
 
   private constructor(
     rootSpan: Span,
+    traceContext: Context,
     requestId: string,
     model: string,
     stream: boolean,
     billingProvider: string,
   ) {
     this.rootSpan = rootSpan;
+    this.traceContext = traceContext;
     this.requestId = requestId;
     this.model = model;
+    this.requestedModel = model;
     this.billingProvider = billingProvider;
     this.startTime = Date.now();
     this.isStream = stream;
@@ -321,19 +343,24 @@ class ProxyTracer {
    * Create a root span for a proxy request and set Langfuse context.
    *
    * If the incoming request carries a `traceparent` header, the root span
-   * will be linked to the caller's trace via OtelBridge.extractContext().
+   * will be linked to the caller's trace via the OTel propagation API.
    */
   static startRequest(
     ctx: ProxyRequestContext,
     incomingHeaders?: Record<string, string>,
   ): ProxyTracer {
-    const tracer = getTracer("neurolink.proxy");
+    const tracer = trace.getTracer("proxy");
 
     // Extract parent context from incoming headers (Claude Code may send traceparent)
     let parentContext = context.active();
     if (incomingHeaders && !trace.getSpan(context.active())) {
-      const bridge = new OtelBridge();
-      const extracted = bridge.extractContext(incomingHeaders);
+      const headers = { ...incomingHeaders };
+      if (headers["traceparent"]?.includes(", ")) {
+        headers["traceparent"] = headers["traceparent"].split(", ")[0];
+      }
+      const extracted = trace.getSpanContext(
+        propagation.extract(context.active(), headers),
+      );
       if (extracted) {
         // Create a remote span context so the root span becomes a child of the caller
         parentContext = trace.setSpanContext(context.active(), extracted);
@@ -341,6 +368,24 @@ class ProxyTracer {
     }
 
     const clientApp = ctx.clientApp ?? detectClientApp(ctx.userAgent);
+    const traceContext = context.with(parentContext, () =>
+      setLangfuseContext(
+        {
+          userId: incomingHeaders?.["x-neurolink-user-id"],
+          sessionId:
+            incomingHeaders?.["x-neurolink-session-id"] ?? ctx.sessionId,
+          conversationId: incomingHeaders?.["x-neurolink-conversation-id"],
+          requestId: ctx.requestId,
+          traceName: `proxy:${ctx.model}`,
+          metadata: {
+            clientApp,
+            stream: ctx.stream,
+            toolCount: ctx.toolCount,
+          },
+        },
+        () => context.active(),
+      ),
+    );
 
     const rootSpan = tracer.startSpan(
       "proxy.request",
@@ -349,18 +394,15 @@ class ProxyTracer {
           "proxy.request_id": ctx.requestId,
           "http.method": ctx.method,
           "http.target": ctx.path,
-          "gen_ai.request.model": ctx.model,
+          "proxy.request.model": ctx.model,
           "proxy.stream": ctx.stream,
           "proxy.tool_count": ctx.toolCount,
           "proxy.client_app": clientApp,
         },
       },
-      parentContext,
+      traceContext,
     );
 
-    if (ctx.sessionId) {
-      rootSpan.setAttribute("session.id", ctx.sessionId);
-    }
     if (ctx.userAgent) {
       rootSpan.setAttribute("http.user_agent", ctx.userAgent);
     }
@@ -372,23 +414,9 @@ class ProxyTracer {
       );
     }
 
-    // Read x-neurolink-* context headers from calling SDK (e.g., Curator)
-    const nlSessionId = incomingHeaders?.["x-neurolink-session-id"];
-    const nlUserId = incomingHeaders?.["x-neurolink-user-id"];
-    const nlConversationId = incomingHeaders?.["x-neurolink-conversation-id"];
-
-    if (nlSessionId) {
-      rootSpan.setAttribute("neurolink.session_id", nlSessionId);
-    }
-    if (nlUserId) {
-      rootSpan.setAttribute("neurolink.user_id", nlUserId);
-    }
-    if (nlConversationId) {
-      rootSpan.setAttribute("neurolink.conversation_id", nlConversationId);
-    }
-
     const instance = new ProxyTracer(
       rootSpan,
+      trace.setSpan(traceContext, rootSpan),
       ctx.requestId,
       ctx.model,
       ctx.stream,
@@ -397,26 +425,6 @@ class ProxyTracer {
     instance.recordRequestMetrics = ctx.recordRequestMetrics !== false;
     instance.recordUsageMetrics =
       ctx.recordUsageMetrics ?? instance.recordRequestMetrics;
-
-    // Set Langfuse context (fire-and-forget — non-blocking)
-    // Prefer NeuroLink session/user from calling SDK over Claude Code session
-    setLangfuseContext({
-      sessionId: nlSessionId ?? ctx.sessionId,
-      userId: nlUserId,
-      conversationId: nlConversationId,
-      requestId: ctx.requestId,
-      traceName: `proxy:${ctx.model}`,
-      operationName: "proxy.request",
-      metadata: {
-        clientApp,
-        stream: ctx.stream,
-        toolCount: ctx.toolCount,
-      },
-    }).catch((err) => {
-      logger.debug(`${LOG_PREFIX} Failed to set Langfuse context`, {
-        error: err instanceof Error ? err.message : String(err),
-      });
-    });
 
     return instance;
   }
@@ -434,7 +442,7 @@ class ProxyTracer {
           "proxy.request_id": this.requestId,
         },
       },
-      trace.setSpan(context.active(), this.rootSpan),
+      this.traceContext,
     );
   }
 
@@ -447,12 +455,13 @@ class ProxyTracer {
           "proxy.request_id": this.requestId,
         },
       },
-      trace.setSpan(context.active(), this.rootSpan),
+      this.traceContext,
     );
   }
 
   /** Span covering a single upstream attempt. One per retry. */
   startUpstreamAttempt(ctx: UpstreamAttemptContext): Span {
+    this.upstreamStartedAt ??= Date.now();
     return this.proxyTracer.startSpan(
       "proxy.upstream",
       {
@@ -465,7 +474,7 @@ class ProxyTracer {
           "http.url": ctx.upstreamUrl,
         },
       },
-      trace.setSpan(context.active(), this.rootSpan),
+      this.traceContext,
     );
   }
 
@@ -476,10 +485,10 @@ class ProxyTracer {
       {
         attributes: {
           "proxy.request_id": this.requestId,
-          "gen_ai.request.model": this.model,
+          "proxy.request.model": this.model,
         },
       },
-      trace.setSpan(context.active(), this.rootSpan),
+      this.traceContext,
     );
   }
 
@@ -510,11 +519,6 @@ class ProxyTracer {
         ctx.rateLimitBefore7d,
       );
     }
-
-    // Update Langfuse context with account as userId
-    setLangfuseContext({ userId: ctx.selectedAccount }).catch(() => {
-      // Non-fatal
-    });
   }
 
   /** Attribute fallback metrics to the account that actually served them. */
@@ -568,11 +572,10 @@ class ProxyTracer {
       this.rootSpan.setAttribute("ai.tokens.reasoning", ctx.reasoningTokens);
     }
 
-    // GenAI semantic convention attributes (for Langfuse compatibility)
     this.rootSpan.setAttributes({
-      "gen_ai.usage.input_tokens": totalTokens - ctx.outputTokens,
-      "gen_ai.usage.output_tokens": ctx.outputTokens,
-      "gen_ai.usage.total_tokens": totalTokens,
+      "proxy.usage.input_tokens": totalTokens - ctx.outputTokens,
+      "proxy.usage.output_tokens": ctx.outputTokens,
+      "proxy.usage.total_tokens": totalTokens,
     });
 
     // Prefix-inferred prices are not an observed model rate. Keep provenance,
@@ -592,6 +595,7 @@ class ProxyTracer {
         this.model,
         billingUsage,
       );
+      this.cost = cost;
       this.rootSpan.setAttributes({
         "ai.cost.total": cost,
         "ai.cost.currency": "USD",
@@ -619,8 +623,14 @@ class ProxyTracer {
    * invoked (tool_use blocks). Uses gen_ai.* semantic-convention attributes.
    */
   setResponseInfo(ctx: ResponseInfoContext): void {
+    this.responseModel = ctx.responseModel ?? this.responseModel;
+    this.finishReason = ctx.finishReason ?? this.finishReason;
+    this.firstOutputAt = ctx.firstOutputAt ?? this.firstOutputAt;
+    if (BODY_LOGGING_ENABLED && ctx.output !== undefined) {
+      this.output = ctx.output;
+    }
     if (ctx.responseModel) {
-      this.rootSpan.setAttribute("gen_ai.response.model", ctx.responseModel);
+      this.rootSpan.setAttribute("proxy.response.model", ctx.responseModel);
     }
     if (ctx.finishReason) {
       this.rootSpan.setAttribute(
@@ -647,6 +657,7 @@ class ProxyTracer {
 
   /** Record an error on the root span. */
   setError(errorType: string, errorMessage: string): void {
+    this.statusMessage = `${errorType}: ${errorMessage}`;
     this.rootSpan.setAttributes({
       "error.type": errorType,
       "error.message": errorMessage,
@@ -682,7 +693,7 @@ class ProxyTracer {
       "proxy.model_substituted": true,
       "proxy.original_model": requestedModel,
       "proxy.actual_model": actualModel,
-      "gen_ai.response.model": actualModel,
+      "proxy.response.model": actualModel,
       ...(actualProvider ? { "proxy.actual_provider": actualProvider } : {}),
     });
     if (this.recordRequestMetrics) {
@@ -726,6 +737,7 @@ class ProxyTracer {
       });
       return;
     }
+    this.input = parseBody(body);
     this.rootSpan.addEvent("proxy.client.request_body", {
       ...buildBodyEventAttributes(body),
     });
@@ -775,6 +787,7 @@ class ProxyTracer {
       });
       return;
     }
+    this.output = parseBody(body);
     this.rootSpan.addEvent("proxy.upstream.response_body", {
       ...buildBodyEventAttributes(body),
     });
@@ -823,6 +836,7 @@ class ProxyTracer {
 
   /** Record an upstream retry attempt. */
   recordRetry(account: string, reason: string): void {
+    this.statusMessage ??= `retried: ${reason}`;
     const m = getProxyMetrics();
     m.retriesTotal.add(1, {
       model: this.model,
@@ -894,6 +908,7 @@ class ProxyTracer {
       this.rootSpan.setStatus({ code: SpanStatusCode.OK });
     }
 
+    this.observeOutcome(responseStatus);
     this.rootSpan.end();
 
     if (!this.recordRequestMetrics && !this.recordUsageMetrics) {
@@ -981,30 +996,70 @@ class ProxyTracer {
     }
   }
 
-  /** Record metrics via TelemetryService (call after setUsage). */
-  recordMetrics(): void {
-    if (!this.recordUsageMetrics || !this.usage) {
+  private levelFor(responseStatus: number): ObservationLevel | undefined {
+    if (responseStatus === 499) {
+      return "WARNING";
+    }
+    if (responseStatus >= 400) {
+      return "ERROR";
+    }
+    if (this.statusMessage) {
+      return "WARNING";
+    }
+    return observationLevel(this.finishReason);
+  }
+
+  private observeOutcome(responseStatus: number): void {
+    const level = this.levelFor(responseStatus);
+    const statusMessage =
+      this.statusMessage ??
+      (responseStatus >= 400 ? `HTTP ${responseStatus}` : undefined);
+    const io = {
+      input:
+        this.input === undefined ? undefined : spanContentAttribute(this.input),
+      output:
+        this.output === undefined
+          ? undefined
+          : spanContentAttribute(this.output),
+    };
+    observe(this.rootSpan, "span", {
+      ...io,
+      level,
+      statusMessage,
+      metadata: { account: this.accountEmail },
+    });
+    observeTrace(this.rootSpan, io);
+
+    if (this.upstreamStartedAt === undefined) {
       return;
     }
-
-    const billingUsage = proxyTokenUsage(this.usage);
-    const totalTokens = billingUsage.total;
-
-    const durationMs = Date.now() - this.startTime;
-
-    const cost =
-      isExactPricingMatch(this.billingProvider, this.model) &&
-      hasPricing(this.billingProvider, this.model)
-        ? calculateCost(this.billingProvider, this.model, billingUsage)
-        : undefined;
-
-    TelemetryService.getInstance().recordAIRequest(
-      this.billingProvider,
-      this.model,
-      totalTokens,
-      durationMs,
-      cost,
+    const generation = this.proxyTracer.startSpan(
+      generationName(this.isStream ? "stream" : "generate"),
+      {
+        startTime: this.upstreamStartedAt,
+        attributes: { "proxy.request_id": this.requestId },
+      },
+      this.traceContext,
     );
+    observe(generation, "generation", {
+      ...io,
+      model: this.responseModel ?? this.model,
+      usageDetails: this.usage && usageDetails(proxyTokenUsage(this.usage)),
+      costDetails: this.cost === undefined ? undefined : { total: this.cost },
+      completionStartTime:
+        this.firstOutputAt === undefined
+          ? undefined
+          : new Date(this.firstOutputAt),
+      level,
+      statusMessage,
+      metadata: {
+        provider: this.billingProvider,
+        account: this.accountEmail,
+        requestedModel: this.requestedModel,
+        finishReason: this.finishReason,
+      },
+    });
+    generation.end();
   }
 
   // -------------------------------------------------------------------------
@@ -1016,10 +1071,9 @@ class ProxyTracer {
    * Injects the current trace's `traceparent` / `tracestate` into a new header map.
    */
   getTraceHeaders(): Record<string, string> {
-    return this.bridge.injectContext(
-      {},
-      trace.setSpan(context.active(), this.rootSpan),
-    );
+    const headers: Record<string, string> = {};
+    propagation.inject(this.traceContext, headers);
+    return headers;
   }
 }
 
@@ -1225,8 +1279,6 @@ export function startProxyHttpTrace(
   headers: Record<string, string>,
 ) {
   try {
-    // Match OtelBridge's existing compatibility policy for HTTP-combined
-    // traceparent values: retain the first injected parent.
     const normalizedHeaders = { ...headers };
     if (normalizedHeaders.traceparent?.includes(",")) {
       normalizedHeaders.traceparent = normalizedHeaders.traceparent
@@ -1234,7 +1286,7 @@ export function startProxyHttpTrace(
         .trim();
     }
     const parent = propagation.extract(ROOT_CONTEXT, normalizedHeaders);
-    const span = getTracer("neurolink.proxy").startSpan(
+    const span = trace.getTracer("proxy").startSpan(
       "proxy.http.request",
       {
         kind: SpanKind.SERVER,

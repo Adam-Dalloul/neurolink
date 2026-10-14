@@ -1,4 +1,117 @@
-import { trace } from "@opentelemetry/api";
+import {
+  context,
+  trace,
+  type Context,
+  type Exception,
+  type Span,
+  type SpanOptions,
+  type Tracer,
+} from "@opentelemetry/api";
+import type { GenerationOperation } from "../types/index.js";
+import { ensureTelemetry } from "../services/server/ai/observability/instrumentation.js";
+
+const PRODUCT_NAME = /neurolink/gi;
+const OPERATION_ROOT = /^(?:provider\.)?(generate|stream)(?:\.|$)/;
+const operations = new WeakMap<Span, GenerationOperation>();
+const nestedOperations = new WeakSet<Span>();
+
+function trackOperation(span: Span, name: string, parent?: Span): Span {
+  const root = OPERATION_ROOT.exec(name)?.[1] as
+    | GenerationOperation
+    | undefined;
+  const parentOperation = parent && operations.get(parent);
+  if (root && parentOperation) {
+    nestedOperations.add(span);
+  }
+  const operation = root ?? parentOperation;
+  if (operation) {
+    operations.set(span, operation);
+  }
+  return span;
+}
+
+/**
+ * @description Reads which public API call the active span belongs to, following the span's ancestry up to a `generate`, `stream`, `provider.generate` or `provider.stream` span.
+ * @returns {GenerationOperation | undefined} The enclosing operation, or `undefined` when no such span is active.
+ */
+export function activeOperation(): GenerationOperation | undefined {
+  const span = trace.getSpan(context.active());
+  return span && operations.get(span);
+}
+
+/**
+ * @description Reports whether a `generate` or `stream` span started inside another operation's span tree.
+ * @param span {Span} - Span returned by a scrubbed tracer.
+ * @returns {boolean} `true` when the span is nested in an enclosing operation, `false` for a trace root.
+ */
+export function isNestedOperation(span: Span): boolean {
+  return nestedOperations.has(span);
+}
+
+function scrubException(exception: Exception): Exception {
+  if (!(exception instanceof Error)) {
+    return typeof exception === "string"
+      ? exception.replace(PRODUCT_NAME, "ai")
+      : exception;
+  }
+  return {
+    name: exception.name.replace(PRODUCT_NAME, "Ai"),
+    message: exception.message.replace(PRODUCT_NAME, "ai"),
+  };
+}
+
+function withScrubbedExceptions(span: Span): Span {
+  const record = span.recordException.bind(span);
+  span.recordException = (exception, time) =>
+    record(scrubException(exception), time);
+  return span;
+}
+
+/**
+ * @description Resolves a tracer whose spans record exceptions as type and message only, without stack traces or product-name references that would reach trace backends as event metadata.
+ * @param name {string} - Instrumentation scope name.
+ * @returns {Tracer} A tracer delegating to the globally registered provider.
+ */
+export function scrubbedTracer(name: string): Tracer {
+  const inner = trace.getTracer(name);
+  return {
+    startSpan: (spanName: string, options?: SpanOptions, ctx?: Context) => {
+      ensureTelemetry();
+      const span = withScrubbedExceptions(
+        inner.startSpan(spanName, options, ctx),
+      );
+      return trackOperation(
+        span,
+        spanName,
+        trace.getSpan(ctx ?? context.active()),
+      );
+    },
+    startActiveSpan<F extends (span: Span) => ReturnType<F>>(
+      spanName: string,
+      arg2?: SpanOptions | F,
+      arg3?: Context | F,
+      arg4?: F,
+    ): ReturnType<F> {
+      ensureTelemetry();
+      const fn = [arg4, arg3, arg2].find(
+        (arg): arg is F => typeof arg === "function",
+      ) as F;
+      const options = typeof arg2 === "function" ? undefined : arg2;
+      const ctx = typeof arg3 === "function" ? undefined : arg3;
+      const parent = trace.getSpan(ctx ?? context.active());
+      const wrapped = ((span: Span) =>
+        fn(
+          trackOperation(withScrubbedExceptions(span), spanName, parent),
+        )) as F;
+      if (ctx) {
+        return inner.startActiveSpan(spanName, options ?? {}, ctx, wrapped);
+      }
+      return options
+        ? inner.startActiveSpan(spanName, options, wrapped)
+        : inner.startActiveSpan(spanName, wrapped);
+    },
+  };
+}
 
 /**
  * Pre-resolved tracers cached at module load.
@@ -20,22 +133,22 @@ import { trace } from "@opentelemetry/api";
  * this file and switch to lazy accessors.
  */
 export const tracers = {
-  sdk: trace.getTracer("neurolink"),
-  provider: trace.getTracer("neurolink.provider"),
-  generation: trace.getTracer("neurolink.generation"),
-  decision: trace.getTracer("neurolink.decision"),
-  stream: trace.getTracer("neurolink.stream"),
-  http: trace.getTracer("neurolink.http"),
-  mcp: trace.getTracer("neurolink.mcp"),
-  memory: trace.getTracer("neurolink.memory"),
-  redis: trace.getTracer("neurolink.redis"),
-  factory: trace.getTracer("neurolink.factory"),
-  rag: trace.getTracer("neurolink.rag"),
-  context: trace.getTracer("neurolink.context"),
-  middleware: trace.getTracer("neurolink.middleware"),
-  processor: trace.getTracer("neurolink.processor"),
-  file: trace.getTracer("neurolink.file"),
-  autoresearch: trace.getTracer("neurolink.autoresearch"),
-  auth: trace.getTracer("neurolink.auth"),
-  workflow: trace.getTracer("neurolink.workflow"),
+  sdk: scrubbedTracer("sdk"),
+  provider: scrubbedTracer("provider"),
+  generation: scrubbedTracer("generation"),
+  decision: scrubbedTracer("decision"),
+  stream: scrubbedTracer("stream"),
+  http: scrubbedTracer("http"),
+  mcp: scrubbedTracer("mcp"),
+  memory: scrubbedTracer("memory"),
+  redis: scrubbedTracer("redis"),
+  factory: scrubbedTracer("factory"),
+  rag: scrubbedTracer("rag"),
+  context: scrubbedTracer("context"),
+  middleware: scrubbedTracer("middleware"),
+  processor: scrubbedTracer("processor"),
+  file: scrubbedTracer("file"),
+  autoresearch: scrubbedTracer("autoresearch"),
+  auth: scrubbedTracer("auth"),
+  workflow: scrubbedTracer("workflow"),
 } as const;

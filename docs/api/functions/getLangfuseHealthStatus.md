@@ -8,13 +8,11 @@
 
 > **getLangfuseHealthStatus**(): `object`
 
-Get health status for Langfuse observability
-
 ## Returns
 
 `object`
 
-Health status object with initialization and configuration details
+`isHealthy` and `hasProcessor` are `true` only while a Langfuse exporter is registered, on NeuroLink's own provider or beside a host provider (where it still needs `createExporterSpanProcessor()` on the host provider to receive spans); `error` carries the message of a failed initialization.
 
 ### isHealthy
 
@@ -24,14 +22,6 @@ Health status object with initialization and configuration details
 
 > **initialized**: `boolean`
 
-### credentialsValid
-
-> **credentialsValid**: `boolean`
-
-### enabled
-
-> **enabled**: `boolean`
-
 ### hasProcessor
 
 > **hasProcessor**: `boolean`
@@ -40,18 +30,10 @@ Health status object with initialization and configuration details
 
 > **usingExternalProvider**: `boolean`
 
-### config?
+### error?
 
-> `optional` **config?**: `object`
+> `optional` **error?**: `string`
 
-#### config.baseUrl
+## Description
 
-> **baseUrl**: `string`
-
-#### config.environment
-
-> **environment**: `string`
-
-#### config.release
-
-> **release**: `string`
+Summarizes the Langfuse export state for health checks.

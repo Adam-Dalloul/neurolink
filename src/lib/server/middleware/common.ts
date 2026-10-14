@@ -29,7 +29,7 @@ export function createTimingMiddleware(): MiddlewareDefinition {
     order: 0, // Run first
     handler: async (ctx, next) => {
       return tracers.middleware.startActiveSpan(
-        "neurolink.middleware.timing",
+        "middleware.timing",
         async (otelSpan) => {
           try {
             const startTime = Date.now();

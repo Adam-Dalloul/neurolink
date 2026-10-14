@@ -35,6 +35,10 @@ import {
   resumeProxyConnections,
   waitForProxyReadiness,
 } from "../../lib/proxy/proxyHealth.js";
+import {
+  ensureTelemetry,
+  getLangfuseHealthStatus,
+} from "../../lib/services/server/ai/observability/instrumentation.js";
 import { logger } from "../../lib/utils/logger.js";
 import {
   applyAllClients,
@@ -3096,32 +3100,20 @@ async function initializeProxyOpenTelemetry(): Promise<void> {
       .filter(Boolean)
       .join(",");
 
-    const { initializeOpenTelemetry, isOpenTelemetryInitialized } =
-      await import("../../lib/services/server/ai/observability/instrumentation.js");
-    const { buildObservabilityConfigFromEnv } =
-      await import("../../lib/utils/observabilityHelpers.js");
-
-    if (isOpenTelemetryInitialized()) {
-      return;
-    }
-
-    const observabilityConfig = buildObservabilityConfigFromEnv();
-    const langfuseConfig = observabilityConfig?.langfuse;
-    const langfuseEnabled = langfuseConfig?.enabled === true;
-    await initializeOpenTelemetry({
-      enabled: langfuseEnabled,
-      publicKey: langfuseConfig?.publicKey || "",
-      secretKey: langfuseConfig?.secretKey || "",
-      baseUrl: langfuseConfig?.baseUrl,
-      environment: "proxy",
-      release: PROXY_VERSION,
-      userId: "neurolink-proxy",
-      autoDetectOperationName: true,
+    const hasLangfuseKeys = Boolean(
+      process.env.LANGFUSE_PUBLIC_KEY && process.env.LANGFUSE_SECRET_KEY,
+    );
+    ensureTelemetry({
+      langfuse: hasLangfuseKeys && {
+        environment: process.env.LANGFUSE_TRACING_ENVIRONMENT || "proxy",
+        release: process.env.LANGFUSE_RELEASE || PROXY_VERSION,
+      },
     });
+    const langfuseEnabled = getLangfuseHealthStatus().hasProcessor;
 
     if (langfuseEnabled) {
       logger.always(
-        `[proxy] Langfuse enabled — exporting to ${langfuseConfig.baseUrl || "https://cloud.langfuse.com"} (environment=proxy)`,
+        `[proxy] Langfuse enabled — exporting to ${process.env.LANGFUSE_BASE_URL || "https://cloud.langfuse.com"}`,
       );
     }
     if (otlpEndpoint) {

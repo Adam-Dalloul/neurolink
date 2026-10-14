@@ -356,7 +356,7 @@ These items are mandatory regardless of which section above you're working from.
 
   ```ts
   return withClientStreamSpan(
-    { name: "neurolink.provider.stream", tracer: tracers.provider, attributes: {...} },
+    { name: "provider.stream", tracer: tracers.provider, attributes: {...} },
     async () => this.executeStreamInner(options),
     (r) => r.stream,
     (r, wrapped) => ({ ...r, stream: wrapped }),

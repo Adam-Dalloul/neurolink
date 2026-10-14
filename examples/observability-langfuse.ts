@@ -4,10 +4,11 @@
  * NeuroLink Observability with Langfuse Example
  *
  * This example demonstrates:
- * - Creating a NeuroLink instance with Langfuse observability configured
- * - Using `setLangfuseContext()` to set trace metadata (userId, sessionId, etc.)
- * - Making generate calls that are automatically traced
- * - How traces appear in the Langfuse dashboard with proper correlation
+ * - Automatic Langfuse tracing from LANGFUSE_* environment variables
+ * - Passing trace identity (userId, sessionId, tags, etc.) via per-call `context`
+ * - Using `setLangfuseContext()` to wrap code that calls generate indirectly
+ * - Reusing a host-registered OpenTelemetry provider with `LangfuseSpanProcessor`
+ *   or with `createExporterSpanProcessor()` (exporter pipeline)
  *
  * Langfuse (https://langfuse.com) provides LLM observability including:
  * - Trace visualization for every AI call
@@ -22,76 +23,70 @@
  *   - Langfuse account and project (cloud.langfuse.com or self-hosted)
  *   - export LANGFUSE_PUBLIC_KEY="pk-..."
  *   - export LANGFUSE_SECRET_KEY="sk-..."
+ *   - Optional: LANGFUSE_BASE_URL, LANGFUSE_TRACING_ENVIRONMENT, LANGFUSE_RELEASE
  *   - At least one AI provider API key set
  */
 
-import { NeuroLink, setLangfuseContext } from "@juspay/neurolink";
+import { LangfuseSpanProcessor } from "@langfuse/otel";
+import {
+  createExporterSpanProcessor,
+  ExporterRegistry,
+  flushOpenTelemetry,
+  getLangfuseHealthStatus,
+  LangfuseExporter,
+  NeuroLink,
+  setLangfuseContext,
+} from "@juspay/neurolink";
+import { NodeTracerProvider } from "@opentelemetry/sdk-trace-node";
 
 async function observabilityLangfuseExample() {
   console.log("NeuroLink Observability with Langfuse Example\n");
 
-  // Validate Langfuse credentials are available
-  const publicKey = process.env.LANGFUSE_PUBLIC_KEY;
-  const secretKey = process.env.LANGFUSE_SECRET_KEY;
+  const tracingEnabled =
+    !!process.env.LANGFUSE_PUBLIC_KEY && !!process.env.LANGFUSE_SECRET_KEY;
 
-  if (!publicKey || !secretKey) {
+  if (!tracingEnabled) {
     console.log(
       "Langfuse credentials not found. Set these environment variables:",
     );
     console.log('  export LANGFUSE_PUBLIC_KEY="pk-..."');
     console.log('  export LANGFUSE_SECRET_KEY="sk-..."');
     console.log(
-      "\nRunning in demo mode (observability will not be sent to Langfuse).\n",
+      "\nRunning without tracing (nothing will be sent to Langfuse).\n",
     );
   }
 
-  // 1. Create NeuroLink with Langfuse observability
-  console.log("1. Creating NeuroLink with Langfuse observability...\n");
+  console.log(
+    "1. Creating NeuroLink (tracing starts from the environment)...\n",
+  );
 
-  const neurolink = new NeuroLink({
-    observability: {
-      langfuse: {
-        enabled: !!publicKey && !!secretKey,
-        publicKey: publicKey || "demo-public-key",
-        secretKey: secretKey || "demo-secret-key",
-        // Optional: custom base URL for self-hosted Langfuse
-        // baseUrl: "https://langfuse.your-company.com",
-      },
-    },
-  });
+  const neurolink = new NeuroLink();
 
   try {
-    // 2. Generate with Langfuse context — traces are tagged automatically
-    console.log("2. Generating with Langfuse context...\n");
+    console.log("2. Generating with per-call context...\n");
 
-    const result = await setLangfuseContext(
-      {
+    const result = await neurolink.generate({
+      input: { text: "What are the benefits of LLM observability?" },
+      maxTokens: 300,
+      context: {
         userId: "user-alice-123",
         sessionId: "session-demo-456",
         conversationId: "conv-789",
         traceName: "observability-example",
+        tags: ["example", "observability"],
         metadata: {
           environment: "development",
           feature: "observability-demo",
           version: "1.0.0",
         },
       },
-      async () => {
-        return await neurolink.generate({
-          input: { text: "What are the benefits of LLM observability?" },
-          maxTokens: 300,
-        });
-      },
-    );
+    });
 
-    if (result) {
-      console.log(`AI: ${result.content}\n`);
-      console.log(`Provider: ${result.provider ?? "default"}`);
-      console.log(`Tokens: ${result.usage?.totalTokens ?? "unknown"}`);
-    }
+    console.log(`AI: ${result.content}\n`);
+    console.log(`Provider: ${result.provider ?? "default"}`);
+    console.log(`Tokens: ${result.usage?.totalTokens ?? "unknown"}`);
 
-    // 3. Multiple calls within the same session context
-    console.log("\n3. Multiple traced calls in the same session...\n");
+    console.log("\n3. Wrapping indirect calls with setLangfuseContext...\n");
 
     await setLangfuseContext(
       {
@@ -111,17 +106,16 @@ async function observabilityLangfuseExample() {
       },
     );
 
-    // 4. Explain what traces look like in Langfuse
     console.log("\n4. What you will see in Langfuse:\n");
     console.log(
       "   - Each generate() call creates a trace in the Langfuse dashboard",
     );
     console.log("   - Traces are grouped by sessionId ('session-demo-456')");
     console.log(
-      "   - Each trace shows: userId, input, output, token usage, latency",
+      "   - Each trace shows: userId, tags, input, output, token usage, latency",
     );
     console.log(
-      "   - Custom metadata (environment, feature) appears on span attributes",
+      "   - Custom metadata (environment, feature) appears on the trace",
     );
     console.log(
       "   - The traceName ('observability-example') is the trace display name",
@@ -130,7 +124,7 @@ async function observabilityLangfuseExample() {
       "   - Cost tracking is automatic based on model and token counts",
     );
 
-    if (publicKey && secretKey) {
+    if (tracingEnabled) {
       console.log("\n   View your traces at: https://cloud.langfuse.com");
     }
   } catch (error) {
@@ -145,14 +139,66 @@ async function observabilityLangfuseExample() {
     }
   }
 
+  await flushOpenTelemetry();
   await neurolink.shutdown();
   console.log("\nDone!");
 }
 
-// Run the example
+async function externalProviderExample() {
+  const provider = new NodeTracerProvider({
+    spanProcessors: [new LangfuseSpanProcessor()],
+  });
+  provider.register();
+
+  const neurolink = new NeuroLink();
+  console.log(
+    `Using external provider: ${getLangfuseHealthStatus().usingExternalProvider}`,
+  );
+
+  const result = await neurolink.generate({
+    input: { text: "Hello from a host-managed tracer provider" },
+    context: { traceName: "external-provider" },
+  });
+  console.log(`AI: ${result.content}`);
+
+  await provider.forceFlush();
+  await neurolink.shutdown();
+}
+
+async function exporterPipelineExample() {
+  const langfuse = new LangfuseExporter({
+    enabled: true,
+    publicKey: process.env.LANGFUSE_PUBLIC_KEY ?? "",
+    secretKey: process.env.LANGFUSE_SECRET_KEY ?? "",
+    baseUrl: process.env.LANGFUSE_BASE_URL,
+  });
+  await langfuse.initialize();
+  const registry = new ExporterRegistry();
+  registry.register(langfuse);
+
+  const provider = new NodeTracerProvider({
+    spanProcessors: [createExporterSpanProcessor(registry)],
+  });
+  provider.register();
+
+  const neurolink = new NeuroLink();
+  const result = await neurolink.generate({
+    input: { text: "Hello through the exporter pipeline" },
+    context: { traceName: "exporter-pipeline" },
+  });
+  console.log(`AI: ${result.content}`);
+
+  await provider.forceFlush();
+  await neurolink.shutdown();
+}
+
 import { fileURLToPath } from "url";
 if (process.argv[1] === fileURLToPath(import.meta.url)) {
   observabilityLangfuseExample().catch(console.error);
 }
 
-export { observabilityLangfuseExample };
+export {
+  exporterPipelineExample,
+  externalProviderExample,
+  observabilityLangfuseExample,
+};

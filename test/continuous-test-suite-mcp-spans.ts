@@ -4,8 +4,8 @@ import "dotenv/config";
 /**
  * Continuous Test Suite — MCP Pipeline B span attributes (Curator P1-5)
  *
- * Issue #5 regression. NeuroLink-emitted spans (`neurolink.tool.execute`,
- * `neurolink.tool.registry.execute`, `neurolink.tools.execute_custom`) must
+ * Issue #5 regression. NeuroLink-emitted spans (`<name>`,
+ * `tool.registry.execute`) must
  * carry one of `mcp.tool.name` / `tool.name` / `gen_ai.tool.name` so per-
  * tool error analysis works in Langfuse.
  *
@@ -86,13 +86,9 @@ async function dumpAllSpans(): Promise<void> {
         return `${s.name}[${tn ? tn.key + "=" + String(tn.value) : "no-name"}]`;
       })
       .join(", ");
-    const exec = spans.byName("neurolink.tool.execute");
+    const exec = spans.byName("calc_dbg");
     if (!exec) {
-      record(
-        testName,
-        "FAIL",
-        `expected neurolink.tool.execute span; got: ${summary}`,
-      );
+      record(testName, "FAIL", `expected calc_dbg span; got: ${summary}`);
       return;
     }
     const execTn = getToolNameAttr(dumpAttrs(exec));
@@ -100,7 +96,7 @@ async function dumpAllSpans(): Promise<void> {
       record(
         testName,
         "FAIL",
-        `neurolink.tool.execute span has no tool-name attribute; spans=${summary}`,
+        `tool.calc_dbg span has no tool-name attribute; spans=${summary}`,
       );
       return;
     }
@@ -134,10 +130,7 @@ async function checkSuccessPath(): Promise<void> {
   try {
     await sdk.executeTool("calc_add", { a: 2, b: 3 });
     await new Promise((r) => setTimeout(r, 100));
-    const targetSpanNames = [
-      "neurolink.tool.execute",
-      "neurolink.tool.registry.execute",
-    ];
+    const targetSpanNames = ["calc_add", "tool.registry.execute"];
     const findings: string[] = [];
     for (const name of targetSpanNames) {
       const span = spans.byName(name);
@@ -179,9 +172,9 @@ async function checkErrorPath(): Promise<void> {
       /* expected */
     }
     await new Promise((r) => setTimeout(r, 100));
-    const span = spans.byName("neurolink.tool.execute");
+    const span = spans.byName("boom");
     if (!span) {
-      record(testName, "FAIL", "neurolink.tool.execute span missing");
+      record(testName, "FAIL", "boom span missing");
       return;
     }
     const attrs = dumpAttrs(span);
@@ -215,9 +208,9 @@ async function checkBogusName(): Promise<void> {
       /* expected */
     }
     await new Promise((r) => setTimeout(r, 100));
-    const span = spans.byName("neurolink.tool.execute");
+    const span = spans.byName("does_not_exist_xyz");
     if (!span) {
-      record(testName, "FAIL", "neurolink.tool.execute span missing");
+      record(testName, "FAIL", "tool.does_not_exist_xyz span missing");
       return;
     }
     const attrs = dumpAttrs(span);

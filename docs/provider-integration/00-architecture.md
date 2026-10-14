@@ -52,7 +52,6 @@ these hooks rather than duplicate the full generation pipeline.
 | `adjustResponseFormat`                    | Structured-output format changes                          |
 | `adjustBodyAfter400`                      | One corrected retry for a recognized bad request          |
 | `getFallbackModels`                       | Alternatives for unavailable model IDs                    |
-| `onStreamStart`                           | Provider-specific streaming lifecycle instrumentation     |
 | `validateConfiguration`                   | Provider configuration/reachability validation            |
 
 Examples: [DeepSeek](02-deepseek.md) downgrades `json_schema` to `json_object`;

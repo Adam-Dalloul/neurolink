@@ -190,7 +190,6 @@ import { NeuroLink, setLangfuseContext } from "@juspay/neurolink";
 const neurolink = new NeuroLink({
   observability: {
     langfuse: {
-      enabled: true,
       publicKey: process.env.LANGFUSE_PUBLIC_KEY,
       secretKey: process.env.LANGFUSE_SECRET_KEY,
     },

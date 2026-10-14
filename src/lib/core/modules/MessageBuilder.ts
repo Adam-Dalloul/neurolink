@@ -93,7 +93,7 @@ export class MessageBuilder {
   async buildMessages(options: TextGenerationOptions): Promise<ModelMessage[]> {
     return withSpan(
       {
-        name: "neurolink.message.build",
+        name: "message.build",
         tracer: tracers.sdk,
         attributes: {
           [ATTR.NL_PROVIDER]: this.providerName,
@@ -269,7 +269,7 @@ export class MessageBuilder {
   ): Promise<ModelMessage[]> {
     return withSpan(
       {
-        name: "neurolink.message.build_for_stream",
+        name: "message.build_for_stream",
         tracer: tracers.sdk,
         attributes: {
           [ATTR.NL_PROVIDER]: this.providerName,

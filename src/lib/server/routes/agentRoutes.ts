@@ -135,7 +135,7 @@ export function createAgentRoutes(basePath: string = "/api"): RouteGroup {
 
           return withSpan(
             {
-              name: "neurolink.http.execute",
+              name: "http.execute",
               tracer: tracers.http,
               attributes: {
                 "http.route": "/api/agent/execute",
@@ -257,7 +257,7 @@ export function createAgentRoutes(basePath: string = "/api"): RouteGroup {
           // Wrap stream with a span that stays open for the full consumption
           // lifetime, not just the generator creation.
           async function* redactedStream(): AsyncIterable<unknown> {
-            const streamSpan = tracers.http.startSpan("neurolink.http.stream", {
+            const streamSpan = tracers.http.startSpan("http.stream", {
               attributes: {
                 "http.route": "/api/agent/stream",
                 "ai.provider": request.provider || "default",
@@ -325,7 +325,7 @@ export function createAgentRoutes(basePath: string = "/api"): RouteGroup {
             const providerName = request.provider || "openai";
             return await withSpan(
               {
-                name: "neurolink.http.embed",
+                name: "http.embed",
                 tracer: tracers.http,
                 attributes: {
                   "http.route": "/api/agent/embed",
@@ -388,7 +388,7 @@ export function createAgentRoutes(basePath: string = "/api"): RouteGroup {
             const providerName = request.provider || "openai";
             return await withSpan(
               {
-                name: "neurolink.http.embedMany",
+                name: "http.embedMany",
                 tracer: tracers.http,
                 attributes: {
                   "http.route": "/api/agent/embed-many",

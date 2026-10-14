@@ -36,21 +36,8 @@ export function guardToolExecutor(
   guards: ToolExecutionGuards,
 ): (args: Record<string, unknown>, opts: unknown) => Promise<unknown> {
   return async (args: Record<string, unknown>, opts: unknown) => {
-    const invoke = () =>
+    const call = () =>
       Promise.resolve(execute(args, opts as Parameters<typeof execute>[1]));
-    // The span wraps the CALL, not the guard: a timeout or an abort is a fact
-    // about this tool invocation and belongs inside its observation.
-    const wrapInSpan = guards.withToolSpan;
-    const toolCallId =
-      typeof opts === "object" &&
-      opts !== null &&
-      "toolCallId" in opts &&
-      typeof opts.toolCallId === "string"
-        ? opts.toolCallId
-        : undefined;
-    const call = wrapInSpan
-      ? () => wrapInSpan(name, invoke, { args, toolCallId })
-      : invoke;
     guards.onProgress?.();
     try {
       const raced = guards.abortSignal

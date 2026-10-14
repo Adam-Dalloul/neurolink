@@ -1,3 +1,6 @@
+import type { JsonValue } from "./common.js";
+import type { SpanAttributes } from "./span.js";
+
 /**
  * Exporter configuration types
  * Following NeuroLink's type conventions
@@ -76,6 +79,11 @@ export type LangfuseExporterConfig = ExporterConfig & {
    * Defaults to false (input/output are exported).
    */
   redactIO?: boolean;
+  /**
+   * Applied to input, output and metadata before they are sent. When it
+   * throws, the value is replaced by `<fully masked>`.
+   */
+  mask?: (params: { data: JsonValue }) => JsonValue;
 };
 
 /**
@@ -256,4 +264,44 @@ export type SamplingRule = {
   sample: boolean;
   /** Optional priority (higher = evaluated first) */
   priority?: number;
+};
+
+/** @description A span attribute value as `SpanData` carries it before OTLP encoding. */
+export type SpanAttributeValue = SpanAttributes[string];
+
+/** @description An OTLP/JSON attribute value. */
+export type OtlpAnyValue =
+  | { boolValue: boolean }
+  | { intValue: string }
+  | { doubleValue: number }
+  | { stringValue: string }
+  | { arrayValue: { values: OtlpAnyValue[] } };
+
+/** @description An OTLP/JSON attribute. */
+export type OtlpKeyValue = { key: string; value: OtlpAnyValue };
+
+/** @description An OTLP/JSON span as Langfuse's ingestion endpoint reads it. */
+export type OtlpSpan = {
+  traceId: string;
+  spanId: string;
+  parentSpanId?: string;
+  name: string;
+  kind: number;
+  startTimeUnixNano: string;
+  endTimeUnixNano: string;
+  attributes: OtlpKeyValue[];
+  events: {
+    name: string;
+    timeUnixNano: string;
+    attributes: OtlpKeyValue[];
+  }[];
+  status: { code: number; message?: string };
+};
+
+/** @description What the Langfuse exporter adds to, masks in and removes from span attributes before sending. */
+export type LangfuseAttributePolicy = Pick<
+  LangfuseExporterConfig,
+  "environment" | "release" | "mask"
+> & {
+  redactIO: boolean;
 };

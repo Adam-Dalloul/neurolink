@@ -46,6 +46,14 @@ can drive perfectly, rejected for members it never touches.
 
 ---
 
+### provider
+
+> **provider**: `string`
+
+Provider name recorded on each step's generation and used to price it.
+
+---
+
 ### maxSteps
 
 > **maxSteps**: `number`

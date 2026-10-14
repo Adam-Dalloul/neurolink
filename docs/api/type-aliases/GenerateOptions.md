@@ -972,7 +972,7 @@ prepareStep: async ({ stepNumber }) => {
 
 ### context?
 
-> `optional` **context?**: [`StandardRecord`](StandardRecord.md)
+> `optional` **context?**: [`StandardRecord`](StandardRecord.md) & [`NeurolinkTraceContext`](NeurolinkTraceContext.md)
 
 ---
 

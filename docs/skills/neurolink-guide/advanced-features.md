@@ -224,7 +224,6 @@ const result = await neurolink.generate({
 const neurolink = new NeuroLink({
   observability: {
     langfuse: {
-      enabled: true,
       publicKey: process.env.LANGFUSE_PUBLIC_KEY,
       secretKey: process.env.LANGFUSE_SECRET_KEY,
       baseUrl: "https://cloud.langfuse.com",
@@ -236,7 +235,7 @@ const neurolink = new NeuroLink({
 ### Context Management
 
 ```typescript
-import { setLangfuseContext, getLangfuseContext } from "@juspay/neurolink";
+import { setLangfuseContext } from "@juspay/neurolink";
 
 const result = await setLangfuseContext(
   {
@@ -258,37 +257,27 @@ const result = await setLangfuseContext(
 
 ### External TracerProvider
 
-For apps with existing OpenTelemetry setup:
+If your app registers its own OpenTelemetry provider, NeuroLink detects it and creates no provider. Recommended: add `createExporterSpanProcessor()` and pass the Langfuse keys to `new NeuroLink({ observability: { langfuse } })`. Alternatively add `new LangfuseSpanProcessor()` with its own keys (NeuroLink's `mask`, chunking and retry do not apply to it) and defaults; no custom `shouldExportSpan` is needed, because every observation span NeuroLink emits carries `gen_ai.observation.type`, which the default filter exports, while infrastructure spans are not exported:
 
 ```typescript
-import { NeuroLink, getSpanProcessors } from "@juspay/neurolink";
 import { NodeSDK } from "@opentelemetry/sdk-node";
+import { LangfuseSpanProcessor } from "@langfuse/otel";
 
-const neurolink = new NeuroLink({
-  observability: {
-    langfuse: {
-      enabled: true,
-      useExternalTracerProvider: true,
-    },
-  },
-});
-
-// Add NeuroLink processors to your OTEL setup
 const sdk = new NodeSDK({
-  spanProcessors: [yourExistingProcessor, ...getSpanProcessors()],
+  spanProcessors: [yourExistingProcessor, new LangfuseSpanProcessor()],
 });
+sdk.start();
 ```
 
 ### Custom Spans
 
 ```typescript
-import { getTracer } from "@juspay/neurolink";
+import { trace } from "@opentelemetry/api";
 
-const tracer = getTracer("my-app");
+const tracer = trace.getTracer("my-app");
 const span = tracer.startSpan("custom-operation");
 
 try {
-  // Your code
   await doSomething();
 } finally {
   span.end();

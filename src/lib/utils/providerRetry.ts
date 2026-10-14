@@ -324,7 +324,7 @@ export async function withProviderRetry<T>(
       const result = await operation();
 
       // Record how many attempts it took on the span
-      span?.setAttribute("gen_ai.provider.total_attempts", attempt + 1);
+      span?.setAttribute("provider.total_attempts", attempt + 1);
 
       if (attempt > 0) {
         logger.info(
@@ -341,9 +341,9 @@ export async function withProviderRetry<T>(
 
       if (!retryable || attempt === MAX_PROVIDER_RETRIES) {
         // Record failure details before re-throwing
-        span?.setAttribute("gen_ai.provider.total_attempts", attempt + 1);
+        span?.setAttribute("provider.total_attempts", attempt + 1);
         if (attempt > 0) {
-          span?.setAttribute("gen_ai.provider.retries_exhausted", true);
+          span?.setAttribute("provider.retries_exhausted", true);
         }
 
         logger.warn(
@@ -361,7 +361,7 @@ export async function withProviderRetry<T>(
 
       const retryAfterMs = getRetryAfterMs(error);
       if (retryAfterMs !== undefined && retryAfterMs > MAX_RETRY_AFTER_MS) {
-        span?.setAttribute("gen_ai.provider.total_attempts", attempt + 1);
+        span?.setAttribute("provider.total_attempts", attempt + 1);
         span?.addEvent("gen_ai.provider.retry_suppressed", {
           "retry.after_ms": retryAfterMs,
           ...(statusCode !== undefined && { "retry.status_code": statusCode }),

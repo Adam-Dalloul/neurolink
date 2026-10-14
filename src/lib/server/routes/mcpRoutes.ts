@@ -478,7 +478,7 @@ export function createMCPRoutes(basePath: string = "/api"): RouteGroup {
         method: "GET",
         path: `${basePath}/mcp/servers`,
         handler: tracedMcpHandler(
-          "neurolink.http.mcp.listServers",
+          "http.mcp.listServers",
           `${basePath}/mcp/servers`,
           handleListServers,
         ),
@@ -489,7 +489,7 @@ export function createMCPRoutes(basePath: string = "/api"): RouteGroup {
         method: "GET",
         path: `${basePath}/mcp/servers/:name`,
         handler: tracedMcpHandler(
-          "neurolink.http.mcp.getServer",
+          "http.mcp.getServer",
           `${basePath}/mcp/servers/:name`,
           handleGetServer,
         ),
@@ -500,7 +500,7 @@ export function createMCPRoutes(basePath: string = "/api"): RouteGroup {
         method: "POST",
         path: `${basePath}/mcp/servers/:name/reconnect`,
         handler: tracedMcpHandler(
-          "neurolink.http.mcp.reconnectServer",
+          "http.mcp.reconnectServer",
           `${basePath}/mcp/servers/:name/reconnect`,
           handleReconnectServer,
         ),
@@ -511,7 +511,7 @@ export function createMCPRoutes(basePath: string = "/api"): RouteGroup {
         method: "DELETE",
         path: `${basePath}/mcp/servers/:name`,
         handler: tracedMcpHandler(
-          "neurolink.http.mcp.removeServer",
+          "http.mcp.removeServer",
           `${basePath}/mcp/servers/:name`,
           handleRemoveServer,
         ),
@@ -522,7 +522,7 @@ export function createMCPRoutes(basePath: string = "/api"): RouteGroup {
         method: "GET",
         path: `${basePath}/mcp/servers/:name/tools`,
         handler: tracedMcpHandler(
-          "neurolink.http.mcp.listServerTools",
+          "http.mcp.listServerTools",
           `${basePath}/mcp/servers/:name/tools`,
           handleListServerTools,
         ),
@@ -533,7 +533,7 @@ export function createMCPRoutes(basePath: string = "/api"): RouteGroup {
         method: "POST",
         path: `${basePath}/mcp/servers/:name/tools/:toolName/execute`,
         handler: tracedMcpHandler(
-          "neurolink.http.mcp.executeTool",
+          "http.mcp.executeTool",
           `${basePath}/mcp/servers/:name/tools/:toolName/execute`,
           handleExecuteTool,
         ),
@@ -544,7 +544,7 @@ export function createMCPRoutes(basePath: string = "/api"): RouteGroup {
         method: "GET",
         path: `${basePath}/mcp/health`,
         handler: tracedMcpHandler(
-          "neurolink.http.mcp.health",
+          "http.mcp.health",
           `${basePath}/mcp/health`,
           handleMCPHealth,
         ),

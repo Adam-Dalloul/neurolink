@@ -133,17 +133,14 @@ export class NeuroLinkWebSocket {
     // Start an OTel span that tracks the lifetime of this connection attempt.
     // Ended in onclose/onerror/disconnect so metrics capture connection
     // duration and error attribution.
-    this.connectionSpan = tracers.http.startSpan(
-      "neurolink.client.ws.connect",
-      {
-        kind: SpanKind.CLIENT,
-        attributes: {
-          "http.url": this.config.baseUrl,
-          "ws.auto_reconnect": this.config.autoReconnect,
-          "ws.reconnect_attempt": this.reconnectAttempts,
-        },
+    this.connectionSpan = tracers.http.startSpan("client.ws.connect", {
+      kind: SpanKind.CLIENT,
+      attributes: {
+        "http.url": this.config.baseUrl,
+        "ws.auto_reconnect": this.config.autoReconnect,
+        "ws.reconnect_attempt": this.reconnectAttempts,
       },
-    );
+    });
 
     // Build WebSocket URL (credentials are sent via headers, not query params,
     // to avoid leaking secrets in server logs, browser history, and HTTP referers)

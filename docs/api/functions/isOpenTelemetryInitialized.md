@@ -8,8 +8,12 @@
 
 > **isOpenTelemetryInitialized**(): `boolean`
 
-Check if OpenTelemetry is initialized
-
 ## Returns
 
 `boolean`
+
+`true` once `ensureTelemetry` has set tracing up.
+
+## Description
+
+Reports whether NeuroLink's tracing is active, either on its own provider or alongside a host provider.

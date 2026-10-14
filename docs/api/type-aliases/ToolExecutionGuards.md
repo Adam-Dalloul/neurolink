@@ -8,6 +8,21 @@
 
 > **ToolExecutionGuards** = `object`
 
+The things a native loop wraps around every tool call that the shared engine
+does not do itself.
+
+NOT Gemini-specific, despite where this started. Both Vertex+Claude loops
+apply these guards directly via `guardToolExecutor`, and the Gemini adapter
+applies them to hydrated tools, so the former `GeminiToolExecutionGuards`
+name described the first caller rather than the contract — and pointed the
+next reader at the wrong provider family.
+
+All optional, and the whole object is optional, because callers differ:
+Vertex bounds tool execution and runs a stall watchdog, AI Studio does
+neither. Passing nothing leaves an executor exactly as the caller supplied
+it, so this cannot quietly give a provider behaviour its hand-rolled loops
+never had.
+
 ## Properties
 
 ### toolTimeoutMs?
@@ -43,50 +58,3 @@ legitimately slow tool reads as a stalled turn without this.
 #### Returns
 
 `void`
-
----
-
-### withToolSpan?
-
-> `optional` **withToolSpan?**: \<`T`\>(`name`, `run`, `call?`) => `Promise`\<`T`\>
-
-Wrap one tool call in the provider's own observability.
-
-A function rather than a pair of start/end callbacks, because the caller
-needs the execution to happen INSIDE its span's context — spans opened by
-the tool itself must nest under the tool call, not dangle as siblings of
-the turn. Handing over the whole invocation is the only shape that lets a
-caller do `context.with(span, run)`.
-
-The caller awaits `run()` itself, so it sees the settled result and can
-mark a FAILURE THAT WAS RETURNED rather than thrown: MCP tools report
-errors in their payload, and an observation that only watches for
-exceptions records those calls as successful.
-
-`call` carries the arguments the model passed and the model's id for the
-call, so the observation can show what was asked and be paired with the
-request that asked it.
-
-#### Type Parameters
-
-##### T
-
-`T`
-
-#### Parameters
-
-##### name
-
-`string`
-
-##### run
-
-() => `Promise`\<`T`\>
-
-##### call?
-
-[`ToolSpanCall`](ToolSpanCall.md)
-
-#### Returns
-
-`Promise`\<`T`\>

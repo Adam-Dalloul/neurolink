@@ -150,7 +150,7 @@ export class ToolDiscoveryService extends EventEmitter {
   ): Promise<ToolDiscoveryResult> {
     return withSpan(
       {
-        name: "neurolink.mcp.discoverTools",
+        name: "mcp.discoverTools",
         tracer: tracers.mcp,
         attributes: { "mcp.server_id": serverId },
       },
@@ -625,22 +625,15 @@ export class ToolDiscoveryService extends EventEmitter {
       const result = await circuitBreaker.execute(
         async (recordResolvedFailure) => {
           return mcpTracer.startActiveSpan(
-            "neurolink.mcp.callTool",
+            "mcp.callTool",
             {
               kind: SpanKind.CLIENT,
               attributes: {
                 "mcp.server_id": serverId,
                 "mcp.tool_name": toolName,
                 "mcp.timeout_ms": effectiveTimeout,
-                // Curator P1-4: Langfuse observations rely on ai.*/gen_ai.*
-                // attributes for tool name and I/O previews. Provide them so
-                // the SPAN observation in Langfuse is legible without
-                // timestamp-joining against the parent ai.toolCall. Redact
-                // parameters via the existing secret-stripping helper so
-                // tokens/credentials/paths don't leave the process.
                 "ai.tool.name": toolName,
-                "gen_ai.tool.name": toolName,
-                "gen_ai.request": safeJsonStringify(
+                "mcp.request": safeJsonStringify(
                   {
                     name: toolName,
                     arguments: redactForPreview(effectiveParameters),
@@ -728,13 +721,8 @@ export class ToolDiscoveryService extends EventEmitter {
                 }
                 // ── end normalization ─────────────────────────────────────────
 
-                // Curator P1-4: build gen_ai.response AFTER normalization so
-                // large payloads use the compact surrogate instead of the raw
-                // result (avoids redundant stringify + memory hit on payloads
-                // that were specifically externalized to Redis). Redact via the
-                // same secret-stripping path used for request parameters.
                 callSpan.setAttribute(
-                  "gen_ai.response",
+                  "mcp.response",
                   safeJsonStringify(redactForPreview(resultForPreview), 2048),
                 );
 

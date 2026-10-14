@@ -39,6 +39,7 @@ import {
   composeAbortSignalsScoped,
   createTimeoutController,
 } from "../../utils/timeout.js";
+import { sanitizeAnthropicMessagesForTrace } from "../../utils/anthropicTraceSanitizer.js";
 import { NeuroLinkError } from "../../utils/errorHandling.js";
 import { ErrorCategory, ErrorSeverity } from "../../constants/enums.js";
 
@@ -137,6 +138,7 @@ async function readAnthropicStep({
   // absence is the only signal that the response ended early, because the
   // content blocks that DID arrive are syntactically complete.
   let sawTerminalEvent = false;
+  let responseModel: string | undefined;
 
   for await (const rawEvent of events) {
     if (stepSignal.aborted) {
@@ -149,6 +151,7 @@ async function readAnthropicStep({
     const event = rawEvent;
 
     if (event.type === "message_start") {
+      responseModel = event.message?.model ?? responseModel;
       const usage = event.message?.usage;
       inputTokens += usage?.input_tokens ?? 0;
       const startOutput = usage?.output_tokens ?? 0;
@@ -408,6 +411,7 @@ async function readAnthropicStep({
       ...(reasoningTokens ? { reasoningTokens } : {}),
     },
     rawStopReason,
+    ...(responseModel ? { model: responseModel } : {}),
     raw: blocks,
   };
 }
@@ -462,7 +466,27 @@ export function createAnthropicLoopAdapter<
       conversation: TMessage[],
       step: number,
     ): Promise<AgenticLoopStepRequest> {
-      return { raw: await config.buildParams(conversation, step) };
+      const params = await config.buildParams(conversation, step);
+      return {
+        raw: params,
+        generation: {
+          provider: config.provider,
+          model: params.model,
+          modelParameters: {
+            temperature: params.temperature,
+            maxTokens: params.max_tokens,
+            topP: params.top_p,
+            thinkingBudget:
+              params.thinking?.type === "enabled"
+                ? params.thinking.budget_tokens
+                : undefined,
+          },
+          input: {
+            system: params.system,
+            messages: sanitizeAnthropicMessagesForTrace(params.messages),
+          },
+        },
+      };
     },
 
     async executeStep(

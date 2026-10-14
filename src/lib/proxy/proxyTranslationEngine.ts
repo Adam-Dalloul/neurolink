@@ -470,7 +470,6 @@ function createTranslationRequest(args: {
         inputIncludesCachedTokens: e.inputIncludesCachedTokens,
         reasoningTokens: e.reasoningTokens,
       });
-      tracer?.recordMetrics();
     }
     const ownsClientOutcome =
       getProxyRequestAccounting(ctx.requestId)?.accountingScope !== "internal";

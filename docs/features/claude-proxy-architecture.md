@@ -281,7 +281,7 @@ In both passthrough and translation paths, the proxy optionally pipes the SSE st
 - **Usage attributes**: Token counts, model, provider, cost estimate, rate-limit headers.
 - **Correlation**: Writes `traceId` and `spanId` into the request log entry for cross-signal correlation.
 
-The tracer emits metrics via `TelemetryService`: request counters, retry counters, latency histograms, request/response body sizes, estimated cost, cache token counters, and model-substitution counters when the translated response model differs from the requested one.
+The tracer emits OpenTelemetry metrics: request counters, retry counters, latency histograms, request/response body sizes, estimated cost, cache token counters, and model-substitution counters when the translated response model differs from the requested one.
 
 ### Translation streaming (Claude-to-Other)
 

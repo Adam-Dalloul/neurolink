@@ -11,8 +11,6 @@ import type {
   ToolRoutingConfig,
 } from "../types/index.js";
 
-import { buildObservabilityConfigFromEnv } from "../utils/observabilityHelpers.js";
-
 /**
  * Build mcp.outputLimits config from environment variables.
  * Reads NEUROLINK_MCP_OUTPUT_STRATEGY and NEUROLINK_MCP_MAX_OUTPUT_BYTES.
@@ -77,12 +75,6 @@ export class GlobalSessionManager {
         maxSessions: config.maxSessions,
         maxTurnsPerSession: config.maxTurnsPerSession,
       };
-    }
-
-    // Add observability config from environment variables (CLI usage)
-    const observabilityConfig = buildObservabilityConfigFromEnv();
-    if (observabilityConfig) {
-      neurolinkOptions.observability = observabilityConfig;
     }
 
     // Add MCP output limits from environment variables (CLI usage)
@@ -240,14 +232,9 @@ export class GlobalSessionManager {
       return session.neurolinkInstance;
     }
 
-    // Create new NeuroLink with observability config from environment (CLI usage)
-    const observabilityConfig = buildObservabilityConfigFromEnv();
     const mcpOutputLimits = buildMcpOutputLimitsFromEnv();
 
     const options: NeurolinkConstructorConfig = {};
-    if (observabilityConfig) {
-      options.observability = observabilityConfig;
-    }
     if (mcpOutputLimits) {
       options.mcp = { outputLimits: mcpOutputLimits };
     }

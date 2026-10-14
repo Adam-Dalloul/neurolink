@@ -14,11 +14,15 @@
  * the same across Anthropic, the OpenAI-compatible family and SageMaker.
  */
 
+import { observeGeneration } from "../telemetry/observation.js";
+import { StepSpans, withGeneration } from "../telemetry/withSpan.js";
 import { logger } from "../utils/logger.js";
 import type {
   FinishReason,
+  GenerationRecord,
   NativeGenerateLoopArgs,
   NativeGenerateLoopResult,
+  SpanContent,
   StepResult,
   StepToolChoiceInput,
   Tool,
@@ -505,9 +509,104 @@ export const appendJsonSchemaInstruction = (
   );
 };
 
+function describeV3Response(
+  res: Awaited<ReturnType<NativeGenerateLoopArgs["doGenerate"]>>,
+): GenerationRecord {
+  const parts = asParts(res.content);
+  const usage = res.usage as
+    | {
+        inputTokens?: {
+          total?: number;
+          noCache?: number;
+          cacheRead?: number;
+          cacheWrite?: number;
+        };
+        outputTokens?: { total?: number; reasoning?: number };
+      }
+    | undefined;
+  const finish = res.finishReason;
+  const response = res.response as { modelId?: string } | undefined;
+  const toolCalls = parts
+    .filter((p) => p.type === "tool-call")
+    .map((p) => ({
+      id: p.toolCallId as string,
+      name: p.toolName as string,
+      args: p.input as SpanContent,
+    }));
+  const reasoning = parts
+    .filter((p) => p.type === "reasoning" && typeof p.text === "string")
+    .map((p) => p.text as string)
+    .join("");
+  return {
+    responseModel:
+      typeof response?.modelId === "string" ? response.modelId : undefined,
+    output: {
+      text: parts
+        .filter((p) => p.type === "text" && typeof p.text === "string")
+        .map((p) => p.text as string)
+        .join(""),
+      ...(reasoning ? { reasoning } : {}),
+      ...(toolCalls.length > 0 ? { toolCalls } : {}),
+    },
+    usage: usage
+      ? {
+          inputTokens: usage.inputTokens?.noCache ?? usage.inputTokens?.total,
+          outputTokens: usage.outputTokens?.total,
+          cacheReadTokens: usage.inputTokens?.cacheRead,
+          cacheCreationTokens: usage.inputTokens?.cacheWrite,
+          reasoningTokens: usage.outputTokens?.reasoning,
+        }
+      : undefined,
+    finishReason:
+      typeof finish === "string"
+        ? finish
+        : (finish as { unified?: string } | undefined)?.unified,
+  };
+}
+
+function generateObservedStep(
+  args: NativeGenerateLoopArgs,
+  request: Parameters<NativeGenerateLoopArgs["doGenerate"]>[0],
+): ReturnType<NativeGenerateLoopArgs["doGenerate"]> {
+  return withGeneration(
+    {
+      provider: args.provider,
+      model: args.modelId,
+      modelParameters: {
+        temperature: args.temperature,
+        maxTokens: args.maxOutputTokens,
+      },
+      input: { messages: args.conversation },
+    },
+    async (span) => {
+      const res = await args.runStep(() => args.doGenerate(request));
+      observeGeneration(span, {
+        provider: args.provider,
+        model: args.modelId,
+        ...describeV3Response(res),
+        aborted: args.abortSignal?.aborted,
+      });
+      return res;
+    },
+  );
+}
+
 export async function runNativeGenerateLoop(
   args: NativeGenerateLoopArgs,
   toolExecutionSummaries: ToolExecutionSummaryInternal[],
+): Promise<NativeGenerateLoopResult> {
+  const stepSpans = new StepSpans();
+  try {
+    return await runGenerateSteps(args, toolExecutionSummaries, stepSpans);
+  } finally {
+    stepSpans.end();
+  }
+}
+
+async function runGenerateSteps(
+  args: NativeGenerateLoopArgs,
+  toolExecutionSummaries: ToolExecutionSummaryInternal[],
+  stepSpans: StepSpans,
 ): Promise<NativeGenerateLoopResult> {
   const toolsUsed: string[] = [];
   let text = "";
@@ -538,6 +637,7 @@ export async function runNativeGenerateLoop(
 
   for (let step = 0; step < args.maxSteps; step++) {
     steps = step + 1;
+    stepSpans.begin(steps);
     // The forced-choice window and the caller's hook are resolved BEFORE the
     // re-ask override below: the re-ask has to win, since its whole point is
     // a request with tools disabled.
@@ -573,40 +673,36 @@ export async function runNativeGenerateLoop(
       args.conversation.splice(0, args.conversation.length, ...guarded);
     }
     const runThisStep = () =>
-      args.runStep(() =>
-        args.doGenerate({
-          prompt: args.conversation,
-          ...(args.tools && args.tools.length > 0 ? { tools: args.tools } : {}),
-          // The v3 call option is an OBJECT — `{ type: "none" }`. Passing the
-          // bare string "none" type-checks against `unknown` and is then
-          // dropped by every converter that switches on `choice.type`, so the
-          // re-ask silently went out unchanged. Caught by the stand-in asserting
-          // the wire body, not by any live provider. The same applied to the
-          // caller's own string-form choice, hence `toV3ToolChoice` above.
-          ...(reasked
-            ? { toolChoice: { type: "none" } }
-            : wireToolChoice !== undefined
-              ? { toolChoice: wireToolChoice }
-              : {}),
-          ...(args.responseFormat
-            ? { responseFormat: args.responseFormat }
+      generateObservedStep(args, {
+        prompt: args.conversation,
+        ...(args.tools && args.tools.length > 0 ? { tools: args.tools } : {}),
+        // The v3 call option is an OBJECT — `{ type: "none" }`. Passing the
+        // bare string "none" type-checks against `unknown` and is then
+        // dropped by every converter that switches on `choice.type`, so the
+        // re-ask silently went out unchanged. Caught by the stand-in asserting
+        // the wire body, not by any live provider. The same applied to the
+        // caller's own string-form choice, hence `toV3ToolChoice` above.
+        ...(reasked
+          ? { toolChoice: { type: "none" } }
+          : wireToolChoice !== undefined
+            ? { toolChoice: wireToolChoice }
             : {}),
-          ...(args.providerOptions
-            ? { providerOptions: args.providerOptions }
-            : {}),
-          ...(args.maxOutputTokens
-            ? { maxOutputTokens: args.maxOutputTokens }
-            : {}),
-          ...(args.temperature !== undefined
-            ? { temperature: args.temperature }
-            : {}),
-          ...(args.abortSignal ? { abortSignal: args.abortSignal } : {}),
-        }),
-      );
+        ...(args.responseFormat ? { responseFormat: args.responseFormat } : {}),
+        ...(args.providerOptions
+          ? { providerOptions: args.providerOptions }
+          : {}),
+        ...(args.maxOutputTokens
+          ? { maxOutputTokens: args.maxOutputTokens }
+          : {}),
+        ...(args.temperature !== undefined
+          ? { temperature: args.temperature }
+          : {}),
+        ...(args.abortSignal ? { abortSignal: args.abortSignal } : {}),
+      });
 
     let res: Awaited<ReturnType<typeof args.doGenerate>>;
     try {
-      res = await runThisStep();
+      res = await stepSpans.run(runThisStep);
     } catch (stepError) {
       // Ported from GenerationHandler.recoverEmptyToolCallsFinish's catch: a
       // failed re-ask hands back the turn that already succeeded rather than
@@ -805,11 +901,13 @@ export async function runNativeGenerateLoop(
               ? { toolTimeoutMs: args.toolTimeoutMs }
               : {}),
           });
-          output = await guarded(input as Record<string, unknown>, {
-            toolCallId: id,
-            messages: [],
-            ...(args.abortSignal ? { abortSignal: args.abortSignal } : {}),
-          });
+          output = await stepSpans.run(() =>
+            guarded(input as Record<string, unknown>, {
+              toolCallId: id,
+              messages: [],
+              ...(args.abortSignal ? { abortSignal: args.abortSignal } : {}),
+            }),
+          );
           toolsUsed.push(name);
         } catch (err) {
           failure = err instanceof Error ? err.message : String(err);

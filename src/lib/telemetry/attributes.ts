@@ -1,10 +1,26 @@
+import {
+  MIN_STRING_BUDGET_CHARS,
+  REDACTED_VALUE,
+  TRUNCATION_NOTE_ALLOWANCE_CHARS,
+} from "../constants/telemetry.js";
 import type { SpanModelRequest } from "../types/index.js";
+import { messageRole } from "./chatMessages.js";
+import {
+  binaryPlaceholder,
+  declaredMimeType,
+  describeDataUrls,
+  isBinaryKey,
+  redactSecretAssignments,
+  redactSensitiveEntry,
+} from "./spanSanitizer.js";
+import { capStrings, stringify } from "./spanSerialization.js";
 
 export const ATTR = {
   // GenAI standard (OpenTelemetry semantic conventions)
   GEN_AI_SYSTEM: "gen_ai.system",
   GEN_AI_MODEL: "gen_ai.request.model",
   GEN_AI_OPERATION: "gen_ai.operation.name",
+  GEN_AI_OBSERVATION: "gen_ai.observation.type",
   GEN_AI_INPUT_TOKENS: "gen_ai.usage.input_tokens",
   GEN_AI_OUTPUT_TOKENS: "gen_ai.usage.output_tokens",
   GEN_AI_FINISH_REASON: "gen_ai.response.finish_reason",
@@ -12,22 +28,20 @@ export const ATTR = {
   GEN_AI_TOOL_NAME: "gen_ai.tool.name",
   GEN_AI_TEMPERATURE: "gen_ai.request.temperature",
   GEN_AI_MAX_TOKENS: "gen_ai.request.max_tokens",
-  // NeuroLink custom
-  NL_PROVIDER: "neurolink.provider",
-  NL_MODEL: "neurolink.model",
-  NL_STREAM_MODE: "neurolink.stream_mode",
-  NL_TOOL_COUNT: "neurolink.tool_count",
-  NL_MESSAGE_COUNT: "neurolink.message_count",
-  NL_HAS_TOOLS: "neurolink.has_tools",
-  NL_INPUT_LENGTH: "neurolink.input_length",
-  NL_OUTPUT_LENGTH: "neurolink.output_length",
-  NL_REQUEST_ID: "neurolink.request_id",
-  NL_PATH: "neurolink.path",
-  NL_HAS_MEMORY: "neurolink.has_conversation_memory",
-  NL_COST: "neurolink.cost",
-  NL_STRUCTURED_OUTPUT: "neurolink.structured_output",
-  NL_HAS_FALLBACK: "neurolink.has_fallback",
-  // MCP
+  NL_PROVIDER: "sdk.provider",
+  NL_MODEL: "sdk.model",
+  NL_STREAM_MODE: "stream_mode",
+  NL_TOOL_COUNT: "tool_count",
+  NL_MESSAGE_COUNT: "message_count",
+  NL_HAS_TOOLS: "has_tools",
+  NL_INPUT_LENGTH: "input_length",
+  NL_OUTPUT_LENGTH: "output_length",
+  NL_REQUEST_ID: "request_id",
+  NL_PATH: "path",
+  NL_HAS_MEMORY: "has_conversation_memory",
+  NL_COST: "cost",
+  NL_STRUCTURED_OUTPUT: "structured_output",
+  NL_HAS_FALLBACK: "has_fallback",
   MCP_SERVER_ID: "mcp.server_id",
   MCP_TOOL_NAME: "mcp.tool_name",
   MCP_TIMEOUT_MS: "mcp.timeout_ms",
@@ -117,32 +131,6 @@ export const ATTR = {
   AR_ERROR_CODE: "autoresearch.error_code",
 } as const;
 
-/**
- * Langfuse observation/trace attribute names recognised by `@langfuse/otel`'s
- * LangfuseSpanProcessor (already registered on the global TracerProvider). They
- * let native (non-AI-SDK) provider paths emit spans that render as proper
- * generation / tool observations — the same data the Vercel AI SDK's
- * `experimental_telemetry` produced before providers moved to native SDKs.
- */
-export const LANGFUSE_ATTR = {
-  TRACE_NAME: "langfuse.trace.name",
-  TRACE_INPUT: "langfuse.trace.input",
-  TRACE_OUTPUT: "langfuse.trace.output",
-  TRACE_TAGS: "langfuse.trace.tags",
-  TRACE_METADATA: "langfuse.trace.metadata",
-  OBSERVATION_TYPE: "langfuse.observation.type",
-  OBSERVATION_INPUT: "langfuse.observation.input",
-  OBSERVATION_OUTPUT: "langfuse.observation.output",
-  OBSERVATION_METADATA: "langfuse.observation.metadata",
-  OBSERVATION_MODEL_NAME: "langfuse.observation.model.name",
-  OBSERVATION_MODEL_PARAMETERS: "langfuse.observation.model.parameters",
-  OBSERVATION_USAGE_DETAILS: "langfuse.observation.usage_details",
-  OBSERVATION_LEVEL: "langfuse.observation.level",
-  OBSERVATION_STATUS_MESSAGE: "langfuse.observation.status_message",
-  OBSERVATION_COMPLETION_START_TIME:
-    "langfuse.observation.completion_start_time",
-} as const;
-
 /** Default ceiling for serialized span attribute values. */
 export const SPAN_ATTRIBUTE_MAX_CHARS = 40_000;
 /** Smallest ceiling accepted, so the system and question openings still fit. */
@@ -167,19 +155,15 @@ export function spanAttributeMaxChars(): number {
 const SYSTEM_PROMPT_FLOOR_CHARS = 2_000;
 /** Room the current question always gets in a model-request attribute. */
 const QUESTION_FLOOR_CHARS = 4_000;
-/** Room for the "...[truncated N chars]" note, kept outside that opening. */
-const TRUNCATION_NOTE_ALLOWANCE_CHARS = 48;
-const MIN_SHRINKABLE_STRING_CHARS = 64;
 
-const REDACTED_VALUE = "[REDACTED]";
 const REDACTION_FAILED_VALUE = "[content omitted: redaction failed]";
 const SENSITIVE_KEY_PATTERN =
-  /(authorization|password|passwd|secret|apikey|privatekey|token|credential|signature)/;
+  /(authorization|password|passwd|secret|apikey|privatekey|tokens?$|credential|signature)/;
 const COOKIE_KEY_PATTERN = /^(set)?cookies?$/;
 // Cheap pre-check: text without any of these is returned untouched, so the
 // common case costs one regex scan and stays byte-identical.
 const SENSITIVE_HINT_PATTERN =
-  /authorization|password|passwd|secret|api[_-]?key|private[_-]?key|token|credential|signature|cookie|bearer/i;
+  /authorization|password|passwd|secret|api[_-]?key|private[_-]?key|token|credential|signature|cookie|bearer|sk-|gh[pousr]_|github_pat_|AKIA|xox[baprs]-/i;
 
 function isSensitiveKey(key: string): boolean {
   const normalized = key.replace(/[_-]/g, "").toLowerCase();
@@ -210,17 +194,13 @@ function redactText(text: string): string {
   if (!SENSITIVE_HINT_PATTERN.test(text)) {
     return text;
   }
-  let redacted = text
-    .replace(/\bBearer\s+[\w.\-+/=]{16,}/gi, `Bearer ${REDACTED_VALUE}`)
-    .replace(
-      /\b(access_token|refresh_token|id_token|api_key|apikey|client_secret|password|signature|credential)=([^&\s"]+)/gi,
-      `$1=${REDACTED_VALUE}`,
-    )
-    .replace(
-      /"([^"\\]{1,80})"(\s*:\s*)"(?:[^"\\]|\\.)*"/g,
-      (match, key: string, separator: string) =>
-        isSensitiveKey(key) ? `"${key}"${separator}"${REDACTED_VALUE}"` : match,
-    );
+  let redacted = redactSecretAssignments(
+    text.replace(/\bBearer\s+[\w.\-+/=]{16,}/gi, `Bearer ${REDACTED_VALUE}`),
+  ).replace(
+    /"([^"\\]{1,80})"(\s*:\s*)"(?:[^"\\]|\\.)*"/g,
+    (match, key: string, separator: string) =>
+      isSensitiveKey(key) ? `"${key}"${separator}"${REDACTED_VALUE}"` : match,
+  );
   ESCAPED_QUOTE_BACKSLASHES.forEach((backslashes, index) => {
     const quote = `${"\\".repeat(backslashes)}"`;
     redacted = redacted.replace(
@@ -236,13 +216,16 @@ function redactText(text: string): string {
 
 function redactNode(value: unknown, ancestors: WeakSet<object>): unknown {
   if (typeof value === "string") {
-    return redactText(value);
+    return redactText(describeDataUrls(value));
   }
   if (value === null || typeof value !== "object") {
     return value;
   }
   if (ancestors.has(value)) {
     return "[circular]";
+  }
+  if (value instanceof ArrayBuffer || ArrayBuffer.isView(value)) {
+    return binaryPlaceholder(value, undefined);
   }
   ancestors.add(value);
   try {
@@ -254,15 +237,20 @@ function redactNode(value: unknown, ancestors: WeakSet<object>): unknown {
     }
     // No prototype, so a key named __proto__ is data rather than an assignment.
     const redacted: Record<string, unknown> = Object.create(null);
+    const mimeType = declaredMimeType(value);
     for (const [key, entry] of Object.entries(value)) {
-      // Counts and flags under a sensitive-looking name (input_tokens: 5) are
-      // not credentials; only text and structures are masked.
-      redacted[key] =
+      if (
         isSensitiveKey(key) &&
         (typeof entry === "string" ||
           (typeof entry === "object" && entry !== null))
-          ? REDACTED_VALUE
-          : redactNode(entry, ancestors);
+      ) {
+        redacted[key] = redactSensitiveEntry(key, entry);
+        continue;
+      }
+      const placeholder = isBinaryKey(key)
+        ? binaryPlaceholder(entry, mimeType)
+        : undefined;
+      redacted[key] = placeholder ?? redactNode(entry, ancestors);
     }
     return redacted;
   } finally {
@@ -271,12 +259,10 @@ function redactNode(value: unknown, ancestors: WeakSet<object>): unknown {
 }
 
 /**
- * Returns a copy of `value` with credentials masked: values under keys such as
- * `access_token`, `password`, `authorization` or `set-cookie`, bearer tokens
- * and `name=value` credentials inside text. Content with nothing sensitive in
- * it serializes exactly as it did before. Throws only if the value cannot be
- * walked; callers on the tracing path use `spanContentAttribute`, which turns
- * that into an omitted value instead of a leak or a failed turn.
+ * @description Returns a copy of a value with credentials masked: values under keys such as `access_token`, `password`, `authorization` or `set-cookie`, bearer tokens, and `name=value` credentials inside text. Purely numeric values after a credential-looking name (e.g. `max_tokens: 4096`) are left alone.
+ * @param value {JsonValue | object} - Content to redact; objects and arrays are walked recursively.
+ * @returns {JsonValue | object} A redacted copy, serializing exactly as the input when nothing in it is sensitive.
+ * @throws {Error} When the value cannot be walked; tracing callers use `spanContentAttribute`, which turns that into an omitted value.
  */
 export function redactSpanContent(value: unknown): unknown {
   return redactNode(value, new WeakSet<object>());
@@ -290,62 +276,15 @@ function redactSafely(value: unknown): unknown {
   }
 }
 
-const MAX_SHRINK_ATTEMPTS = 200;
-
-/**
- * Cuts the longest string inside `root` down by at least `excess` characters,
- * in place, and says whether it found one worth cutting. Only ever called on
- * the copy `redactSpanContent` made, never on the caller's own data.
- */
-function shrinkLongestString(root: object, excess: number): boolean {
-  let owner: object | undefined;
-  let ownerKey = "";
-  let longestText = "";
-  const visited = new Set<object>();
-  const pending: object[] = [root];
-  while (pending.length > 0) {
-    const node = pending.pop();
-    if (node === undefined || visited.has(node)) {
-      continue;
-    }
-    visited.add(node);
-    for (const [key, entry] of Object.entries(node)) {
-      if (typeof entry === "string") {
-        if (
-          entry.length > longestText.length &&
-          entry.length > MIN_SHRINKABLE_STRING_CHARS
-        ) {
-          longestText = entry;
-          owner = node;
-          ownerKey = key;
-        }
-      } else if (entry !== null && typeof entry === "object") {
-        pending.push(entry);
-      }
-    }
-  }
-  if (owner === undefined) {
-    return false;
-  }
-  const keep = Math.max(
-    MIN_SHRINKABLE_STRING_CHARS / 2,
-    longestText.length - excess - TRUNCATION_NOTE_ALLOWANCE_CHARS,
-  );
-  Reflect.set(
-    owner,
-    ownerKey,
-    `${longestText.slice(0, keep)}...[truncated ${longestText.length - keep} chars]`,
-  );
-  return true;
-}
-
 /**
  * `spanJsonAttribute` for content a person or model wrote or a tool returned
  * (arguments, results, answers), with credentials masked first. Use the plain
  * form for metadata such as usage counts and server ids.
  *
- * A structured value over the cap is shortened by trimming its longest
- * strings, so the attribute stays valid JSON instead of ending mid-token.
+ * A structured value over the cap is shortened by cutting every string to a
+ * per-string budget in one walk, tightening the budget only if the result
+ * still does not fit, so the attribute stays valid JSON instead of ending
+ * mid-token.
  */
 export function spanContentAttribute(
   value: unknown,
@@ -355,21 +294,11 @@ export function spanContentAttribute(
   if (redacted === null || typeof redacted !== "object") {
     return spanJsonAttribute(redacted, maxChars);
   }
-  let serialized: string;
-  try {
-    serialized = JSON.stringify(redacted) ?? String(redacted);
-  } catch {
-    return spanJsonAttribute(redacted, maxChars);
-  }
-  for (
-    let attempt = 0;
-    serialized.length > maxChars && attempt < MAX_SHRINK_ATTEMPTS;
-    attempt++
-  ) {
-    if (!shrinkLongestString(redacted, serialized.length - maxChars)) {
-      break;
-    }
-    serialized = JSON.stringify(redacted);
+  let serialized = stringify(redacted);
+  let budget = Math.floor(maxChars / 4);
+  while (serialized.length > maxChars && budget >= MIN_STRING_BUDGET_CHARS) {
+    serialized = stringify(capStrings(redacted, budget));
+    budget = Math.floor(budget / 4);
   }
   return spanJsonAttribute(serialized, maxChars);
 }
@@ -384,15 +313,7 @@ export function spanJsonAttribute(
   value: unknown,
   maxChars: number = spanAttributeMaxChars(),
 ): string {
-  let serialized: string;
-  try {
-    serialized =
-      typeof value === "string"
-        ? value
-        : (JSON.stringify(value) ?? String(value));
-  } catch {
-    serialized = String(value);
-  }
+  const serialized = stringify(value);
   if (serialized.length > maxChars) {
     const truncationSuffix = `...[truncated ${serialized.length - maxChars} chars]`;
     const keepLength = Math.max(0, maxChars - truncationSuffix.length);
@@ -499,20 +420,9 @@ export function spanModelRequestAttribute(
         }
       : {}),
     ...(rawRequest.prompt !== undefined
-      ? { prompt: redactText(rawRequest.prompt) }
+      ? { prompt: redactText(describeDataUrls(rawRequest.prompt)) }
       : {}),
   };
-  const serialize = (value: unknown): string => {
-    try {
-      return typeof value === "string"
-        ? value
-        : (JSON.stringify(value) ?? String(value));
-    } catch {
-      return String(value);
-    }
-  };
-  // Sizes are measured as JSON, which is what the attribute carries: escaping
-  // makes a JSON string longer than its text.
   const jsonLength = (value: unknown): number => {
     try {
       return (JSON.stringify(value) ?? "null").length;
@@ -564,26 +474,25 @@ export function spanModelRequestAttribute(
     }
     let copy: unknown;
     try {
-      copy = JSON.parse(serialize(message));
+      copy = JSON.parse(stringify(message));
     } catch {
       copy = undefined;
     }
     if (copy !== null && typeof copy === "object") {
       for (
-        let attempt = 0;
-        jsonLength(copy) > budget && attempt < MAX_SHRINK_ATTEMPTS;
-        attempt++
+        let stringBudget = Math.floor(budget / 4);
+        jsonLength(copy) > budget && stringBudget >= MIN_STRING_BUDGET_CHARS;
+        stringBudget = Math.floor(stringBudget / 4)
       ) {
-        if (!shrinkLongestString(copy, jsonLength(copy) - budget)) {
-          break;
-        }
+        capStrings(copy, stringBudget);
       }
       if (jsonLength(copy) <= budget) {
         return copy;
       }
     }
     return {
-      truncatedMessage: fitText(serialize(message), Math.max(0, budget - 32)),
+      role: messageRole(message),
+      content: fitText(stringify(message), Math.max(0, budget - 32)),
     };
   };
 
@@ -617,8 +526,8 @@ export function spanModelRequestAttribute(
     }
     turnComplete = false;
     if (turn.length === 0 && remaining > 64) {
-      const excerpt = fitText(serialize(messages[index]), remaining - 32);
-      turn.unshift({ truncatedMessage: excerpt });
+      const excerpt = fitText(stringify(messages[index]), remaining - 32);
+      turn.unshift({ role: messageRole(messages[index]), content: excerpt });
       remaining -= jsonLength(excerpt) + 32;
     }
     break;
@@ -647,25 +556,30 @@ export function spanModelRequestAttribute(
   const omittedMessages = messages.length - kept.length;
   remaining += systemFloor;
 
-  const body: Record<string, unknown> = {};
+  const leading: object[] = [];
   if (request.system !== undefined) {
-    body.system =
-      jsonLength(request.system) <= remaining
-        ? request.system
-        : fitText(serialize(request.system), Math.max(0, remaining));
-  }
-  if (request.messages !== undefined) {
-    body.messages = kept;
+    leading.push({
+      role: "system",
+      content:
+        jsonLength(request.system) <= remaining
+          ? request.system
+          : fitText(stringify(request.system), Math.max(0, remaining)),
+    });
   }
   if (omittedMessages > 0) {
-    body.omittedMessages = omittedMessages;
+    leading.push({
+      role: "system",
+      content: `[${omittedMessages} earlier messages omitted]`,
+    });
   }
-  if (prompt !== undefined) {
-    body.prompt = prompt;
-  }
+  const conversation = [
+    ...leading,
+    ...kept,
+    ...(prompt !== undefined ? [{ role: "user", content: prompt }] : []),
+  ];
   try {
-    return JSON.stringify(body);
+    return JSON.stringify(conversation);
   } catch {
-    return spanJsonAttribute(body, maxChars);
+    return spanJsonAttribute(conversation, maxChars);
   }
 }

@@ -1,8 +1,8 @@
-import { trace } from "@opentelemetry/api";
+import { scrubbedTracer } from "../../telemetry/tracers.js";
 
 export const MAX_IMAGE_DOWNLOAD_BYTES = 10 * 1024 * 1024;
 
-export const streamTracer = trace.getTracer("neurolink.provider.vertex");
+export const streamTracer = scrubbedTracer("provider.vertex");
 
 export let cachedCredentialsPath: string | null = null;
 

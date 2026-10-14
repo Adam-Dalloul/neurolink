@@ -126,7 +126,7 @@ export function createMemoryRetrievalTools(
       execute: async (args) =>
         withSpan(
           {
-            name: "neurolink.memory.retrieve_context",
+            name: "memory.retrieve_context",
             tracer: tracers.memory,
             attributes: {
               "memory.operation": args.artifactId

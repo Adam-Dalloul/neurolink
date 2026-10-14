@@ -319,7 +319,7 @@ async function runTranscription(
 ): Promise<TranscribeResult> {
   return withSpan(
     {
-      name: "neurolink.http.transcribe",
+      name: "http.transcribe",
       tracer: tracers.http,
       attributes: {
         "http.route": route,

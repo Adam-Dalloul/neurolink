@@ -28,7 +28,7 @@
 
 Span the per-step provider retry annotates, via
 `withProviderRetry(..., span, ...)` — it records
-`gen_ai.provider.total_attempts` on every completed step, retried or not.
+`provider.total_attempts` on every completed step, retried or not.
 
 Caller-supplied rather than read from the ambient context inside the
 engine. Reading it here would hand the attribute to every provider on the

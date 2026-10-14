@@ -1,8 +1,10 @@
+import { context, SpanKind, SpanStatusCode, trace } from "@opentelemetry/api";
 import type { AIProviderName } from "../constants/enums.js";
 import { BaseProvider } from "../core/baseProvider.js";
 import { createStreamChannel } from "../core/streamChannel.js";
 import type { NeuroLink } from "../neurolink.js";
 import type {
+  GenerationRecord,
   EnhancedGenerateResult,
   TextGenerationOptions,
   Tool,
@@ -29,7 +31,8 @@ import {
   hasNativeDoGenerate,
   runNativeGenerateLoop,
 } from "../core/nativeGenerateLoop.js";
-import { withSpan } from "../telemetry/withSpan.js";
+import { generationName } from "../telemetry/observationNames.js";
+import { observeGeneration } from "../telemetry/observation.js";
 import { tracers } from "../telemetry/tracers.js";
 // SageMaker-specific imports
 import {
@@ -314,6 +317,7 @@ export class AmazonSageMakerProvider extends BaseProvider {
     const loop = await runNativeGenerateLoop(
       {
         doGenerate,
+        provider: this.providerName,
         conversation,
         ...(responseFormat ? { responseFormat } : {}),
         ...(v3Tools.length > 0 ? { tools: v3Tools } : {}),
@@ -401,117 +405,153 @@ export class AmazonSageMakerProvider extends BaseProvider {
     usage: Promise<{ inputTokens: number; outputTokens: number }>;
     warnings?: string[];
   }> {
-    return withSpan(
-      {
-        name: "neurolink.provider.sagemaker.stream",
-        tracer: tracers.stream,
-        attributes: {
-          "provider.name": "sagemaker",
-          "model.name": this.modelName,
-          "sagemaker.endpoint": this.modelConfig.endpointName,
-          "sagemaker.region": this.sagemakerConfig.region,
-        },
+    const span = tracers.generation.startSpan(generationName("stream"), {
+      kind: SpanKind.CLIENT,
+      attributes: {
+        "sagemaker.endpoint": this.modelConfig.endpointName,
+        "sagemaker.region": this.sagemakerConfig.region,
       },
-      async () => {
-        try {
-          const messages = await this.buildMessagesForStream(options);
-          const result = await this.sagemakerModel.doStream({
+    });
+    const call: GenerationRecord = {
+      provider: this.providerName,
+      model: this.modelName,
+    };
+    try {
+      const messages = await this.buildMessagesForStream(options);
+      observeGeneration(span, {
+        ...call,
+        modelParameters: {
+          temperature: options.temperature,
+          maxTokens: options.maxTokens,
+        },
+        input: { messages },
+      });
+      const result = await context.with(
+        trace.setSpan(context.active(), span),
+        () =>
+          this.sagemakerModel.doStream({
             prompt: messages,
             maxTokens: options.maxTokens,
             temperature: options.temperature,
-          });
+          }),
+      );
 
-          // Settled from the `finish` part below. A turn that ends without one
-          // — a truncated or errored stream — still settles, so a caller
-          // awaiting either promise cannot hang.
-          let settleFinishReason!: (reason: string) => void;
-          let settleUsage!: (usage: {
-            inputTokens: number;
-            outputTokens: number;
-          }) => void;
-          const finishReason = new Promise<string>((resolve) => {
-            settleFinishReason = resolve;
-          });
-          const usage = new Promise<{
-            inputTokens: number;
-            outputTokens: number;
-          }>((resolve) => {
-            settleUsage = resolve;
-          });
+      // Settled from the `finish` part below. A turn that ends without one
+      // — a truncated or errored stream — still settles, so a caller
+      // awaiting either promise cannot hang.
+      let settleFinishReason!: (reason: string) => void;
+      let settleUsage!: (usage: {
+        inputTokens: number;
+        outputTokens: number;
+      }) => void;
+      const finishReason = new Promise<string>((resolve) => {
+        settleFinishReason = resolve;
+      });
+      const usage = new Promise<{
+        inputTokens: number;
+        outputTokens: number;
+      }>((resolve) => {
+        settleUsage = resolve;
+      });
 
-          // The source is drained by a detached pump rather than lazily by the
-          // consumer. Resolving `finishReason`/`usage` from inside a generator
-          // ties them to somebody iterating it, and the inherited
-          // `executeStream` chains analytics off exactly those promises — so a
-          // caller that awaits `result.analytics` without consuming the stream
-          // would wait forever. Pumping here means the turn completes, and
-          // both promises settle, whether or not anyone reads a chunk.
-          const channel = createStreamChannel<{ content: string }>();
-          void (async () => {
-            const reader = result.stream.getReader();
-            let sawFinish = false;
-            try {
-              while (true) {
-                const { done, value } = await reader.read();
-                if (done) {
-                  break;
-                }
-                const part = value as {
-                  type?: string;
-                  textDelta?: string;
-                  finishReason?: string;
-                  usage?: {
-                    inputTokens?: number;
-                    outputTokens?: number;
-                    promptTokens?: number;
-                    completionTokens?: number;
-                  };
-                };
-                if (part.type === "text-delta" && part.textDelta) {
-                  channel.push({ content: part.textDelta });
-                  continue;
-                }
-                if (part.type === "finish") {
-                  sawFinish = true;
-                  settleFinishReason(part.finishReason ?? "stop");
-                  settleUsage({
-                    inputTokens:
-                      part.usage?.inputTokens ?? part.usage?.promptTokens ?? 0,
-                    outputTokens:
-                      part.usage?.outputTokens ??
-                      part.usage?.completionTokens ??
-                      0,
-                  });
-                }
-              }
-              channel.close();
-            } catch (error) {
-              channel.error(error);
-            } finally {
-              reader.releaseLock();
-              // A stream that ended without a finish part — truncated or
-              // errored — must still settle both promises, or the same hang
-              // returns by a different route.
-              if (!sawFinish) {
-                settleFinishReason("unknown");
-                settleUsage({ inputTokens: 0, outputTokens: 0 });
-              }
+      // The source is drained by a detached pump rather than lazily by the
+      // consumer. Resolving `finishReason`/`usage` from inside a generator
+      // ties them to somebody iterating it, and the inherited
+      // `executeStream` chains analytics off exactly those promises — so a
+      // caller that awaits `result.analytics` without consuming the stream
+      // would wait forever. Pumping here means the turn completes, and
+      // both promises settle, whether or not anyone reads a chunk.
+      const channel = createStreamChannel<{ content: string }>();
+      void (async () => {
+        const reader = result.stream.getReader();
+        let sawFinish = false;
+        let text = "";
+        let firstChunkAt: Date | undefined;
+        let finish = "unknown";
+        let tokens = { inputTokens: 0, outputTokens: 0 };
+        try {
+          while (true) {
+            const { done, value } = await reader.read();
+            if (done) {
+              break;
             }
-          })();
-
-          return {
-            stream: channel.iterable,
-            finishReason,
-            usage,
-            warnings: (result.warnings ?? []).map(
-              (warning) => warning.message ?? String(warning),
-            ),
-          };
+            const part = value as {
+              type?: string;
+              textDelta?: string;
+              finishReason?: string;
+              usage?: {
+                inputTokens?: number;
+                outputTokens?: number;
+                promptTokens?: number;
+                completionTokens?: number;
+              };
+            };
+            if (part.type === "text-delta" && part.textDelta) {
+              firstChunkAt ??= new Date();
+              text += part.textDelta;
+              channel.push({ content: part.textDelta });
+              continue;
+            }
+            if (part.type === "finish") {
+              sawFinish = true;
+              finish = part.finishReason ?? "stop";
+              tokens = {
+                inputTokens:
+                  part.usage?.inputTokens ?? part.usage?.promptTokens ?? 0,
+                outputTokens:
+                  part.usage?.outputTokens ?? part.usage?.completionTokens ?? 0,
+              };
+              settleFinishReason(finish);
+              settleUsage(tokens);
+            }
+          }
+          channel.close();
+          span.setStatus({ code: SpanStatusCode.OK });
         } catch (error) {
-          throw this.handleProviderError(error);
+          span.setStatus({
+            code: SpanStatusCode.ERROR,
+            message: error instanceof Error ? error.message : String(error),
+          });
+          channel.error(error);
+        } finally {
+          reader.releaseLock();
+          // A stream that ended without a finish part — truncated or
+          // errored — must still settle both promises, or the same hang
+          // returns by a different route.
+          if (!sawFinish) {
+            settleFinishReason("unknown");
+            settleUsage({ inputTokens: 0, outputTokens: 0 });
+          }
+          observeGeneration(span, {
+            ...call,
+            output: text,
+            usage: tokens,
+            finishReason: finish,
+            completionStartTime: firstChunkAt,
+          });
+          span.end();
         }
-      },
-    );
+      })();
+
+      return {
+        stream: channel.iterable,
+        finishReason,
+        usage,
+        warnings: (result.warnings ?? []).map(
+          (warning) => warning.message ?? String(warning),
+        ),
+      };
+    } catch (error) {
+      span.setStatus({
+        code: SpanStatusCode.ERROR,
+        message: error instanceof Error ? error.message : String(error),
+      });
+      if (error instanceof Error) {
+        span.recordException(error);
+      }
+      span.end();
+      throw this.handleProviderError(error);
+    }
   }
 
   protected formatProviderError(error: unknown): Error {

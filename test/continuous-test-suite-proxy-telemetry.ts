@@ -4797,7 +4797,7 @@ await test("OTLP Codex text, tool and control-only streams carry native trace co
                 "native custom input bucket still includes cached tokens",
               );
               assertEqual(
-                requestSpan?.attributes["gen_ai.usage.input_tokens"],
+                requestSpan?.attributes["proxy.usage.input_tokens"],
                 100,
                 "native input usage changed",
               );

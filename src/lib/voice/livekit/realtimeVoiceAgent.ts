@@ -227,7 +227,7 @@ export function defineRealtimeVoiceAgent(
 
     // Decide whether this call may be remembered BEFORE the lifecycle installs
     // its process reaper, so the shutdown flush is registered first.
-    const memory = await setUpRealtimeCallMemory(ctx, memoryConfig);
+    const memory = await setUpRealtimeCallMemory(ctx, memoryConfig, cfg.model);
 
     await installRealtimeJobLifecycle(ctx, cfg);
 

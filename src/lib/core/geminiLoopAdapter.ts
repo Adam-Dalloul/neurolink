@@ -25,7 +25,9 @@ import type {
   AgenticLoopToolCallResult,
   GeminiLoopAdapterConfig,
   GeminiStepRaw,
+  GeminiStepRequest,
   GeminiTurnContent,
+  GenerationRecord,
 } from "../types/index.js";
 import type { Tool } from "../types/index.js";
 import { guardToolExecutor } from "./toolExecutionGuards.js";
@@ -37,6 +39,38 @@ import {
   pushModelResponseToHistory,
   refreshNativeToolDeclarations,
 } from "../providers/googleNativeGemini3/utils.js";
+
+/**
+ * @description Describes one Gemini request as the request half of a Langfuse generation.
+ * @param provider {string} - Provider name used to price the call.
+ * @param request {GeminiStepRequest} - Model, contents and generation config sent.
+ * @returns {GenerationRecord} Provider, model, sampling and thinking parameters, and the system instruction plus contents.
+ */
+export function describeGeminiRequest(
+  provider: string,
+  request: GeminiStepRequest,
+): GenerationRecord {
+  const settings = (request.config ?? {}) as {
+    temperature?: number;
+    maxOutputTokens?: number;
+    topP?: number;
+    systemInstruction?: string;
+    thinkingConfig?: { thinkingLevel?: string; thinkingBudget?: number };
+  };
+  const thinking = settings.thinkingConfig;
+  return {
+    provider,
+    model: request.model,
+    modelParameters: {
+      temperature: settings.temperature,
+      maxTokens: settings.maxOutputTokens,
+      topP: settings.topP,
+      thinkingLevel: thinking?.thinkingLevel,
+      thinkingBudget: thinking?.thinkingBudget,
+    },
+    input: { system: settings.systemInstruction, messages: request.contents },
+  };
+}
 
 export function createGeminiLoopAdapter(
   config: GeminiLoopAdapterConfig,
@@ -91,8 +125,10 @@ export function createGeminiLoopAdapter(
       const hydratedToolNames = config.declarations
         ? refreshNativeToolDeclarations(config.liveTools, config.declarations)
         : [];
+      const raw = config.buildRequest(conversation, step);
       return {
-        raw: config.buildRequest(conversation, step),
+        raw,
+        generation: describeGeminiRequest(config.provider, raw),
         ...(hydratedToolNames.length > 0 ? { hydratedToolNames } : {}),
       };
     },

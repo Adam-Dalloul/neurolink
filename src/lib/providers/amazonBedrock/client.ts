@@ -70,7 +70,7 @@ import { resolveSamplingParams } from "../../models/modelRegistry.js";
 import { buildMultimodalMessagesArray } from "../../utils/messageBuilder.js";
 import { buildMultimodalOptions } from "../../utils/multimodalOptionsBuilder.js";
 import { convertZodToJsonSchema } from "../../utils/schemaConversion.js";
-import { type Span, SpanKind, SpanStatusCode } from "@opentelemetry/api";
+import { SpanKind, SpanStatusCode } from "@opentelemetry/api";
 
 import { bedrockTracer } from "./constants.js";
 import { loadBedrockControl } from "./utils.js";
@@ -833,10 +833,7 @@ export class AmazonBedrockProvider extends BaseProvider {
       "bedrock.tool.execute",
       {
         kind: SpanKind.CLIENT,
-        attributes: {
-          "gen_ai.tool.name": toolName,
-          "gen_ai.system": "aws.bedrock",
-        },
+        attributes: { "tool.name": toolName },
       },
       async (span) => {
         try {
@@ -960,9 +957,11 @@ export class AmazonBedrockProvider extends BaseProvider {
     if (disableTools) {
       return {};
     }
-    const aiTools =
-      (optionTools as Record<string, Tool> | undefined) ??
-      (await this.getAllTools());
+    const aiTools = optionTools
+      ? this.toolsManager.wrapExternalToolsWithEvents(
+          optionTools as Record<string, Tool>,
+        )
+      : await this.getAllTools();
     return this.convertAISDKToolsToToolDefinitions(aiTools);
   }
 
@@ -1201,244 +1200,201 @@ export class AmazonBedrockProvider extends BaseProvider {
       "[AmazonBedrockProvider] Attempting real streaming with ConverseStreamCommand",
     );
 
-    return bedrockTracer.startActiveSpan(
-      "bedrock.stream",
-      {
-        kind: SpanKind.CLIENT,
-        attributes: {
-          "gen_ai.system": "aws.bedrock",
-          "gen_ai.request.model": this.modelName || this.getDefaultModel(),
-          "gen_ai.operation.name": "stream",
-        },
-      },
-      async (streamSpan) => {
-        try {
-          logger.debug(
-            "[TRACE] executeStream TRY block - about to call streamingConversationLoop",
-          );
-          // Clear conversation history for new streaming session
-          this.conversationHistory = [];
+    try {
+      logger.debug(
+        "[TRACE] executeStream TRY block - about to call streamingConversationLoop",
+      );
+      // Clear conversation history for new streaming session
+      this.conversationHistory = [];
 
-          // Check for multimodal input (images, PDFs, CSVs, files)
-          const hasMultimodalInput = !!(
-            options.input?.images?.length ||
-            options.input?.content?.length ||
-            options.input?.files?.length ||
-            options.input?.csvFiles?.length ||
-            options.input?.pdfFiles?.length
-          );
+      // Check for multimodal input (images, PDFs, CSVs, files)
+      const hasMultimodalInput = !!(
+        options.input?.images?.length ||
+        options.input?.content?.length ||
+        options.input?.files?.length ||
+        options.input?.csvFiles?.length ||
+        options.input?.pdfFiles?.length
+      );
 
-          if (hasMultimodalInput) {
-            logger.debug(
-              `[AmazonBedrockProvider] Detected multimodal input, using multimodal message builder`,
-              {
-                hasImages: !!options.input?.images?.length,
-                imageCount: options.input?.images?.length || 0,
-                hasContent: !!options.input?.content?.length,
-                contentCount: options.input?.content?.length || 0,
-                hasFiles: !!options.input?.files?.length,
-                fileCount: options.input?.files?.length || 0,
-                hasCSVFiles: !!options.input?.csvFiles?.length,
-                csvFileCount: options.input?.csvFiles?.length || 0,
-                hasPDFFiles: !!options.input?.pdfFiles?.length,
-                pdfFileCount: options.input?.pdfFiles?.length || 0,
-              },
-            );
+      if (hasMultimodalInput) {
+        logger.debug(
+          `[AmazonBedrockProvider] Detected multimodal input, using multimodal message builder`,
+          {
+            hasImages: !!options.input?.images?.length,
+            imageCount: options.input?.images?.length || 0,
+            hasContent: !!options.input?.content?.length,
+            contentCount: options.input?.content?.length || 0,
+            hasFiles: !!options.input?.files?.length,
+            fileCount: options.input?.files?.length || 0,
+            hasCSVFiles: !!options.input?.csvFiles?.length,
+            csvFileCount: options.input?.csvFiles?.length || 0,
+            hasPDFFiles: !!options.input?.pdfFiles?.length,
+            pdfFileCount: options.input?.pdfFiles?.length || 0,
+          },
+        );
 
-            // Same instance-default fold as the generate() path above.
-            this.applyToolReplayDefault(options);
-            const multimodalOptions = buildMultimodalOptions(
-              options,
-              this.providerName,
-              this.modelName,
-            );
+        // Same instance-default fold as the generate() path above.
+        this.applyToolReplayDefault(options);
+        const multimodalOptions = buildMultimodalOptions(
+          options,
+          this.providerName,
+          this.modelName,
+        );
 
-            const multimodalMessages = await buildMultimodalMessagesArray(
-              multimodalOptions,
-              this.providerName,
-              this.modelName,
-            );
+        const multimodalMessages = await buildMultimodalMessagesArray(
+          multimodalOptions,
+          this.providerName,
+          this.modelName,
+        );
 
-            // Convert to Bedrock format
-            this.conversationHistory =
-              this.convertToBedrockMessages(multimodalMessages);
-          } else {
-            logger.debug(
-              `[AmazonBedrockProvider] Text-only input, using simple message builder`,
-            );
+        // Convert to Bedrock format
+        this.conversationHistory =
+          this.convertToBedrockMessages(multimodalMessages);
+      } else {
+        logger.debug(
+          `[AmazonBedrockProvider] Text-only input, using simple message builder`,
+        );
 
-            // Add user message to conversation - simple text-only case
-            const userMessage: BedrockMessage = {
-              role: "user",
-              content: [{ text: options.input.text }],
-            };
-            this.conversationHistory.push(userMessage);
-          }
+        // Add user message to conversation - simple text-only case
+        const userMessage: BedrockMessage = {
+          role: "user",
+          content: [{ text: options.input.text }],
+        };
+        this.conversationHistory.push(userMessage);
+      }
 
-          logger.debug(
-            `[AmazonBedrockProvider] Starting streaming conversation with ${this.conversationHistory.length} message(s)`,
-          );
+      logger.debug(
+        `[AmazonBedrockProvider] Starting streaming conversation with ${this.conversationHistory.length} message(s)`,
+      );
 
-          // Call the actual streaming implementation that already exists
-          logger.debug(
-            "[TRACE] executeStream - calling streamingConversationLoop NOW",
-          );
-          const result = await this.streamingConversationLoop(
-            options,
-            streamSpan,
-          );
-          logger.debug(
-            "[TRACE] executeStream - streamingConversationLoop SUCCESS, returning result",
-          );
-          streamSpan.setStatus({ code: SpanStatusCode.OK });
-          streamSpan.end();
-          return result;
-        } catch (error: unknown) {
-          logger.debug(
-            "[TRACE] executeStream CATCH - error caught from streamingConversationLoop",
-          );
-          const errorObj = error as Error;
+      // Call the actual streaming implementation that already exists
+      logger.debug(
+        "[TRACE] executeStream - calling streamingConversationLoop NOW",
+      );
+      const result = await this.streamingConversationLoop(options);
+      logger.debug(
+        "[TRACE] executeStream - streamingConversationLoop SUCCESS, returning result",
+      );
+      return result;
+    } catch (error: unknown) {
+      logger.debug(
+        "[TRACE] executeStream CATCH - error caught from streamingConversationLoop",
+      );
+      const errorObj = error as Error;
 
-          // Check if error is related to streaming permissions. Gated on the
-          // real AWS SDK service-exception shape ($metadata) first: a
-          // middleware's wrapStream/transformParams can throw an arbitrary
-          // Error whose message happens to contain "streaming" or whose name
-          // happens to collide with an AWS exception name, and without this
-          // guard that error was silently swallowed and retried as if AWS
-          // itself had rejected the streaming call (see
-          // BedrockRuntimeServiceException in the AWS SDK, which carries
-          // $fault/$metadata on every genuine service exception).
-          const hasAwsServiceExceptionShape =
-            typeof errorObj === "object" &&
-            errorObj !== null &&
-            "$metadata" in errorObj;
-          const isPermissionError =
-            hasAwsServiceExceptionShape &&
-            (errorObj?.name === "AccessDeniedException" ||
-              errorObj?.name === "UnauthorizedOperation" ||
-              errorObj?.message?.includes(
-                "bedrock:InvokeModelWithResponseStream",
-              ) ||
-              errorObj?.message?.includes("streaming") ||
-              errorObj?.message?.includes("ConverseStream"));
+      // Check if error is related to streaming permissions. Gated on the
+      // real AWS SDK service-exception shape ($metadata) first: a
+      // middleware's wrapStream/transformParams can throw an arbitrary
+      // Error whose message happens to contain "streaming" or whose name
+      // happens to collide with an AWS exception name, and without this
+      // guard that error was silently swallowed and retried as if AWS
+      // itself had rejected the streaming call (see
+      // BedrockRuntimeServiceException in the AWS SDK, which carries
+      // $fault/$metadata on every genuine service exception).
+      const hasAwsServiceExceptionShape =
+        typeof errorObj === "object" &&
+        errorObj !== null &&
+        "$metadata" in errorObj;
+      const isPermissionError =
+        hasAwsServiceExceptionShape &&
+        (errorObj?.name === "AccessDeniedException" ||
+          errorObj?.name === "UnauthorizedOperation" ||
+          errorObj?.message?.includes(
+            "bedrock:InvokeModelWithResponseStream",
+          ) ||
+          errorObj?.message?.includes("streaming") ||
+          errorObj?.message?.includes("ConverseStream"));
 
-          logger.debug(
-            "[TRACE] executeStream CATCH - checking if permission error",
-          );
-          logger.debug(
-            `[TRACE] executeStream CATCH - isPermissionError=${isPermissionError}`,
-          );
+      logger.debug(
+        "[TRACE] executeStream CATCH - checking if permission error",
+      );
+      logger.debug(
+        `[TRACE] executeStream CATCH - isPermissionError=${isPermissionError}`,
+      );
 
-          if (isPermissionError) {
-            logger.debug(
-              "[TRACE] executeStream CATCH - PERMISSION ERROR DETECTED, starting fallback",
-            );
-            logger.warn(
-              `[AmazonBedrockProvider] Streaming permissions not available, falling back to generate method: ${errorObj.message}`,
-            );
+      if (isPermissionError) {
+        logger.debug(
+          "[TRACE] executeStream CATCH - PERMISSION ERROR DETECTED, starting fallback",
+        );
+        logger.warn(
+          `[AmazonBedrockProvider] Streaming permissions not available, falling back to generate method: ${errorObj.message}`,
+        );
 
-            streamSpan.addEvent("stream.fallback_to_generate", {
-              reason: errorObj.message,
-            });
+        // Fallback to generate method and convert to streaming format
+        const generateResult = await this.generate({
+          prompt: options.input.text,
+          input: options.input,
+          maxTokens: options.maxTokens,
+          temperature: options.temperature,
+          systemPrompt: options.systemPrompt,
+        });
 
-            // Fallback to generate method and convert to streaming format
-            const generateResult = await this.generate({
-              prompt: options.input.text,
-              input: options.input,
-              maxTokens: options.maxTokens,
-              temperature: options.temperature,
-              systemPrompt: options.systemPrompt,
-            });
-
-            if (!generateResult) {
-              streamSpan.setStatus({
-                code: SpanStatusCode.ERROR,
-                message: "Generate method returned null result",
-              });
-              streamSpan.end();
-              // eslint-disable-next-line preserve-caught-error
-              throw new Error("Generate method returned null result");
-            }
-
-            streamSpan.setAttribute(
-              "gen_ai.response.stop_reason",
-              "fallback_end_turn",
-            );
-            streamSpan.setStatus({ code: SpanStatusCode.OK });
-            streamSpan.end();
-
-            // Convert generate result to streaming format.
-            // Use whitespace-preserving split (matches BaseProvider's
-            // executeFakeStreaming) so newlines, tabs, indentation, code
-            // blocks, and markdown tables aren't collapsed to single spaces.
-            const stream = new ReadableStream({
-              start(controller) {
-                const responseText = generateResult.content || "";
-                const tokens = responseText.split(/(\s+)/);
-                let buffer = "";
-                for (let i = 0; i < tokens.length; i++) {
-                  buffer += tokens[i];
-                  const shouldYield =
-                    i === tokens.length - 1 ||
-                    buffer.length > 50 ||
-                    /[.!?;,]\s*$/.test(buffer);
-                  if (shouldYield && buffer.length > 0) {
-                    controller.enqueue({ content: buffer });
-                    buffer = "";
-                  }
-                }
-                if (buffer.length > 0) {
-                  controller.enqueue({ content: buffer });
-                }
-                controller.close();
-              },
-            });
-
-            // Convert ReadableStream to AsyncIterable like streamingConversationLoop does
-            const asyncIterable = {
-              async *[Symbol.asyncIterator]() {
-                const reader = stream.getReader();
-                try {
-                  while (true) {
-                    const { done, value } = await reader.read();
-                    if (done) {
-                      break;
-                    }
-                    yield value;
-                  }
-                } finally {
-                  reader.releaseLock();
-                }
-              },
-            };
-
-            return {
-              stream: asyncIterable,
-              // The generate() fallback already computed real usage — a
-              // hardcoded zero object here threw it away.
-              usage: generateResult.usage,
-              model: this.modelName || this.getDefaultModel(),
-              provider: this.getProviderName(),
-              metadata: {
-                fallback: true,
-              },
-            };
-          }
-
-          // Re-throw non-permission errors
-          streamSpan.setStatus({
-            code: SpanStatusCode.ERROR,
-            message:
-              errorObj instanceof Error ? errorObj.message : String(errorObj),
-          });
-          streamSpan.recordException(
-            errorObj instanceof Error ? errorObj : new Error(String(errorObj)),
-          );
-          streamSpan.end();
-          throw error;
+        if (!generateResult) {
+          // eslint-disable-next-line preserve-caught-error
+          throw new Error("Generate method returned null result");
         }
-      },
-    );
+
+        // Convert generate result to streaming format.
+        // Use whitespace-preserving split (matches BaseProvider's
+        // executeFakeStreaming) so newlines, tabs, indentation, code
+        // blocks, and markdown tables aren't collapsed to single spaces.
+        const stream = new ReadableStream({
+          start(controller) {
+            const responseText = generateResult.content || "";
+            const tokens = responseText.split(/(\s+)/);
+            let buffer = "";
+            for (let i = 0; i < tokens.length; i++) {
+              buffer += tokens[i];
+              const shouldYield =
+                i === tokens.length - 1 ||
+                buffer.length > 50 ||
+                /[.!?;,]\s*$/.test(buffer);
+              if (shouldYield && buffer.length > 0) {
+                controller.enqueue({ content: buffer });
+                buffer = "";
+              }
+            }
+            if (buffer.length > 0) {
+              controller.enqueue({ content: buffer });
+            }
+            controller.close();
+          },
+        });
+
+        // Convert ReadableStream to AsyncIterable like streamingConversationLoop does
+        const asyncIterable = {
+          async *[Symbol.asyncIterator]() {
+            const reader = stream.getReader();
+            try {
+              while (true) {
+                const { done, value } = await reader.read();
+                if (done) {
+                  break;
+                }
+                yield value;
+              }
+            } finally {
+              reader.releaseLock();
+            }
+          },
+        };
+
+        return {
+          stream: asyncIterable,
+          // The generate() fallback already computed real usage — a
+          // hardcoded zero object here threw it away.
+          usage: generateResult.usage,
+          model: this.modelName || this.getDefaultModel(),
+          provider: this.getProviderName(),
+          metadata: {
+            fallback: true,
+          },
+        };
+      }
+
+      // Re-throw non-permission errors
+      throw error;
+    }
   }
 
   /**
@@ -1678,7 +1634,6 @@ export class AmazonBedrockProvider extends BaseProvider {
 
   private async streamingConversationLoop(
     options: StreamOptions,
-    streamSpan: Span,
   ): Promise<StreamResult> {
     const startTime = Date.now();
     const maxSteps = options.maxSteps || DEFAULT_MAX_STEPS;
@@ -1791,9 +1746,6 @@ export class AmazonBedrockProvider extends BaseProvider {
           return stepResult;
         },
       };
-      streamSpan.addEvent("stream.api_call", {
-        "bedrock.tool_count": toolConfig?.tools?.length ?? 0,
-      });
       return runAgenticLoop(adapter, conversation, {
         tools: this.toEngineTools(tools),
         abortSignal: signal,
@@ -1919,10 +1871,6 @@ export class AmazonBedrockProvider extends BaseProvider {
             // Read after drain by the facade's fallbackOnMaxSteps gate. Keep
             // the engine's own outcome; raw tool_use alone is not a step cap.
             metadata.stopReason = outcome.result.stopReason;
-            streamSpan.setAttribute(
-              "gen_ai.response.stop_reason",
-              outcome.result.rawStopReason ?? "unknown",
-            );
           }
 
           // Analytics is resolved off `settled` above, so it lands whether or

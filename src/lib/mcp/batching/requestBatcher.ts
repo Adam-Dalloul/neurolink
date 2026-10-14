@@ -274,7 +274,7 @@ export class RequestBatcher<T = unknown> extends EventEmitter {
 
     await withSpan(
       {
-        name: "neurolink.mcp.batch.execute",
+        name: "mcp.batch.execute",
         tracer: tracers.mcp,
         attributes: {
           "mcp.batch.id": batchId,

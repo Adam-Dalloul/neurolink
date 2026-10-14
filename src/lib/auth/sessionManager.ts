@@ -416,7 +416,7 @@ export class SessionManager {
   ): Promise<AuthSession> {
     return withSpan(
       {
-        name: "neurolink.auth.session.create",
+        name: "auth.session.create",
         tracer: tracers.auth,
         attributes: {
           "auth.user_id": maskId(user.id),
@@ -469,7 +469,7 @@ export class SessionManager {
   ): Promise<AuthSession | null> {
     return withSpan(
       {
-        name: "neurolink.auth.session.get",
+        name: "auth.session.get",
         tracer: tracers.auth,
         attributes: {
           "auth.session_id": maskId(sessionId),
@@ -520,7 +520,7 @@ export class SessionManager {
   async refreshSession(sessionId: string): Promise<AuthSession | null> {
     return withSpan(
       {
-        name: "neurolink.auth.session.refresh",
+        name: "auth.session.refresh",
         tracer: tracers.auth,
         attributes: { "auth.session_id": maskId(sessionId) },
       },
@@ -573,7 +573,7 @@ export class SessionManager {
   async validateSession(sessionId: string): Promise<boolean> {
     return withSpan(
       {
-        name: "neurolink.auth.session.validate",
+        name: "auth.session.validate",
         tracer: tracers.auth,
         attributes: { "auth.session_id": maskId(sessionId) },
       },

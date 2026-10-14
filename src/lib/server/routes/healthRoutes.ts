@@ -46,7 +46,7 @@ export function createHealthRoutes(basePath: string = "/api"): RouteGroup {
         method: "GET",
         path: `${basePath}/health`,
         handler: tracedHealthHandler(
-          "neurolink.http.health.check",
+          "http.health.check",
           `${basePath}/health`,
           async (): Promise<HealthResponse> => {
             return {
@@ -64,7 +64,7 @@ export function createHealthRoutes(basePath: string = "/api"): RouteGroup {
         method: "GET",
         path: `${basePath}/health/live`,
         handler: tracedHealthHandler(
-          "neurolink.http.health.live",
+          "http.health.live",
           `${basePath}/health/live`,
           async (): Promise<{ status: string; timestamp: string }> => {
             // Liveness probe - just checks if the server is running
@@ -83,7 +83,7 @@ export function createHealthRoutes(basePath: string = "/api"): RouteGroup {
         handler: (ctx: ServerContext): Promise<ReadyResponse> =>
           withSpan(
             {
-              name: "neurolink.http.health.ready",
+              name: "http.health.ready",
               tracer: tracers.http,
               attributes: {
                 "http.route": `${basePath}/health/ready`,
@@ -138,7 +138,7 @@ export function createHealthRoutes(basePath: string = "/api"): RouteGroup {
         handler: (ctx: ServerContext) =>
           withSpan(
             {
-              name: "neurolink.http.health.startup",
+              name: "http.health.startup",
               tracer: tracers.http,
               attributes: {
                 "http.route": `${basePath}/health/startup`,
@@ -170,7 +170,7 @@ export function createHealthRoutes(basePath: string = "/api"): RouteGroup {
         handler: (ctx: ServerContext) =>
           withSpan(
             {
-              name: "neurolink.http.health.detailed",
+              name: "http.health.detailed",
               tracer: tracers.http,
               attributes: {
                 "http.route": `${basePath}/health/detailed`,
@@ -301,7 +301,7 @@ export function createHealthRoutes(basePath: string = "/api"): RouteGroup {
         method: "GET",
         path: `${basePath}/version`,
         handler: tracedHealthHandler(
-          "neurolink.http.version",
+          "http.version",
           `${basePath}/version`,
           async () => {
             return {

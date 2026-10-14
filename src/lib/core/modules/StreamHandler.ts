@@ -56,7 +56,7 @@ export class StreamHandler {
    * Validate stream options - consolidates validation from 7/10 providers
    */
   validateStreamOptions(options: StreamOptions): void {
-    const span = tracers.stream.startSpan("neurolink.stream.validate", {
+    const span = tracers.stream.startSpan("stream.validate", {
       attributes: {
         [ATTR.NL_PROVIDER]: this.providerName,
         [ATTR.NL_MODEL]: this.modelName,
@@ -268,7 +268,7 @@ export class StreamHandler {
   ): Promise<UnknownRecord | undefined> {
     return withSpan(
       {
-        name: "neurolink.stream.analytics",
+        name: "stream.analytics",
         tracer: tracers.stream,
         attributes: {
           [ATTR.NL_PROVIDER]: this.providerName,

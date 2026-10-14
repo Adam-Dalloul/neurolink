@@ -1213,15 +1213,6 @@ export type TelemetryCommandArgs = {
 /** Telemetry status sub-command args */
 export type TelemetryStatusArgs = TelemetryCommandArgs;
 
-/** Telemetry configure sub-command args */
-export type TelemetryConfigureArgs = TelemetryCommandArgs & {
-  exporter: string;
-  config: string;
-};
-
-/** Telemetry list-exporters sub-command args */
-export type TelemetryListExportersArgs = TelemetryCommandArgs;
-
 /** Telemetry flush sub-command args */
 export type TelemetryFlushArgs = TelemetryCommandArgs & {
   timeout?: number;
@@ -1254,18 +1245,6 @@ export type TelemetryNativeValidateArgs = {
   collectorBin: string;
 };
 
-/** Available exporter names */
-export type ExporterName =
-  | "langfuse"
-  | "langsmith"
-  | "otel"
-  | "datadog"
-  | "sentry"
-  | "braintrust"
-  | "arize"
-  | "posthog"
-  | "laminar";
-
 // ============================================================================
 // OBSERVABILITY CLI TYPES (moved from src/cli/commands/observability.ts)
 // Prefixed with "Observability" to avoid collision with telemetry types.
@@ -1284,9 +1263,6 @@ export type ObservabilityStatusArgs = ObservabilityCommandArgs;
 export type ObservabilityMetricsArgs = ObservabilityCommandArgs & {
   detailed?: boolean;
 };
-
-/** Observability exporters sub-command args */
-export type ObservabilityExportersArgs = ObservabilityCommandArgs;
 
 /** Observability costs sub-command args */
 export type ObservabilityCostsArgs = ObservabilityCommandArgs & {

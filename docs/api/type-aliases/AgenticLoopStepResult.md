@@ -48,6 +48,14 @@ Provider's own raw stop/finish-reason string, e.g. "tool_use", "MAX_TOKENS"
 
 ---
 
+### model?
+
+> `optional` **model?**: `string`
+
+Model the response says served it, when the API reports one.
+
+---
+
 ### raw
 
 > **raw**: `TRaw`

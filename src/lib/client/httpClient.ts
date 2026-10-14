@@ -255,7 +255,7 @@ export class NeuroLinkClient {
   ): Promise<ClientApiResponse<T>> {
     return withClientSpan(
       {
-        name: "neurolink.client.http.request",
+        name: "client.http.request",
         tracer: tracers.http,
         attributes: {
           "http.method": method,

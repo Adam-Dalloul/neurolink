@@ -262,13 +262,16 @@ import type {
   ProxyQuotaSource,
   ProxyRoutingPolicySnapshot,
   QueuedAccountAdmission,
+  RawStreamCapture,
   ResponseInfoContext,
   RouteGroup,
   RoutedClaudeRequestRuntimeContext,
   RuntimeAccountState,
   ServerContext,
+  SSETelemetry,
   StreamTerminalOutcome,
   TransientRateLimitRetryBudget,
+  UsageContext,
   ProxyPeerAuthOutcome,
   ProxyPeerLimitsSnapshot,
   ProxyResidentGrant,
@@ -3361,8 +3364,12 @@ function responseInfoFromStream(data: {
   stopReason?: string | null;
   stopSequence?: string | null;
   contentBlocks?: Array<{ type?: string; toolName?: string }>;
+  firstUsefulOutputAt?: number;
 }): ResponseInfoContext {
-  const info: ResponseInfoContext = {};
+  const info: ResponseInfoContext = {
+    output: data.contentBlocks,
+    firstOutputAt: data.firstUsefulOutputAt,
+  };
   if (data.model) {
     info.responseModel = data.model;
   }
@@ -3936,6 +3943,104 @@ function trackUpstreamReadableStream(source: ReadableStream<Uint8Array>): {
   return { stream, outcome: tracker.outcome };
 }
 
+function settleStreamSpend(
+  account: ProxyPassthroughAccount,
+  model: string | undefined,
+  usage: UsageContext,
+): void {
+  settleBorrowedRequest(account.key, model, usage);
+  recordLeasedAccountSpend(account.label, model, usage);
+}
+
+function logStreamFinal(
+  logFinalRequest: ClaudeFinalRequestLogger,
+  failure: ReturnType<typeof getStreamFailureDetails>,
+  accountLabel: string,
+  accountType: string,
+  usage: UsageContext,
+): void {
+  logFinalRequest(
+    failure?.status ?? 200,
+    accountLabel,
+    accountType,
+    failure?.errorType,
+    failure?.message,
+    usage,
+  );
+}
+
+function streamUsageFields(usage: SSETelemetry["usage"]): UsageContext {
+  return {
+    inputTokens: usage.inputTokens,
+    outputTokens: usage.outputTokens,
+    cacheCreationTokens: usage.cacheCreationInputTokens,
+    ...oneHourCacheWriteFields(usage.cacheCreation1hInputTokens),
+    cacheReadTokens: usage.cacheReadInputTokens,
+  };
+}
+
+function setRateLimitUsage(
+  tracer: ProxyTracer,
+  response: Response,
+  usage: SSETelemetry["usage"],
+): void {
+  const rateLimit5h = parseFloat(
+    response.headers.get("anthropic-ratelimit-unified-5h-utilization") ?? "",
+  );
+  const rateLimit7d = parseFloat(
+    response.headers.get("anthropic-ratelimit-unified-7d-utilization") ?? "",
+  );
+  if (isNaN(rateLimit5h) && isNaN(rateLimit7d)) {
+    return;
+  }
+  const usageUpdate = streamUsageFields(usage);
+  if (!isNaN(rateLimit5h)) {
+    usageUpdate.rateLimitAfter5h = rateLimit5h;
+  }
+  if (!isNaN(rateLimit7d)) {
+    usageUpdate.rateLimitAfter7d = rateLimit7d;
+  }
+  tracer.setUsage(usageUpdate);
+}
+
+function logStreamBodies(args: {
+  logProxyBody: ProxyBodyCaptureLogger;
+  headers: Record<string, string>;
+  data: SSETelemetry;
+  clientBody: RawStreamCapture;
+  account: string;
+  accountType: string;
+  attempt: number;
+  responseStatus: number;
+  requestStartTime: number;
+}): void {
+  const { logProxyBody, headers, data, clientBody, requestStartTime } = args;
+  const common = {
+    headers,
+    contentType: headers["content-type"] ?? "text/event-stream",
+    account: args.account,
+    accountType: args.accountType,
+    attempt: args.attempt,
+    responseStatus: args.responseStatus,
+  };
+  logProxyBody({
+    ...common,
+    phase: "upstream_response",
+    body: data.rawText ?? "",
+    sourceTruncated: data.rawTextTruncated,
+    bodySize: data.totalBytesReceived,
+    durationMs: Date.now() - requestStartTime,
+  });
+  logProxyBody({
+    ...common,
+    phase: "client_response",
+    body: clientBody.text,
+    sourceTruncated: clientBody.truncated,
+    bodySize: clientBody.totalBytes,
+    durationMs: Date.now() - requestStartTime,
+  });
+}
+
 async function handleClaudePassthroughStreamResponse(args: {
   ctx: ServerContext;
   body: ClaudeRequest;
@@ -4025,45 +4130,13 @@ async function handleClaudePassthroughStreamResponse(args: {
           );
           observeClaudeStreamOutput(ctx.metadata, data);
           const failure = getStreamFailureDetails(terminalOutcome);
-          capturedTracer.setUsage({
-            inputTokens: data.usage.inputTokens,
-            outputTokens: data.usage.outputTokens,
-            cacheCreationTokens: data.usage.cacheCreationInputTokens,
-            ...oneHourCacheWriteFields(data.usage.cacheCreation1hInputTokens),
-            cacheReadTokens: data.usage.cacheReadInputTokens,
-          });
+          capturedTracer.setUsage(streamUsageFields(data.usage));
           capturedTracer.logStreamEvents(data.events);
           capturedTracer.setResponseInfo(responseInfoFromStream(data));
 
-          const rateLimit5h = parseFloat(
-            capturedResponse.headers.get(
-              "anthropic-ratelimit-unified-5h-utilization",
-            ) ?? "",
-          );
-          const rateLimit7d = parseFloat(
-            capturedResponse.headers.get(
-              "anthropic-ratelimit-unified-7d-utilization",
-            ) ?? "",
-          );
-          const usageUpdate: Parameters<typeof capturedTracer.setUsage>[0] = {
-            inputTokens: data.usage.inputTokens,
-            outputTokens: data.usage.outputTokens,
-            cacheCreationTokens: data.usage.cacheCreationInputTokens,
-            ...oneHourCacheWriteFields(data.usage.cacheCreation1hInputTokens),
-            cacheReadTokens: data.usage.cacheReadInputTokens,
-          };
-          if (!isNaN(rateLimit5h)) {
-            usageUpdate.rateLimitAfter5h = rateLimit5h;
-          }
-          if (!isNaN(rateLimit7d)) {
-            usageUpdate.rateLimitAfter7d = rateLimit7d;
-          }
-          if (!isNaN(rateLimit5h) || !isNaN(rateLimit7d)) {
-            capturedTracer.setUsage(usageUpdate);
-          }
+          setRateLimitUsage(capturedTracer, capturedResponse, data.usage);
 
           capturedTracer.logUpstreamResponseBody(data.rawText ?? "");
-          capturedTracer.recordMetrics();
           capturedTracer.recordBodySizes(
             capturedRequestBytes,
             data.totalBytesReceived,
@@ -4081,39 +4154,18 @@ async function handleClaudePassthroughStreamResponse(args: {
             failure?.status ?? response.status,
             failure?.errorType,
             failure?.message,
-            {
-              inputTokens: data.usage.inputTokens,
-              outputTokens: data.usage.outputTokens,
-              cacheCreationTokens: data.usage.cacheCreationInputTokens,
-              ...oneHourCacheWriteFields(data.usage.cacheCreation1hInputTokens),
-              cacheReadTokens: data.usage.cacheReadInputTokens,
-            },
+            streamUsageFields(data.usage),
           );
-          logProxyBody({
-            phase: "upstream_response",
+          logStreamBodies({
+            logProxyBody,
             headers: responseHeaders,
-            body: data.rawText ?? "",
-            sourceTruncated: data.rawTextTruncated,
-            bodySize: data.totalBytesReceived,
-            contentType: responseHeaders["content-type"] ?? "text/event-stream",
+            data,
+            clientBody,
             account: "passthrough",
             accountType: "passthrough",
             attempt: 1,
             responseStatus: 200,
-            durationMs: Date.now() - requestStartTime,
-          });
-          logProxyBody({
-            phase: "client_response",
-            headers: responseHeaders,
-            body: clientBody.text,
-            sourceTruncated: clientBody.truncated,
-            bodySize: clientBody.totalBytes,
-            contentType: responseHeaders["content-type"] ?? "text/event-stream",
-            account: "passthrough",
-            accountType: "passthrough",
-            attempt: 1,
-            responseStatus: 200,
-            durationMs: Date.now() - requestStartTime,
+            requestStartTime,
           });
         })
         .catch((error) => {
@@ -4168,39 +4220,18 @@ async function handleClaudePassthroughStreamResponse(args: {
             failure?.status ?? response.status,
             failure?.errorType,
             failure?.message,
-            {
-              inputTokens: data.usage.inputTokens,
-              outputTokens: data.usage.outputTokens,
-              cacheCreationTokens: data.usage.cacheCreationInputTokens,
-              ...oneHourCacheWriteFields(data.usage.cacheCreation1hInputTokens),
-              cacheReadTokens: data.usage.cacheReadInputTokens,
-            },
+            streamUsageFields(data.usage),
           );
-          logProxyBody({
-            phase: "upstream_response",
+          logStreamBodies({
+            logProxyBody,
             headers: responseHeaders,
-            body: data.rawText ?? "",
-            sourceTruncated: data.rawTextTruncated,
-            bodySize: data.totalBytesReceived,
-            contentType: responseHeaders["content-type"] ?? "text/event-stream",
+            data,
+            clientBody,
             account: "passthrough",
             accountType: "passthrough",
             attempt: 1,
             responseStatus: response.status,
-            durationMs: Date.now() - requestStartTime,
-          });
-          logProxyBody({
-            phase: "client_response",
-            headers: responseHeaders,
-            body: clientBody.text,
-            sourceTruncated: clientBody.truncated,
-            bodySize: clientBody.totalBytes,
-            contentType: responseHeaders["content-type"] ?? "text/event-stream",
-            account: "passthrough",
-            accountType: "passthrough",
-            attempt: 1,
-            responseStatus: response.status,
-            durationMs: Date.now() - requestStartTime,
+            requestStartTime,
           });
         })
         .catch((error) => {
@@ -4334,7 +4365,6 @@ async function handleClaudePassthroughJsonResponse(args: {
       }
     }
     tracer.setResponseInfo(extractResponseInfo(responseJson));
-    tracer.recordMetrics();
     const responseJsonStr = JSON.stringify(responseJson);
     tracer.recordBodySizes(bodyStr.length, responseJsonStr.length);
     upstreamSpan?.end();
@@ -7497,7 +7527,6 @@ function attachAnthropicSuccessStreamTelemetry(args: {
       const capturedResponse = response;
       const capturedRequestBytes = finalBodyStr.length;
       const capturedAccountLabel = account.label;
-      const capturedAccountKey = account.key;
 
       telemetryDone = Promise.all([telemetry, clientCapture, streamOutcome])
         .then(([data, clientBody, rawOutcome]) => {
@@ -7512,118 +7541,46 @@ function attachAnthropicSuccessStreamTelemetry(args: {
             account,
             logAttempt,
           );
-          capturedTracer.setUsage({
-            inputTokens: data.usage.inputTokens,
-            outputTokens: data.usage.outputTokens,
-            cacheCreationTokens: data.usage.cacheCreationInputTokens,
-            ...oneHourCacheWriteFields(data.usage.cacheCreation1hInputTokens),
-            cacheReadTokens: data.usage.cacheReadInputTokens,
-          });
+          const usage = streamUsageFields(data.usage);
+          capturedTracer.setUsage(usage);
           // Bill the borrowing grant from the same totals. A stream's usage is
           // only final at message_delta, which is exactly here.
-          settleBorrowedRequest(capturedAccountKey, data.model, {
-            inputTokens: data.usage.inputTokens,
-            outputTokens: data.usage.outputTokens,
-            cacheCreationTokens: data.usage.cacheCreationInputTokens,
-            cacheReadTokens: data.usage.cacheReadInputTokens,
-          });
-          recordLeasedAccountSpend(capturedAccountLabel, data.model, {
-            inputTokens: data.usage.inputTokens,
-            outputTokens: data.usage.outputTokens,
-            cacheCreationTokens: data.usage.cacheCreationInputTokens,
-            cacheReadTokens: data.usage.cacheReadInputTokens,
-          });
+          settleStreamSpend(account, data.model, usage);
           capturedTracer.logStreamEvents(data.events);
           capturedTracer.setResponseInfo(responseInfoFromStream(data));
-          const rateLimit5h = parseFloat(
-            capturedResponse.headers.get(
-              "anthropic-ratelimit-unified-5h-utilization",
-            ) ?? "",
-          );
-          const rateLimit7d = parseFloat(
-            capturedResponse.headers.get(
-              "anthropic-ratelimit-unified-7d-utilization",
-            ) ?? "",
-          );
-          const usageUpdate: Parameters<typeof capturedTracer.setUsage>[0] = {
-            inputTokens: data.usage.inputTokens,
-            outputTokens: data.usage.outputTokens,
-            cacheCreationTokens: data.usage.cacheCreationInputTokens,
-            ...oneHourCacheWriteFields(data.usage.cacheCreation1hInputTokens),
-            cacheReadTokens: data.usage.cacheReadInputTokens,
-          };
-          if (!isNaN(rateLimit5h)) {
-            usageUpdate.rateLimitAfter5h = rateLimit5h;
-          }
-          if (!isNaN(rateLimit7d)) {
-            usageUpdate.rateLimitAfter7d = rateLimit7d;
-          }
-          if (!isNaN(rateLimit5h) || !isNaN(rateLimit7d)) {
-            capturedTracer.setUsage(usageUpdate);
-          }
+          setRateLimitUsage(capturedTracer, capturedResponse, data.usage);
 
           capturedTracer.logUpstreamResponseBody(data.rawText ?? "");
-          capturedTracer.recordMetrics();
           capturedTracer.recordBodySizes(
             capturedRequestBytes,
             data.totalBytesReceived,
           );
           capturedUpstreamSpan?.end();
           const failure = getStreamFailureDetails(terminalOutcome);
-          const usage = {
-            inputTokens: data.usage.inputTokens,
-            outputTokens: data.usage.outputTokens,
-            cacheCreationTokens: data.usage.cacheCreationInputTokens,
-            ...oneHourCacheWriteFields(data.usage.cacheCreation1hInputTokens),
-            cacheReadTokens: data.usage.cacheReadInputTokens,
-          };
           if (failure) {
             capturedTracer.setError(failure.errorType, failure.message);
-            capturedTracer.end(failure.status, Date.now() - requestStartTime);
-            logFinalRequest(
-              failure.status,
-              capturedAccountLabel,
-              account.type,
-              failure.errorType,
-              failure.message,
-              usage,
-            );
-          } else {
-            capturedTracer.end(200, Date.now() - requestStartTime);
-            logFinalRequest(
-              200,
-              capturedAccountLabel,
-              account.type,
-              undefined,
-              undefined,
-              usage,
-            );
           }
-          logProxyBody({
-            phase: "upstream_response",
+          capturedTracer.end(
+            failure?.status ?? 200,
+            Date.now() - requestStartTime,
+          );
+          logStreamFinal(
+            logFinalRequest,
+            failure,
+            capturedAccountLabel,
+            account.type,
+            usage,
+          );
+          logStreamBodies({
+            logProxyBody,
             headers: responseHeaders,
-            body: data.rawText ?? "",
-            sourceTruncated: data.rawTextTruncated,
-            bodySize: data.totalBytesReceived,
-            contentType: responseHeaders["content-type"] ?? "text/event-stream",
+            data,
+            clientBody,
             account: capturedAccountLabel,
             accountType: account.type,
             attempt: attemptNumber,
             responseStatus: 200,
-            durationMs: Date.now() - requestStartTime,
-          });
-          logProxyBody({
-            phase: "client_response",
-            headers: responseHeaders,
-            body: clientBody.text,
-            sourceTruncated: clientBody.truncated,
-            bodySize: clientBody.totalBytes,
-            contentType: responseHeaders["content-type"] ?? "text/event-stream",
-            account: capturedAccountLabel,
-            accountType: account.type,
-            attempt: attemptNumber,
-            responseStatus: 200,
-            durationMs: Date.now() - requestStartTime,
+            requestStartTime,
           });
         })
         .catch((error) => {
@@ -7679,7 +7636,6 @@ function attachAnthropicSuccessStreamTelemetry(args: {
         });
       streamSource = streamSource.pipeThrough(noTracerInterceptor);
       const capturedAccountLabel = account.label;
-      const capturedAccountKey = account.key;
       telemetryDone = Promise.all([
         noTracerTelemetry,
         clientCapture,
@@ -7698,61 +7654,27 @@ function attachAnthropicSuccessStreamTelemetry(args: {
             logAttempt,
           );
           const failure = getStreamFailureDetails(terminalOutcome);
-          const usage = {
-            inputTokens: data.usage.inputTokens,
-            outputTokens: data.usage.outputTokens,
-            cacheCreationTokens: data.usage.cacheCreationInputTokens,
-            ...oneHourCacheWriteFields(data.usage.cacheCreation1hInputTokens),
-            cacheReadTokens: data.usage.cacheReadInputTokens,
-          };
+          const usage = streamUsageFields(data.usage);
           // Settled on the untraced path too: whether telemetry is exported has
           // nothing to do with whether a borrower should be charged.
-          settleBorrowedRequest(capturedAccountKey, data.model, usage);
-          recordLeasedAccountSpend(capturedAccountLabel, data.model, usage);
-          if (failure) {
-            logFinalRequest(
-              failure.status,
-              capturedAccountLabel,
-              account.type,
-              failure.errorType,
-              failure.message,
-              usage,
-            );
-          } else {
-            logFinalRequest(
-              200,
-              capturedAccountLabel,
-              account.type,
-              undefined,
-              undefined,
-              usage,
-            );
-          }
-          logProxyBody({
-            phase: "upstream_response",
+          settleStreamSpend(account, data.model, usage);
+          logStreamFinal(
+            logFinalRequest,
+            failure,
+            capturedAccountLabel,
+            account.type,
+            usage,
+          );
+          logStreamBodies({
+            logProxyBody,
             headers: responseHeaders,
-            body: data.rawText ?? "",
-            sourceTruncated: data.rawTextTruncated,
-            bodySize: data.totalBytesReceived,
-            contentType: responseHeaders["content-type"] ?? "text/event-stream",
+            data,
+            clientBody,
             account: capturedAccountLabel,
             accountType: account.type,
             attempt: attemptNumber,
             responseStatus: 200,
-            durationMs: Date.now() - requestStartTime,
-          });
-          logProxyBody({
-            phase: "client_response",
-            headers: responseHeaders,
-            body: clientBody.text,
-            sourceTruncated: clientBody.truncated,
-            bodySize: clientBody.totalBytes,
-            contentType: responseHeaders["content-type"] ?? "text/event-stream",
-            account: capturedAccountLabel,
-            accountType: account.type,
-            attempt: attemptNumber,
-            responseStatus: 200,
-            durationMs: Date.now() - requestStartTime,
+            requestStartTime,
           });
         })
         .catch((error) => {
@@ -7954,7 +7876,6 @@ async function handleAnthropicJsonSuccessResponse(args: {
       }
     }
     tracer.setResponseInfo(extractResponseInfo(responseJson));
-    tracer.recordMetrics();
     const responseJsonStr = JSON.stringify(responseJson);
     tracer.recordBodySizes(finalBodyStr.length, responseJsonStr.length);
     upstreamSpan?.end();
@@ -8130,7 +8051,6 @@ async function handleAnthropicSuccessfulNonStreamRetryResponse(args: {
       });
     }
     tracer.setResponseInfo(extractResponseInfo(retryJson));
-    tracer.recordMetrics();
     const retryJsonStr = JSON.stringify(retryJson);
     tracer.recordBodySizes(finalBodyStr.length, retryJsonStr.length);
     upstreamSpan?.end();
@@ -11987,7 +11907,7 @@ export function createClaudeProxyRoutes(
             : modelRouter;
           return withSpan(
             {
-              name: "neurolink.http.claudeProxy.listModels",
+              name: "http.claudeProxy.listModels",
               tracer: tracers.http,
               attributes: { "http.route": `${basePath}/v1/models` },
             },
@@ -12007,7 +11927,7 @@ export function createClaudeProxyRoutes(
         handler: async (ctx: ServerContext) =>
           withSpan(
             {
-              name: "neurolink.http.claudeProxy.countTokens",
+              name: "http.claudeProxy.countTokens",
               tracer: tracers.http,
               attributes: {
                 "http.route": `${basePath}/v1/messages/count_tokens`,
@@ -12039,7 +11959,7 @@ export function createClaudeProxyRoutes(
 
               const inputTokens = Math.ceil(text.length / 4);
               span.setAttribute("ai.model", body.model);
-              span.setAttribute("gen_ai.usage.input_tokens", inputTokens);
+              span.setAttribute("ai.tokens.input", inputTokens);
               return { input_tokens: inputTokens };
             },
           ),
@@ -12080,7 +12000,7 @@ export function createClaudeProxyRoutes(
           const accountFilter = ctx.query?.account;
           return withSpan(
             {
-              name: "neurolink.http.claudeProxy.limits",
+              name: "http.claudeProxy.limits",
               tracer: tracers.http,
               attributes: { "http.route": `${basePath}/limits` },
             },

@@ -206,12 +206,15 @@ Get observability configuration
 
 > **isTelemetryEnabled**(): `boolean`
 
-Check if Langfuse telemetry is enabled
-Centralized utility to avoid duplication across providers
-
 ##### Returns
 
 `boolean`
+
+`true` when OpenTelemetry is initialized or a Langfuse exporter is running.
+
+##### Description
+
+Reports whether any tracing backend is active.
 
 ---
 
@@ -219,7 +222,7 @@ Centralized utility to avoid duplication across providers
 
 > **getTelemetryStatus**(): `object`
 
-Get comprehensive telemetry status including Langfuse, OTel, and exporter health
+Get comprehensive telemetry status including Langfuse and OpenTelemetry state
 
 ##### Returns
 
@@ -260,10 +263,6 @@ Get comprehensive telemetry status including Langfuse, OTel, and exporter health
 ###### openTelemetry.serviceName?
 
 > `optional` **serviceName?**: `string`
-
-###### exporters?
-
-> `optional` **exporters?**: `object`[]
 
 ---
 
@@ -3672,10 +3671,8 @@ Create a worker-mode NeuroLink instance for sub-agent execution.
 
 Worker mode is the framework-provided version of the config block every
 consumer used to copy by hand: conversation memory OFF, orchestration
-OFF, observability inherited from this instance with
-`autoDetectExternalProvider: true` + `skipLangfuseSpanProcessor: true`
-(worker spans join the host's tracer without duplicate Langfuse
-exports), credentials inherited, the host's tool registry shared (so
+OFF, observability inherited from this instance (worker spans join the
+host's tracer provider), credentials inherited, the host's tool registry shared (so
 worker tool calls reuse the host's connections), and an internal log
 bridge attached with a caller-supplied tag.
 

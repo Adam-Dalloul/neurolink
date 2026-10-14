@@ -528,7 +528,7 @@ export function createMemoryRoutes(basePath: string = "/api"): RouteGroup {
         method: "GET",
         path: `${basePath}/memory/sessions/:id/messages`,
         handler: tracedMemoryHandler(
-          "neurolink.http.memory.getSessionMessages",
+          "http.memory.getSessionMessages",
           `${basePath}/memory/sessions/:id/messages`,
           handleGetSessionMessages,
         ),
@@ -540,7 +540,7 @@ export function createMemoryRoutes(basePath: string = "/api"): RouteGroup {
         method: "GET",
         path: `${basePath}/memory/sessions/:id`,
         handler: tracedMemoryHandler(
-          "neurolink.http.memory.getSession",
+          "http.memory.getSession",
           `${basePath}/memory/sessions/:id`,
           handleGetSession,
         ),
@@ -552,7 +552,7 @@ export function createMemoryRoutes(basePath: string = "/api"): RouteGroup {
         method: "GET",
         path: `${basePath}/memory/sessions`,
         handler: tracedMemoryHandler(
-          "neurolink.http.memory.listSessions",
+          "http.memory.listSessions",
           `${basePath}/memory/sessions`,
           handleListSessions,
         ),
@@ -563,7 +563,7 @@ export function createMemoryRoutes(basePath: string = "/api"): RouteGroup {
         method: "GET",
         path: `${basePath}/memory/stats`,
         handler: tracedMemoryHandler(
-          "neurolink.http.memory.stats",
+          "http.memory.stats",
           `${basePath}/memory/stats`,
           handleGetStats,
         ),
@@ -574,7 +574,7 @@ export function createMemoryRoutes(basePath: string = "/api"): RouteGroup {
         method: "DELETE",
         path: `${basePath}/memory/sessions/:sessionId`,
         handler: tracedMemoryHandler(
-          "neurolink.http.memory.clearSession",
+          "http.memory.clearSession",
           `${basePath}/memory/sessions/:sessionId`,
           handleClearSession,
         ),
@@ -585,7 +585,7 @@ export function createMemoryRoutes(basePath: string = "/api"): RouteGroup {
         method: "DELETE",
         path: `${basePath}/memory/sessions`,
         handler: tracedMemoryHandler(
-          "neurolink.http.memory.clearAllSessions",
+          "http.memory.clearAllSessions",
           `${basePath}/memory/sessions`,
           handleClearAllSessions,
         ),
@@ -596,7 +596,7 @@ export function createMemoryRoutes(basePath: string = "/api"): RouteGroup {
         method: "GET",
         path: `${basePath}/memory/health`,
         handler: tracedMemoryHandler(
-          "neurolink.http.memory.health",
+          "http.memory.health",
           `${basePath}/memory/health`,
           handleMemoryHealth,
         ),

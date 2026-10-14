@@ -386,14 +386,11 @@ export class MCPToolRegistry extends MCPRegistry {
 
     return withSpan(
       {
-        name: "neurolink.tool.registry.execute",
+        name: "tool.registry.execute",
         tracer: tracers.mcp,
         attributes: {
-          [ATTR.GEN_AI_TOOL_NAME]: toolName,
+          "tool.name": toolName,
           [ATTR.MCP_SERVER_ID]: preResolvedServerId || "builtin",
-          // Curator P1-3: registry-level wrapper — duplicates ai.toolCall in
-          // Langfuse. Retained for OTel/metrics; skipped for Langfuse export.
-          "langfuse.internal": true,
         },
       },
       async (span) => {

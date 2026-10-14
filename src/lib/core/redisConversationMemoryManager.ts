@@ -3,7 +3,7 @@
  * Redis-based implementation of conversation storage with same interface as ConversationMemoryManager
  */
 
-import { SpanKind, SpanStatusCode } from "@opentelemetry/api";
+import { context, SpanKind, SpanStatusCode } from "@opentelemetry/api";
 import { tracers } from "../telemetry/tracers.js";
 import { randomUUID } from "crypto";
 import { MESSAGES_PER_TURN } from "../config/conversationMemory.js";
@@ -34,7 +34,6 @@ import {
   buildContextFromPointer,
   getEffectiveTokenThreshold,
 } from "../utils/conversationMemory.js";
-import { runWithCurrentLangfuseContext } from "../services/server/ai/observability/instrumentation.js";
 import { logger } from "../utils/logger.js";
 import {
   assistantTurnIdentity,
@@ -116,7 +115,7 @@ export class RedisConversationMemoryManager implements IConversationMemoryManage
     }
 
     await redisTracer.startActiveSpan(
-      "neurolink.memory.initialize",
+      "memory.initialize",
       {
         kind: SpanKind.CLIENT,
         attributes: {
@@ -231,7 +230,7 @@ export class RedisConversationMemoryManager implements IConversationMemoryManage
     const redisClient = this.redisClient;
 
     return redisTracer.startActiveSpan(
-      "neurolink.memory.getSession",
+      "memory.getSession",
       { kind: SpanKind.CLIENT, attributes: { "session.id": sessionId } },
       async (span) => {
         if (userId) {
@@ -574,7 +573,7 @@ export class RedisConversationMemoryManager implements IConversationMemoryManage
 
     // NLK-GAP-012: Add span for storeTurn CRUD operation
     return redisTracer.startActiveSpan(
-      "neurolink.memory.storeTurn",
+      "memory.storeTurn",
       {
         kind: SpanKind.CLIENT,
         attributes: {
@@ -616,10 +615,8 @@ export class RedisConversationMemoryManager implements IConversationMemoryManage
           if (!conversation) {
             const titleGenerationKey = `${options.sessionId}:${normalizedUserId}`;
 
-            // Capture the current Langfuse ALS context before setImmediate,
-            // which breaks automatic AsyncLocalStorage propagation and would
-            // otherwise cause orphaned traces in Langfuse.
-            const generateTitleWithContext = runWithCurrentLangfuseContext(
+            const generateTitleWithContext = context.bind(
+              context.active(),
               async () => {
                 if (this.titleGenerationInProgress.has(titleGenerationKey)) {
                   return;
@@ -772,10 +769,8 @@ export class RedisConversationMemoryManager implements IConversationMemoryManage
 
             // Only trigger summarization if not already in progress for this session
             if (!this.summarizationInProgress.has(summarizationKey)) {
-              // Capture the current Langfuse ALS context before setImmediate,
-              // which breaks automatic AsyncLocalStorage propagation and would
-              // otherwise cause orphaned traces in Langfuse.
-              const summarizeWithContext = runWithCurrentLangfuseContext(
+              const summarizeWithContext = context.bind(
+                context.active(),
                 async () => {
                   try {
                     await this.checkAndSummarize(
@@ -1123,7 +1118,7 @@ export class RedisConversationMemoryManager implements IConversationMemoryManage
 
     // NLK-GAP-012: Add span for buildContext CRUD operation
     return redisTracer.startActiveSpan(
-      "neurolink.memory.buildContext",
+      "memory.buildContext",
       {
         kind: SpanKind.CLIENT,
         attributes: {
@@ -1797,7 +1792,7 @@ User message: "${userMessage}"`;
 
     // NLK-GAP-012: Add span for clearSession CRUD operation
     return redisTracer.startActiveSpan(
-      "neurolink.memory.clear",
+      "memory.clear",
       {
         kind: SpanKind.CLIENT,
         attributes: {

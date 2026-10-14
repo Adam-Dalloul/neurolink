@@ -162,10 +162,10 @@ await test("resolves a near-miss name, actually invokes the resolved tool, and r
 
     const repairSpan = spans
       .finished()
-      .find((s) => s.name === "neurolink.mcp.toolNameRepair");
+      .find((s) => s.name === "mcp.toolNameRepair");
     assert(
       repairSpan !== undefined,
-      "no neurolink.mcp.toolNameRepair span was recorded for the repair",
+      "no mcp.toolNameRepair span was recorded for the repair",
     );
     const attrs = repairSpan!.attributes;
     assertEqual(
@@ -195,7 +195,7 @@ await test("an exact tool name is executed unchanged with no repair span", () =>
     assertEqual(textOf(result), "ran:search_code:exact");
     const repairSpan = spans
       .finished()
-      .find((s) => s.name === "neurolink.mcp.toolNameRepair");
+      .find((s) => s.name === "mcp.toolNameRepair");
     assert(
       repairSpan === undefined,
       "an exact-name call must not be recorded as a repair (would change existing-caller behaviour)",
@@ -297,7 +297,7 @@ await test("an over-limit requested name fails closed with candidates in registr
 
     const repairSpan = spans
       .finished()
-      .find((s) => s.name === "neurolink.mcp.toolNameRepair");
+      .find((s) => s.name === "mcp.toolNameRepair");
     assert(
       repairSpan === undefined,
       "no repair should have been recorded — an unresolved over-limit name must not silently execute any tool",

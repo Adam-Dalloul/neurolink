@@ -16,6 +16,14 @@
 
 ---
 
+### generation?
+
+> `optional` **generation?**: [`GenerationRecord`](GenerationRecord.md)
+
+The request half of this step's generation observation.
+
+---
+
 ### hydratedToolNames?
 
 > `optional` **hydratedToolNames?**: `string`[]

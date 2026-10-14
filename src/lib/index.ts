@@ -379,56 +379,20 @@ export { NeuroLink };
 
 // Observability configuration types
 
-export { buildObservabilityConfigFromEnv } from "./utils/observabilityHelpers.js";
-
 import {
-  createContextEnricher,
   flushOpenTelemetry,
-  // Enhanced context and tracing
-  getLangfuseContext,
   getLangfuseHealthStatus,
-  getLangfuseSpanProcessor,
-  // NEW EXPORTS - External TracerProvider Support
-  getSpanProcessors,
-  getTracer,
-  getTracerProvider,
-  initializeOpenTelemetry,
-  isLangfuseInternalSpan,
   isOpenTelemetryInitialized,
-  isUsingExternalTracerProvider,
-  langfuseShouldExportSpan,
-  runWithCurrentLangfuseContext,
   setLangfuseContext,
   shutdownOpenTelemetry,
 } from "./services/server/ai/observability/instrumentation.js";
 
-import {
-  getTelemetryStatus as getStatus,
-  initializeTelemetry as init,
-} from "./telemetry/index.js";
-
 export {
-  initializeOpenTelemetry,
   shutdownOpenTelemetry,
   flushOpenTelemetry,
   getLangfuseHealthStatus,
   setLangfuseContext,
-  getLangfuseSpanProcessor,
-  getTracerProvider,
   isOpenTelemetryInitialized,
-  // NEW EXPORTS - External TracerProvider Support
-  getSpanProcessors,
-  createContextEnricher,
-  isUsingExternalTracerProvider,
-  // Host-processor filter helpers — reuse NeuroLink's internal-span filtering
-  // when the host app registers its own LangfuseSpanProcessor.
-  isLangfuseInternalSpan,
-  langfuseShouldExportSpan,
-  // Enhanced context and tracing
-  getLangfuseContext,
-  getTracer,
-  // ALS context propagation helper
-  runWithCurrentLangfuseContext,
 };
 
 // Analytics Middleware exports
@@ -446,6 +410,11 @@ export { MiddlewareFactory } from "./middleware/factory.js";
 export { tool, jsonSchema, stepCountIs } from "./utils/tool.js";
 export { ExporterRegistry } from "./observability/exporterRegistry.js";
 export { NoOpExporter } from "./observability/exporters/baseExporter.js";
+export {
+  createExporterSpanProcessor,
+  ExporterSpanProcessor,
+} from "./observability/exporterSpanProcessor.js";
+export { LangfuseExporter } from "./observability/exporters/langfuseExporter.js";
 // Observability modules and types
 export {
   getMetricsAggregator,
@@ -802,34 +771,6 @@ export {
 } from "./core/toolRoutingEmbedding.js";
 
 // ============================================================================
-// REAL-TIME SERVICES & TELEMETRY - Enterprise Platform Features
-// ============================================================================
-
-// Real-time Services (Phase 1) - Basic SSE functionality only
-// export { createEnhancedChatService } from './chat/index.js';
-// export type * from './services/types.js';
-
-// Optional Telemetry (Phase 2) - Telemetry service initialization
-export async function initializeTelemetry(): Promise<boolean> {
-  try {
-    const result = await init();
-    return !!result;
-  } catch {
-    return false;
-  }
-}
-
-export async function getTelemetryStatus(): Promise<{
-  enabled: boolean;
-  initialized: boolean;
-  endpoint?: string;
-  service?: string;
-  version?: string;
-}> {
-  return getStatus();
-}
-
-// ============================================================================
 // EVALUATION SYSTEM - Comprehensive Response Evaluation & Scoring
 // ============================================================================
 
@@ -887,7 +828,6 @@ export {
   contextToErrorContext,
   // Hooks
   createLangfuseAdapter,
-  createMockLangfuseClient,
   startLangfuseAdapter,
   createConsoleLoggerHook,
   createMetricsCollectorHook,

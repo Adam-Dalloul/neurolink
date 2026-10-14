@@ -1636,7 +1636,7 @@ export async function processUnifiedFilesArray(
 
   return withSpan(
     {
-      name: "neurolink.file.process_all",
+      name: "file.process_all",
       tracer: tracers.file,
       attributes: {
         [ATTR.FILE_TOTAL_COUNT]: totalFiles,

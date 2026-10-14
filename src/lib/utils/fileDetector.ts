@@ -347,7 +347,7 @@ export class FileDetector {
 
     return withSpan(
       {
-        name: "neurolink.file.detect_and_process",
+        name: "file.detect_and_process",
         tracer: tracers.file,
         attributes: {
           [ATTR.FILE_NAME]: inputFilename,

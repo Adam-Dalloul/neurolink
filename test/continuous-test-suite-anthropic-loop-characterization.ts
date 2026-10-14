@@ -573,7 +573,7 @@ section("retry telemetry");
 await test("a native loop turn records the provider attempt count on the active span", async () => {
   // Before this loop moved onto the shared engine it called
   //   withProviderRetry(fn, trace.getActiveSpan() ?? undefined, label)
-  // and withProviderRetry writes gen_ai.provider.total_attempts on that span
+  // and withProviderRetry writes provider.total_attempts on that span
   // after every completed attempt, retried or not. The engine passed
   // `undefined` in its place, so the attribute stopped being emitted for
   // every native Anthropic turn — invisibly, because nothing asserted on it.
@@ -587,7 +587,7 @@ await test("a native loop turn records the provider attempt count on the active 
   const counter = { calls: 0 };
   spanExporter.reset();
   // The turn runs under a span of the caller's own, so the assertions below
-  // can tell this turn's `neurolink.stream` span from any other span that
+  // can tell this turn's `stream` span from any other span that
   // happens to share the name.
   let callerSpanId = "";
   try {
@@ -618,7 +618,7 @@ await test("a native loop turn records the provider attempt count on the active 
     restore();
     await server.close();
   }
-  const ATTR = "gen_ai.provider.total_attempts";
+  const ATTR = "provider.total_attempts";
   const carrying = spanExporter
     .getFinishedSpans()
     .filter((span: ReadableSpan) => span.attributes[ATTR] !== undefined);
@@ -636,23 +636,29 @@ await test("a native loop turn records the provider attempt count on the active 
     "no span carries the provider attempt count, so the loop is not passing one",
   );
   // Named, not merely present. The attribute lands on the turn's own
-  // `neurolink.stream` span — the one the SDK opens around the request, which
+  // `stream` span — the one NeuroLink opens around the request, which
   // is what `trace.getActiveSpan()` resolves to when the client hands its span
   // to the loop. Pinning the name is what stops this passing on an attribute
   // some unrelated provider path wrote on a different span.
   //
   // The call is wrapped in the test's own `startActiveSpan`, but the attribute
-  // does not land on that wrapper: the SDK opens `neurolink.stream` beneath it
+  // does not land on that wrapper: NeuroLink opens `stream` beneath it
   // and the loop is handed that child, so the wrapper stays bare. Parentage is
   // therefore what ties the carrying span to THIS turn: it must be the one
-  // `neurolink.stream` span whose parent is the caller's span, not merely any
+  // `stream` span whose parent is the caller's span, not merely any
   // span of that name.
   assert(
-    carrying.length === 1 && carrying[0].name === "neurolink.stream",
+    carrying.length === 1 && carrying[0].name === "stream.attempt",
     "the attempt count was recorded on some span other than the turn's own",
   );
+  const root = spanExporter
+    .getFinishedSpans()
+    .find(
+      (span: ReadableSpan) =>
+        span.spanContext().spanId === carrying[0].parentSpanContext?.spanId,
+    );
   assert(
-    carrying[0].parentSpanContext?.spanId === callerSpanId,
+    root?.name === "stream" && root.parentSpanContext?.spanId === callerSpanId,
     "the span carrying the attempt count is not this caller's turn span",
   );
   // Every step of a clean turn succeeds first try, so each recorded count is 1.
@@ -1028,19 +1034,18 @@ async function startHoldingStandIn(
 }
 
 /**
- * The value handed to `resolveFinish`, observed where it is actually
- * consumed. The deferred finish promise is not on `StreamResult`, but the
- * provider span reads it and records it verbatim, so the attribute IS the
- * promise's resolution.
+ * The Langfuse level of every `anthropic.generation` span. A finish reason
+ * that is not a normal stop reaches Langfuse only as a WARNING level.
  */
-function finishReasonsOnProviderSpans(): string[] {
+function generationLevels(): string[] {
   return spanExporter
     .getFinishedSpans()
     .filter(
-      (span: ReadableSpan) => span.name === "neurolink.provider.streamText",
+      (span: ReadableSpan) =>
+        span.attributes["langfuse.observation.type"] === "generation",
     )
     .map((span: ReadableSpan) =>
-      String(span.attributes["gen_ai.response.finish_reason"]),
+      String(span.attributes["langfuse.observation.level"] ?? "DEFAULT"),
     );
 }
 
@@ -1091,7 +1096,7 @@ await test("a caller abort mid-stream is reported as an aborted turn, not a norm
   }
   // The span ends inside the finish promise's continuation.
   await new Promise((resolve) => setTimeout(resolve, 50));
-  const finishes = finishReasonsOnProviderSpans();
+  const finishes = generationLevels();
   console.log(
     `    [diagnostic] abort mid-stream: text=${JSON.stringify(streamed)} stopReason=${String(stopReason)} finishReason=${String(finishReason)} threw=${String(threw)} spanFinish=${finishes.join(",")}`,
   );
@@ -1108,8 +1113,8 @@ await test("a caller abort mid-stream is reported as an aborted turn, not a norm
     `an aborted turn must report finishReason "other", reported ${String(finishReason)}`,
   );
   assert(
-    finishes.length === 1 && finishes[0] === "other",
-    `the resolved finish reason must be "other", was ${finishes.join(",") || "(none)"}`,
+    finishes.length === 1 && finishes[0] === "WARNING",
+    "the generation span must carry exactly one WARNING level for the aborted turn",
   );
 });
 
@@ -1149,7 +1154,7 @@ await test("a turn that outlives turnTimeoutMs is reported as a time limit, not 
     await server.close();
   }
   await new Promise((resolve) => setTimeout(resolve, 50));
-  const finishes = finishReasonsOnProviderSpans();
+  const finishes = generationLevels();
   console.log(
     `    [diagnostic] turnTimeoutMs 200: text=${JSON.stringify(streamed)} stopReason=${String(stopReason)} finishReason=${String(finishReason)} threw=${String(threw)} spanFinish=${finishes.join(",")}`,
   );
@@ -1162,8 +1167,8 @@ await test("a turn that outlives turnTimeoutMs is reported as a time limit, not 
     `a timed-out turn must report finishReason "other", reported ${String(finishReason)}`,
   );
   assert(
-    finishes.length === 1 && finishes[0] === "other",
-    "the provider span did not record exactly one finish reason of other for the timed-out turn",
+    finishes.length === 1 && finishes[0] === "WARNING",
+    "the generation span did not carry exactly one WARNING level for the timed-out turn",
   );
 });
 
@@ -1197,7 +1202,7 @@ await test("a turn the model ended itself still reports a plain stop", async () 
     await server.close();
   }
   await new Promise((resolve) => setTimeout(resolve, 50));
-  const finishes = finishReasonsOnProviderSpans();
+  const finishes = generationLevels();
   console.log(
     `    [diagnostic] clean turn: text=${JSON.stringify(streamed)} stopReason=${String(stopReason)} finishReason=${String(finishReason)} spanFinish=${finishes.join(",")}`,
   );
@@ -1214,8 +1219,8 @@ await test("a turn the model ended itself still reports a plain stop", async () 
     `a clean turn must not claim an interrupted stopReason, claimed ${String(stopReason)}`,
   );
   assert(
-    finishes.length === 1 && finishes[0] === "end_turn",
-    `a clean turn must resolve its provider stop reason verbatim, resolved ${finishes.join(",") || "(none)"}`,
+    finishes.length === 1 && finishes[0] === "DEFAULT",
+    "a clean turn must leave its single generation span at the default level",
   );
 });
 

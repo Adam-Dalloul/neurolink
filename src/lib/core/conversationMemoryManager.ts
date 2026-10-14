@@ -11,7 +11,7 @@ import {
 } from "../config/conversationMemory.js";
 import { TokenUtils } from "../constants/tokens.js";
 import { SummarizationEngine } from "../context/summarizationEngine.js";
-import { runWithCurrentLangfuseContext } from "../services/server/ai/observability/instrumentation.js";
+import { context } from "@opentelemetry/api";
 import { tracers, withSpan } from "../telemetry/index.js";
 import type {
   ChatMessage,
@@ -103,7 +103,7 @@ export class ConversationMemoryManager implements IConversationMemoryManager {
   ): Promise<void> {
     return withSpan(
       {
-        name: "neurolink.memory.storeTurn",
+        name: "memory.storeTurn",
         tracer: tracers.memory,
         attributes: {
           "memory.type": "in-memory",
@@ -177,10 +177,8 @@ export class ConversationMemoryManager implements IConversationMemoryManager {
           if (shouldSummarize) {
             // Only trigger summarization if not already in progress for this session
             if (!this.summarizationInProgress.has(options.sessionId)) {
-              // Capture the current Langfuse ALS context before setImmediate,
-              // which breaks automatic AsyncLocalStorage propagation and would
-              // otherwise cause orphaned traces in Langfuse.
-              const summarizeWithContext = runWithCurrentLangfuseContext(
+              const summarizeWithContext = context.bind(
+                context.active(),
                 async () => {
                   try {
                     await this.checkAndSummarize(
@@ -340,7 +338,7 @@ export class ConversationMemoryManager implements IConversationMemoryManager {
   ): Promise<ChatMessage[]> {
     return withSpan(
       {
-        name: "neurolink.memory.buildContext",
+        name: "memory.buildContext",
         tracer: tracers.memory,
         attributes: {
           "memory.type": "in-memory",
@@ -494,7 +492,7 @@ export class ConversationMemoryManager implements IConversationMemoryManager {
   public async clearSession(sessionId: string): Promise<boolean> {
     return withSpan(
       {
-        name: "neurolink.memory.clear",
+        name: "memory.clear",
         tracer: tracers.memory,
         attributes: {
           "memory.type": "in-memory",

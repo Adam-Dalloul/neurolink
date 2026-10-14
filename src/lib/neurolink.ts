@@ -24,7 +24,16 @@ import { loadProcessDotenv } from "./utils/dotenvBootstrap.js";
 
 await loadProcessDotenv();
 
-import { SpanKind, SpanStatusCode, context, trace } from "@opentelemetry/api";
+import {
+  type Context,
+  type Span,
+  SpanKind,
+  SpanStatusCode,
+  context,
+  trace,
+} from "@opentelemetry/api";
+import { getPropagatedAttributesFromContext } from "@langfuse/core";
+import { LangfuseOtelSpanAttributes } from "@langfuse/tracing";
 import { AsyncLocalStorage } from "async_hooks";
 import { EventEmitter } from "events";
 import pLimit from "p-limit";
@@ -182,6 +191,8 @@ import type {
   BackgroundCommandStatus,
   GitToolResult,
   GitToolsetOptions,
+  ObservationAttributes,
+  ObservationLevel,
 } from "./types/index.js";
 import { emergencyContentTruncation } from "./context/emergencyTruncation.js";
 import {
@@ -324,15 +335,14 @@ import { withSpan } from "./telemetry/withSpan.js";
 import { getActiveTraceContext } from "./telemetry/traceContext.js";
 import { calculateCost } from "./utils/pricing.js";
 import {
+  acquireTelemetry,
+  ensureTelemetry,
   flushOpenTelemetry,
-  getLangfuseContext,
   getLangfuseHealthStatus,
-  initializeOpenTelemetry,
   isOpenTelemetryInitialized,
-  runWithCurrentLangfuseContext,
+  releaseTelemetry,
   setLangfuseContext,
-  shutdownOpenTelemetry,
-  stampGuestRescueIdentity,
+  traceMetadataFromContext,
 } from "./services/server/ai/observability/instrumentation.js";
 import {
   clearChecklistState,
@@ -364,8 +374,20 @@ import {
 } from "./agent/gitTools.js";
 import { TaskManager } from "./tasks/taskManager.js";
 import { createTaskTools } from "./tasks/tools/taskTools.js";
-import { ATTR, spanJsonAttribute } from "./telemetry/attributes.js";
-import { tracers } from "./telemetry/tracers.js";
+import {
+  ATTR,
+  spanJsonAttribute,
+  spanModelRequestAttribute,
+} from "./telemetry/attributes.js";
+import { assistantMessages } from "./telemetry/chatMessages.js";
+import {
+  observationLevel,
+  observe,
+  observeTrace,
+  usageDetails,
+} from "./telemetry/observation.js";
+import { toolSpanName } from "./telemetry/observationNames.js";
+import { isNestedOperation, tracers } from "./telemetry/tracers.js";
 // Voice integration imports
 import type {
   STTCredentials,
@@ -765,6 +787,169 @@ function createTypedEmitter<
   return emitter as TypedEventEmitter<TEvents>;
 }
 
+function turnInput(
+  optionsOrPrompt: GenerateOptions | StreamOptions | DynamicOptions | string,
+): string {
+  if (typeof optionsOrPrompt === "string") {
+    return spanModelRequestAttribute({ prompt: optionsOrPrompt });
+  }
+  const options = optionsOrPrompt as GenerateOptions;
+  return spanModelRequestAttribute({
+    messages: options.conversationMessages,
+    prompt: options.input?.text,
+  });
+}
+
+function observeTurn(span: Span, attrs: ObservationAttributes): void {
+  observe(span, "agent", attrs);
+  if (!isNestedOperation(span)) {
+    observeTrace(span, { input: attrs.input, output: attrs.output });
+  }
+}
+
+function startTurn(
+  span: Span,
+  optionsOrPrompt: GenerateOptions | StreamOptions | DynamicOptions | string,
+): void {
+  observeTurn(span, { input: turnInput(optionsOrPrompt) });
+  if (typeof optionsOrPrompt !== "string") {
+    const name = (optionsOrPrompt as GenerateOptions).context?.observationName;
+    if (name) {
+      span.updateName(name);
+    }
+  }
+  if (!isNestedOperation(span)) {
+    observeTrace(span, {
+      metadata: traceMetadataFromContext(context.active()),
+    });
+  }
+}
+
+function failTurnSpan(span: Span, error: Error): void {
+  const message = error.message;
+  if (isAbortError(error)) {
+    observeTurn(span, {
+      output: message,
+      level: "WARNING",
+      statusMessage: message,
+    });
+    return;
+  }
+  span.recordException(error);
+  span.setStatus({ code: SpanStatusCode.ERROR, message });
+  observeTurn(span, {
+    output: message,
+    level: "ERROR",
+    statusMessage: message,
+  });
+}
+
+function traceTurnStream<T>(
+  result: { stream: AsyncIterable<T>; model?: string; finishReason?: string },
+  span: Span,
+  turnContext: Context,
+): AsyncIterableIterator<T> {
+  const iterator = result.stream[Symbol.asyncIterator]();
+  let output = "";
+  let ended = false;
+  let started = false;
+  const finish = (): void => {
+    ended = true;
+    span.end();
+  };
+  const end = (level?: ObservationLevel, statusMessage?: string): void => {
+    observeTurn(span, {
+      output: output ? assistantMessages(output) : undefined,
+      metadata: { model: result.model },
+      level,
+      statusMessage,
+    });
+    finish();
+  };
+  const close = async (): Promise<void> => {
+    if (ended) {
+      return;
+    }
+    try {
+      await context.with(turnContext, async () => {
+        await iterator.return?.();
+      });
+    } finally {
+      end(
+        "WARNING",
+        started
+          ? "stream closed by the consumer before it finished"
+          : "stream closed before first chunk",
+      );
+    }
+  };
+  const traced: AsyncIterableIterator<T> = {
+    async next(): Promise<IteratorResult<T>> {
+      if (ended) {
+        return { done: true, value: undefined };
+      }
+      started = true;
+      try {
+        const step = await context.with(turnContext, () => iterator.next());
+        if (step.done) {
+          span.setStatus({ code: SpanStatusCode.OK });
+          end(observationLevel(result.finishReason));
+          return { done: true, value: undefined };
+        }
+        const content =
+          typeof step.value === "object" && step.value !== null
+            ? (step.value as { content?: string }).content
+            : undefined;
+        if (typeof content === "string") {
+          output += content;
+        }
+        return step;
+      } catch (error) {
+        failTurnSpan(
+          span,
+          error instanceof Error ? error : new Error(String(error)),
+        );
+        finish();
+        throw error;
+      }
+    },
+    async return(): Promise<IteratorResult<T>> {
+      await close();
+      return { done: true, value: undefined };
+    },
+    async throw(error: Error): Promise<IteratorResult<T>> {
+      await close();
+      throw error;
+    },
+    [Symbol.asyncIterator]() {
+      return traced;
+    },
+  };
+  return traced;
+}
+
+function drainInContext<T>(
+  stream: AsyncIterable<T>,
+  drainContext: Context,
+): AsyncGenerator<T> {
+  return (async function* () {
+    const iterator = stream[Symbol.asyncIterator]();
+    try {
+      while (true) {
+        const step = await context.with(drainContext, () => iterator.next());
+        if (step.done) {
+          return;
+        }
+        yield step.value;
+      }
+    } finally {
+      await context.with(drainContext, async () => {
+        await iterator.return?.();
+      });
+    }
+  })();
+}
+
 /** Monotonic source for {@link NeuroLink.logInstanceId}. Process-local by design. */
 let neuroLinkInstanceCounter = 0;
 
@@ -1109,96 +1294,41 @@ export class NeuroLink {
   private skillsManagerInstance?: SkillsManager | null;
   private skillsConfig?: SkillsConfig;
 
-  /**
-   * Extract and set Langfuse context from options with proper async scoping
-   */
   private async setLangfuseContextFromOptions<T>(
     options: { context?: unknown },
     callback: () => Promise<T>,
   ): Promise<T> {
-    if (
-      options.context &&
-      typeof options.context === "object" &&
-      options.context !== null
-    ) {
-      let callbackExecuted = false;
-      try {
-        const ctx = options.context as Record<string, unknown>;
-        // Trigger context scoping if any meaningful Langfuse field is present
-        if (
-          ctx.userId ||
-          ctx.sessionId ||
-          ctx.conversationId ||
-          ctx.requestId ||
-          ctx.traceName ||
-          ctx.metadata
-        ) {
-          // Build customAttributes from top-level metadata string/number/boolean fields
-          let customAttributes:
-            | Record<string, string | number | boolean>
-            | undefined;
-          if (ctx.metadata && typeof ctx.metadata === "object") {
-            const metaObj = ctx.metadata as Record<string, unknown>;
-            const attrs: Record<string, string | number | boolean> = {};
-            for (const [k, v] of Object.entries(metaObj)) {
-              if (
-                typeof v === "string" ||
-                typeof v === "number" ||
-                typeof v === "boolean"
-              ) {
-                attrs[k] = v;
-              }
-            }
-            if (Object.keys(attrs).length > 0) {
-              customAttributes = attrs;
-            }
-          }
-
-          return await new Promise<T>((resolve, reject) => {
-            setLangfuseContext(
-              {
-                userId: typeof ctx.userId === "string" ? ctx.userId : null,
-                sessionId:
-                  typeof ctx.sessionId === "string" ? ctx.sessionId : null,
-                conversationId:
-                  typeof ctx.conversationId === "string"
-                    ? ctx.conversationId
-                    : null,
-                requestId:
-                  typeof ctx.requestId === "string" ? ctx.requestId : null,
-                traceName:
-                  typeof ctx.traceName === "string" ? ctx.traceName : null,
-                metadata:
-                  ctx.metadata && typeof ctx.metadata === "object"
-                    ? (ctx.metadata as Record<string, unknown>)
-                    : null,
-                ...(customAttributes !== undefined && { customAttributes }),
-              },
-              async () => {
-                try {
-                  callbackExecuted = true;
-                  const result = await callback();
-                  resolve(result);
-                } catch (error) {
-                  reject(error);
-                }
-              },
-            );
-          });
-        }
-      } catch (error) {
-        if (callbackExecuted) {
-          // Callback was executed inside Langfuse context but failed — do NOT retry
-          // Re-throw to avoid double API calls and preserve error context
-          throw error;
-        }
-        // Langfuse context setup itself failed — graceful degradation, run without context
-        logger.warn("Failed to set Langfuse context from options", {
-          error: error instanceof Error ? error.message : String(error),
-        });
-      }
+    if (!options.context || typeof options.context !== "object") {
+      return await callback();
     }
-    return await callback();
+    const ctx = options.context as Record<string, JsonValue>;
+    const outer = getPropagatedAttributesFromContext(context.active());
+    const unset = (key: string, value: JsonValue): string | undefined =>
+      typeof value === "string" && !outer[key] ? value : undefined;
+    return await setLangfuseContext(
+      {
+        userId: unset(LangfuseOtelSpanAttributes.TRACE_USER_ID, ctx.userId),
+        sessionId: unset(
+          LangfuseOtelSpanAttributes.TRACE_SESSION_ID,
+          ctx.sessionId,
+        ),
+        conversationId:
+          typeof ctx.conversationId === "string"
+            ? ctx.conversationId
+            : undefined,
+        requestId:
+          typeof ctx.requestId === "string" ? ctx.requestId : undefined,
+        traceName: unset(LangfuseOtelSpanAttributes.TRACE_NAME, ctx.traceName),
+        tags: Array.isArray(ctx.tags)
+          ? ctx.tags.filter((tag): tag is string => typeof tag === "string")
+          : undefined,
+        metadata:
+          ctx.metadata && typeof ctx.metadata === "object"
+            ? (ctx.metadata as Record<string, JsonValue>)
+            : undefined,
+      },
+      callback,
+    );
   }
 
   private createMetricsTraceContext(): {
@@ -1558,26 +1688,12 @@ export class NeuroLink {
     const credentials =
       this.conversationMemoryConfig?.conversationMemory?.memory?.neurolink
         ?.credentials ?? this.credentials;
-    const hostLangfuse = this.observabilityConfig?.langfuse;
     this.memoryCondenser = new NeuroLink({
       ...(credentials ? { credentials } : {}),
       conversationMemory: { enabled: false },
       enableOrchestration: false,
       ...(this.observabilityConfig
-        ? {
-            observability: {
-              ...this.observabilityConfig,
-              ...(hostLangfuse
-                ? {
-                    langfuse: {
-                      ...hostLangfuse,
-                      autoDetectExternalProvider: true,
-                      skipLangfuseSpanProcessor: true,
-                    },
-                  }
-                : {}),
-            },
-          }
+        ? { observability: this.observabilityConfig }
         : {}),
     });
     if (previousSink) {
@@ -1705,6 +1821,7 @@ export class NeuroLink {
    * @throws {Error} When HITL configuration is invalid (if enabled)
    */
   private observabilityConfig?: ObservabilityConfig;
+  private telemetryHeld = false;
   private metricsAggregator: MetricsAggregator = new MetricsAggregator();
   private analyticsService: AnalyticsService;
   /**
@@ -1729,6 +1846,9 @@ export class NeuroLink {
     }
     this.fileRegistry = new FileReferenceRegistry();
     this.observabilityConfig = config?.observability;
+    if (this.observabilityConfig) {
+      ensureTelemetry(this.observabilityConfig);
+    }
     this.analyticsService = new AnalyticsService();
 
     // Initialize orchestration setting
@@ -1868,11 +1988,6 @@ export class NeuroLink {
       this.skillsConfig = config.skills;
       this.registerSkillTools();
     }
-    this.initializeLangfuse(
-      constructorId,
-      constructorStartTime,
-      constructorHrTimeStart,
-    );
     this.initializeMetricsListeners();
     this.logConstructorComplete(
       constructorId,
@@ -3169,25 +3284,22 @@ Current user's request: ${currentInput}`;
       }
     };
 
-    // Carry the turn's identity across the setImmediate boundary so the
-    // condensation generate + redis spans don't orphan to "guest". Keep the
-    // ambient store when it survived (generate path — carries conversationId,
-    // metadata, …); re-establish from the caller only when it was lost (stream
-    // path, which fires after the caller consumed the stream).
-    const ambient = getLangfuseContext();
-    const wrappedMemoryWrite =
-      !(ambient?.traceName || ambient?.userId) &&
-      (langfuseIdentity?.traceName || langfuseIdentity?.sessionId)
+    const identifiedMemoryWrite =
+      langfuseIdentity?.traceName || langfuseIdentity?.sessionId
         ? () =>
             setLangfuseContext(
               {
                 userId,
-                sessionId: langfuseIdentity.sessionId ?? null,
-                traceName: langfuseIdentity.traceName ?? null,
+                sessionId: langfuseIdentity.sessionId ?? undefined,
+                traceName: langfuseIdentity.traceName ?? undefined,
               },
               memoryWrite,
             )
-        : runWithCurrentLangfuseContext(memoryWrite);
+        : memoryWrite;
+    const wrappedMemoryWrite = context.bind(
+      context.active(),
+      identifiedMemoryWrite,
+    );
     // Tracked from the moment it is scheduled, not from when setImmediate
     // fires: shutdown() typically runs in that gap, and a write it cannot
     // see is a write it cannot wait for. `memoryWrite` never rejects (it
@@ -3386,111 +3498,20 @@ Current user's request: ${currentInput}`;
     });
   }
 
-  /**
-   * Initialize Langfuse observability for AI operations tracking
-   */
-  private initializeLangfuse(
-    constructorId: string,
-    constructorStartTime: number,
-    constructorHrTimeStart: bigint,
-  ): void {
-    const langfuseInitStartTime = process.hrtime.bigint();
-
-    try {
-      const langfuseConfig = this.observabilityConfig?.langfuse;
-
-      // Check if we should use external provider mode - bypass enabled check
-      const useExternalProvider =
-        langfuseConfig?.autoDetectExternalProvider === true ||
-        langfuseConfig?.useExternalTracerProvider === true;
-
-      if (langfuseConfig?.enabled || useExternalProvider) {
-        logger.debug(`[NeuroLink] 📊 LOG_POINT_C019_LANGFUSE_INIT_START`, {
-          logPoint: "C019_LANGFUSE_INIT_START",
-          constructorId,
-          timestamp: new Date().toISOString(),
-          elapsedMs: Date.now() - constructorStartTime,
-          elapsedNs: (
-            process.hrtime.bigint() - constructorHrTimeStart
-          ).toString(),
-          langfuseInitStartTimeNs: langfuseInitStartTime.toString(),
-          message: "Starting Langfuse observability initialization",
-        });
-
-        // Initialize OpenTelemetry (sets defaults from config)
-        void initializeOpenTelemetry(langfuseConfig).catch((err) => {
-          logger.error("[NeuroLink] OpenTelemetry initialization failed", {
-            error: err instanceof Error ? err.message : String(err),
-          });
-        });
-
-        const healthStatus = getLangfuseHealthStatus();
-        const langfuseInitDurationNs =
-          process.hrtime.bigint() - langfuseInitStartTime;
-
-        if (
-          healthStatus.initialized &&
-          healthStatus.hasProcessor &&
-          healthStatus.isHealthy
-        ) {
-          logger.debug(`[NeuroLink] ✅ LOG_POINT_C020_LANGFUSE_INIT_SUCCESS`, {
-            logPoint: "C020_LANGFUSE_INIT_SUCCESS",
-            constructorId,
-            timestamp: new Date().toISOString(),
-            elapsedMs: Date.now() - constructorStartTime,
-            elapsedNs: (
-              process.hrtime.bigint() - constructorHrTimeStart
-            ).toString(),
-            langfuseInitDurationNs: langfuseInitDurationNs.toString(),
-            langfuseInitDurationMs: Number(langfuseInitDurationNs) / 1_000_000,
-            healthStatus,
-            message: "Langfuse observability initialized successfully",
-          });
-        } else {
-          logger.warn(`[NeuroLink] ⚠️ LOG_POINT_C021_LANGFUSE_INIT_WARNING`, {
-            logPoint: "C021_LANGFUSE_INIT_WARNING",
-            constructorId,
-            timestamp: new Date().toISOString(),
-            elapsedMs: Date.now() - constructorStartTime,
-            elapsedNs: (
-              process.hrtime.bigint() - constructorHrTimeStart
-            ).toString(),
-            langfuseInitDurationNs: langfuseInitDurationNs.toString(),
-            healthStatus,
-            message: "Langfuse initialized but not healthy",
-          });
-        }
-      } else {
-        logger.debug(`[NeuroLink] 🚫 LOG_POINT_C022_LANGFUSE_DISABLED`, {
-          logPoint: "C022_LANGFUSE_DISABLED",
-          constructorId,
-          timestamp: new Date().toISOString(),
-          elapsedMs: Date.now() - constructorStartTime,
-          elapsedNs: (
-            process.hrtime.bigint() - constructorHrTimeStart
-          ).toString(),
-          message:
-            "Langfuse observability not enabled - skipping initialization",
-        });
-      }
-    } catch (error) {
-      const langfuseInitErrorDurationNs =
-        process.hrtime.bigint() - langfuseInitStartTime;
-
-      logger.error(`[NeuroLink] ❌ LOG_POINT_C023_LANGFUSE_INIT_ERROR`, {
-        logPoint: "C023_LANGFUSE_INIT_ERROR",
-        constructorId,
-        timestamp: new Date().toISOString(),
-        elapsedMs: Date.now() - constructorStartTime,
-        elapsedNs: (
-          process.hrtime.bigint() - constructorHrTimeStart
-        ).toString(),
-        langfuseInitDurationNs: langfuseInitErrorDurationNs.toString(),
-        errorMessage: error instanceof Error ? error.message : String(error),
-        errorStack: error instanceof Error ? error.stack : undefined,
-        message: "Langfuse observability initialization failed",
-      });
+  private holdTelemetry(): void {
+    if (!this.telemetryHeld) {
+      this.telemetryHeld = true;
+      acquireTelemetry(this.observabilityConfig);
     }
+  }
+
+  private async releaseTelemetryHold(): Promise<void> {
+    if (!this.telemetryHeld) {
+      await flushOpenTelemetry();
+      return;
+    }
+    this.telemetryHeld = false;
+    await releaseTelemetry();
   }
 
   /**
@@ -4282,20 +4303,17 @@ Current user's request: ${currentInput}`;
   }
 
   /**
-   * Check if Langfuse telemetry is enabled
-   * Centralized utility to avoid duplication across providers
+   * @description Reports whether any tracing backend is active.
+   * @returns {boolean} `true` when OpenTelemetry is initialized or a Langfuse exporter is running.
    */
   isTelemetryEnabled(): boolean {
-    // Check if observability config enables telemetry
-    if (this.observabilityConfig?.langfuse?.enabled) {
-      return true;
-    }
-    // Check if OpenTelemetry was initialized (by this or external app)
-    return isOpenTelemetryInitialized();
+    return (
+      isOpenTelemetryInitialized() || getLangfuseHealthStatus().hasProcessor
+    );
   }
 
   /**
-   * Get comprehensive telemetry status including Langfuse, OTel, and exporter health
+   * Get comprehensive telemetry status including Langfuse and OpenTelemetry state
    */
   getTelemetryStatus(): {
     enabled: boolean;
@@ -4309,43 +4327,33 @@ Current user's request: ${currentInput}`;
       endpoint?: string;
       serviceName?: string;
     };
-    exporters?: Array<{
-      name: string;
-      enabled: boolean;
-      healthy: boolean;
-      pendingSpans: number;
-      lastExportTime?: string;
-      latencyMs?: number;
-      errors?: string[];
-    }>;
   } {
     const langfuseConfig = this.observabilityConfig?.langfuse;
-    const otelConfig = this.observabilityConfig?.openTelemetry;
+    const langfuseOptions =
+      typeof langfuseConfig === "object" ? langfuseConfig : undefined;
+    const { hasProcessor } = getLangfuseHealthStatus();
 
     return {
-      enabled: this.isTelemetryEnabled(),
-      langfuse: langfuseConfig
-        ? {
-            enabled: langfuseConfig.enabled ?? false,
-            baseUrl: langfuseConfig.baseUrl,
-            environment: langfuseConfig.environment,
-          }
-        : undefined,
-      openTelemetry: otelConfig
-        ? {
-            enabled: otelConfig.enabled ?? false,
-            endpoint: otelConfig.endpoint,
-            serviceName: otelConfig.serviceName,
-          }
-        : isOpenTelemetryInitialized() ||
-            process.env.OTEL_EXPORTER_OTLP_ENDPOINT
+      enabled: isOpenTelemetryInitialized(),
+      langfuse:
+        langfuseConfig !== undefined || hasProcessor
+          ? {
+              enabled: hasProcessor,
+              baseUrl:
+                langfuseOptions?.baseUrl ?? process.env.LANGFUSE_BASE_URL,
+              environment:
+                langfuseOptions?.environment ??
+                process.env.LANGFUSE_TRACING_ENVIRONMENT,
+            }
+          : undefined,
+      openTelemetry:
+        isOpenTelemetryInitialized() || process.env.OTEL_EXPORTER_OTLP_ENDPOINT
           ? {
               enabled: isOpenTelemetryInitialized(),
               endpoint: process.env.OTEL_EXPORTER_OTLP_ENDPOINT,
               serviceName: process.env.OTEL_SERVICE_NAME,
             }
           : undefined,
-      exporters: [],
     };
   }
 
@@ -4462,33 +4470,7 @@ Current user's request: ${currentInput}`;
    * This method can be called externally to ensure Langfuse is properly initialized
    */
   async initializeLangfuseObservability(): Promise<void> {
-    try {
-      const langfuseConfig = this.observabilityConfig?.langfuse;
-
-      if (langfuseConfig?.enabled) {
-        try {
-          await initializeOpenTelemetry(langfuseConfig);
-        } catch (err) {
-          logger.error("[NeuroLink] OpenTelemetry initialization failed", {
-            error: err instanceof Error ? err.message : String(err),
-          });
-          return;
-        }
-
-        logger.debug(
-          "[NeuroLink] Langfuse observability initialized via public method",
-        );
-      } else {
-        logger.debug(
-          "[NeuroLink] Langfuse not enabled, skipping initialization",
-        );
-      }
-    } catch (error) {
-      logger.warn(
-        "[NeuroLink] Failed to initialize Langfuse observability:",
-        error,
-      );
-    }
+    this.holdTelemetry();
   }
 
   /**
@@ -4516,8 +4498,7 @@ Current user's request: ${currentInput}`;
       }
 
       try {
-        await flushOpenTelemetry();
-        await shutdownOpenTelemetry();
+        await this.releaseTelemetryHold();
         logger.debug("[NeuroLink] OpenTelemetry shutdown completed");
       } catch (error) {
         logger.warn("[NeuroLink] OpenTelemetry shutdown failed:", error);
@@ -4626,14 +4607,11 @@ Current user's request: ${currentInput}`;
   }
 
   /**
-   * Handle generation:end for Pipeline B spans + advanced analytics.
-   * When pipelineAHandled is set, skips Pipeline B spans but still tracks
-   * analytics so successful AI-SDK generate/stream calls are recorded.
-   * Stream analytics are owned here (not stream:complete) to avoid duplicates.
+   * Handle generation:end: records advanced analytics for every generation
+   * and the metrics span for a non-streamed one. A streamed generation gets
+   * its span from stream:complete / stream:error instead.
    */
   private handleGenerationEndMetrics(data: Record<string, unknown>): void {
-    const skipPipelineBSpan = data.pipelineAHandled === true;
-
     try {
       const result = data.result as Record<string, unknown> | undefined;
       const usage = result?.usage as
@@ -4651,12 +4629,19 @@ Current user's request: ${currentInput}`;
           : Date.now();
       const traceCtx = this._metricsTraceContext;
 
-      let computedCost: number | undefined =
+      const reportedCost =
         typeof analytics?.cost === "number" && Number.isFinite(analytics.cost)
           ? analytics.cost
           : undefined;
+      const cost =
+        reportedCost !== undefined && reportedCost > 0
+          ? reportedCost
+          : (this.estimateCostFromUsage(provider, model, usage) ??
+            reportedCost);
+      const aborted = data.aborted === true;
+      const failed = !aborted && (data.success === false || !!data.error);
 
-      if (!skipPipelineBSpan) {
+      if (data.streamed !== true) {
         let span = SpanSerializer.createGenerationSpan({
           provider,
           model,
@@ -4710,17 +4695,8 @@ Current user's request: ${currentInput}`;
           });
         }
 
-        if (analytics?.cost && analytics.cost > 0) {
-          span = SpanSerializer.enrichWithCost(span, {
-            totalCost: analytics.cost,
-          });
-        } else {
-          const estimated = this.estimateCostFromUsage(provider, model, usage);
-          if (estimated !== undefined) {
-            span = SpanSerializer.enrichWithCost(span, {
-              totalCost: estimated,
-            });
-          }
+        if (cost !== undefined && cost > 0) {
+          span = SpanSerializer.enrichWithCost(span, { totalCost: cost });
         }
 
         const content = (result?.content as string) || (result?.text as string);
@@ -4735,54 +4711,28 @@ Current user's request: ${currentInput}`;
 
         this.metricsAggregator.recordSpan(span);
         getMetricsAggregator().recordSpan(span);
-
-        const spanCost = span.attributes["ai.cost.total"];
-        if (typeof spanCost === "number" && spanCost > 0) {
-          computedCost = spanCost;
-        }
-
-        this.enqueueAnalyticsTrackRequest({
-          provider,
-          model,
-          userId: (data.userId as string) || (data.user as string) || undefined,
-          teamId: (data.teamId as string) || undefined,
-          department: (data.department as string) || undefined,
-          timestamp: eventTimestamp,
-          latency: responseTime,
-          inputTokens: usage?.input || 0,
-          outputTokens: usage?.output || 0,
-          totalTokens:
-            usage?.total || (usage?.input || 0) + (usage?.output || 0),
-          cost: computedCost,
-          isError: span.status === SpanStatus.ERROR,
-          errorMessage: statusMessage,
-          qualityScore: parseAnalyticsQualityScore(data.qualityScore),
-        });
-      } else {
-        // Pipeline A handled the observation — still record analytics so
-        // successful AI-SDK generate()/stream() calls are not silently dropped.
-        if (computedCost === undefined) {
-          computedCost = this.estimateCostFromUsage(provider, model, usage);
-        }
-
-        this.enqueueAnalyticsTrackRequest({
-          provider,
-          model,
-          userId: (data.userId as string) || (data.user as string) || undefined,
-          teamId: (data.teamId as string) || undefined,
-          department: (data.department as string) || undefined,
-          timestamp: eventTimestamp,
-          latency: responseTime,
-          inputTokens: usage?.input || 0,
-          outputTokens: usage?.output || 0,
-          totalTokens:
-            usage?.total || (usage?.input || 0) + (usage?.output || 0),
-          cost: computedCost,
-          isError: data.success === false || Boolean(data.error),
-          errorMessage: data.error ? String(data.error) : undefined,
-          qualityScore: parseAnalyticsQualityScore(data.qualityScore),
-        });
       }
+
+      this.enqueueAnalyticsTrackRequest({
+        provider,
+        model,
+        userId: (data.userId as string) || (data.user as string) || undefined,
+        teamId: (data.teamId as string) || undefined,
+        department: (data.department as string) || undefined,
+        timestamp: eventTimestamp,
+        latency: responseTime,
+        inputTokens: usage?.input || 0,
+        outputTokens: usage?.output || 0,
+        totalTokens: usage?.total || (usage?.input || 0) + (usage?.output || 0),
+        cost,
+        isError: failed,
+        errorMessage: aborted
+          ? "Generation aborted by client"
+          : data.error
+            ? String(data.error)
+            : undefined,
+        qualityScore: parseAnalyticsQualityScore(data.qualityScore),
+      });
     } catch {
       // Non-blocking
     }
@@ -5099,9 +5049,10 @@ Current user's request: ${currentInput}`;
   async generate(
     optionsOrPrompt: GenerateOptions | DynamicOptions | string,
   ): Promise<GenerateResult> {
-    return logger.runInInstanceScope(this.logInstanceId, () =>
-      this.generateInInstanceScope(optionsOrPrompt),
-    );
+    return logger.runInInstanceScope(this.logInstanceId, async () => {
+      this.holdTelemetry();
+      return this.generateInInstanceScope(optionsOrPrompt);
+    });
   }
 
   /**
@@ -5176,55 +5127,19 @@ Current user's request: ${currentInput}`;
         } as GenerateOptions;
       }
     }
-    // Retrieve once at the public call boundary so fallback attempts reuse the
-    // same grounding block and internal preparation cannot inject it twice.
-    const groundingOptions =
-      typeof optionsOrPrompt === "string"
-        ? ({ input: { text: optionsOrPrompt } } as GenerateOptions)
-        : (optionsOrPrompt as GenerateOptions);
-    const knowledgeOutcome =
-      await this.retrieveKnowledgeGrounding(groundingOptions);
-    if (knowledgeOutcome?.ephemeralContext) {
-      const block = knowledgeOutcome.ephemeralContext.content;
-      optionsOrPrompt = {
-        ...groundingOptions,
-        systemPrompt: this.appendKnowledgeGroundingBlockToSystemPrompt(
-          groundingOptions.systemPrompt,
-          block,
-        ),
-      } as GenerateOptions | DynamicOptions;
-    }
     const startedAt = Date.now();
+    const turnOptions = optionsOrPrompt;
     try {
-      const result = await this.runWithFallbackOrchestration(
-        optionsOrPrompt,
-        "generate",
-        (opts) => {
-          // Capture root-ness before startActiveSpan makes generateSpan active.
-          // The actual guest-rescue stamp is deferred to executeGenerateRequest,
-          // AFTER prepareGenerateRequest merges auth/requestContext-derived
-          // identity into options.context — otherwise an auth:{token} caller
-          // with no pre-set context.userId would stamp the root span as guest.
-          const generateIsRoot = !trace.getSpan(context.active());
-          return tracers.sdk.startActiveSpan(
-            "neurolink.generate",
+      return await this.setLangfuseContextFromOptions(
+        typeof turnOptions === "string" ? {} : (turnOptions as GenerateOptions),
+        () =>
+          tracers.sdk.startActiveSpan(
+            "generate",
             { kind: SpanKind.INTERNAL },
-            (generateSpan) =>
-              this.executeGenerateWithMetricsContext(
-                opts,
-                generateSpan,
-                generateIsRoot,
-              ),
-          );
-        },
+            (turnSpan) =>
+              this.runGenerateTurn(turnOptions, agentModeVersion, turnSpan),
+          ),
       );
-      if (knowledgeOutcome) {
-        result.knowledge = knowledgeOutcome.metadata;
-      }
-      if (agentModeVersion) {
-        result.agentModeVersion = agentModeVersion;
-      }
-      return result;
     } catch (error) {
       // Lifecycle middleware (wrapGenerate.catch in builtin/lifecycle.ts)
       // stamps errors it already surfaced with the shared Symbol marker
@@ -5240,6 +5155,69 @@ Current user's request: ${currentInput}`;
         startedAt,
       );
       throw error;
+    }
+  }
+
+  private async runGenerateTurn(
+    optionsOrPrompt: GenerateOptions | DynamicOptions | string,
+    agentModeVersion: TerminalAgentModeVersion | undefined,
+    turnSpan: Span,
+  ): Promise<GenerateResult> {
+    try {
+      const groundingOptions =
+        typeof optionsOrPrompt === "string"
+          ? ({ input: { text: optionsOrPrompt } } as GenerateOptions)
+          : (optionsOrPrompt as GenerateOptions);
+      const knowledgeOutcome =
+        await this.retrieveKnowledgeGrounding(groundingOptions);
+      if (knowledgeOutcome?.ephemeralContext) {
+        const block = knowledgeOutcome.ephemeralContext.content;
+        optionsOrPrompt = {
+          ...groundingOptions,
+          systemPrompt: this.appendKnowledgeGroundingBlockToSystemPrompt(
+            groundingOptions.systemPrompt,
+            block,
+          ),
+        } as GenerateOptions | DynamicOptions;
+      }
+      startTurn(turnSpan, optionsOrPrompt);
+      const result = await this.runWithFallbackOrchestration(
+        optionsOrPrompt,
+        "generate",
+        (opts) =>
+          tracers.sdk.startActiveSpan(
+            "generate.attempt",
+            { kind: SpanKind.INTERNAL },
+            (attemptSpan) => {
+              observe(attemptSpan, "span", {});
+              return this.executeGenerateWithMetricsContext(opts, attemptSpan);
+            },
+          ),
+      );
+      if (knowledgeOutcome) {
+        result.knowledge = knowledgeOutcome.metadata;
+      }
+      if (agentModeVersion) {
+        result.agentModeVersion = agentModeVersion;
+      }
+      observeTurn(turnSpan, {
+        output: assistantMessages({
+          text: result.content,
+          toolCalls: result.toolExecutions,
+        }),
+        metadata: { model: result.model },
+        level: observationLevel(result.finishReason),
+      });
+      turnSpan.setStatus({ code: SpanStatusCode.OK });
+      return result;
+    } catch (error) {
+      failTurnSpan(
+        turnSpan,
+        error instanceof Error ? error : new Error(String(error)),
+      );
+      throw error;
+    } finally {
+      turnSpan.end();
     }
   }
 
@@ -5494,19 +5472,16 @@ Current user's request: ${currentInput}`;
   private async executeGenerateWithMetricsContext(
     optionsOrPrompt: GenerateOptions | DynamicOptions | string,
     generateSpan: ReturnType<typeof tracers.sdk.startSpan>,
-    isRootSpan: boolean,
   ): Promise<GenerateResult> {
     return metricsTraceContextStorage.run(
       this.createMetricsTraceContext(),
-      () =>
-        this.executeGenerateRequest(optionsOrPrompt, generateSpan, isRootSpan),
+      () => this.executeGenerateRequest(optionsOrPrompt, generateSpan),
     );
   }
 
   private async executeGenerateRequest(
     optionsOrPrompt: GenerateOptions | DynamicOptions | string,
     generateSpan: ReturnType<typeof tracers.sdk.startSpan>,
-    isRootSpan: boolean,
   ): Promise<GenerateResult> {
     let resolvedOptions: GenerateOptions | undefined;
     try {
@@ -5515,9 +5490,6 @@ Current user's request: ${currentInput}`;
         generateSpan,
       );
       resolvedOptions = options;
-      // Stamp now that prepareGenerateRequest has merged any auth/requestContext
-      // identity into options.context (see capture of isRootSpan in generate()).
-      stampGuestRescueIdentity(generateSpan, options.context, isRootSpan);
       const earlyResult = await this.maybeHandleEarlyGenerateResult(
         options,
         generateSpan,
@@ -5548,14 +5520,9 @@ Current user's request: ${currentInput}`;
       generateSpan.setStatus({ code: SpanStatusCode.OK });
       return result;
     } catch (error) {
-      // Match the inner-span discrimination: client aborts are user-initiated
-      // cancellations, not faults. Mark with finishReason=aborted and skip
-      // ERROR status so ContextEnricher routes the outer trace to
-      // langfuse.level=WARNING (matches Curator telemetry-gaps Issue 5a). All
-      // other errors keep the existing ERROR status + recordException pair.
       if (isAbortError(error)) {
         generateSpan.setAttribute("ai.finishReason", "aborted");
-        generateSpan.setAttribute("neurolink.aborted", true);
+        generateSpan.setAttribute("aborted", true);
       } else {
         generateSpan.recordException(
           error instanceof Error ? error : new Error(String(error)),
@@ -5568,13 +5535,13 @@ Current user's request: ${currentInput}`;
 
       // G7 fix: Distinguish context overflow errors with dedicated attributes
       if (error instanceof ContextBudgetExceededError) {
-        generateSpan.setAttribute("neurolink.error.type", "context_overflow");
+        generateSpan.setAttribute("error.type", "context_overflow");
         generateSpan.setAttribute(
-          "neurolink.context.estimated_tokens",
+          "context.estimated_tokens",
           error.estimatedTokens,
         );
         generateSpan.setAttribute(
-          "neurolink.context.available_tokens",
+          "context.available_tokens",
           error.availableTokens,
         );
       }
@@ -5623,18 +5590,18 @@ Current user's request: ${currentInput}`;
     this._generationTurnActive = true;
 
     generateSpan.setAttribute(
-      "neurolink.provider",
+      "sdk.provider",
       (options.provider as string) || "default",
     );
-    generateSpan.setAttribute("neurolink.model", options.model || "default");
+    generateSpan.setAttribute("sdk.model", options.model || "default");
     generateSpan.setAttribute(
-      "neurolink.input_length",
+      "input_length",
       typeof optionsOrPrompt === "string"
         ? optionsOrPrompt.length
         : options.input?.text?.length || 0,
     );
     generateSpan.setAttribute(
-      "neurolink.has_tools",
+      "has_tools",
       !!(options.tools && Object.keys(options.tools).length > 0),
     );
 
@@ -5784,23 +5751,17 @@ Current user's request: ${currentInput}`;
       );
     }
     const pptResult = await this.generateWithPPT(options);
-    generateSpan.setAttribute(
-      "neurolink.output_length",
-      pptResult.content?.length ?? 0,
-    );
+    generateSpan.setAttribute("output_length", pptResult.content?.length ?? 0);
     if (pptResult.analytics) {
       generateSpan.setAttribute(
-        "neurolink.tokens.input",
+        "tokens.input",
         pptResult.analytics.tokenUsage?.input ?? 0,
       );
       generateSpan.setAttribute(
-        "neurolink.tokens.output",
+        "tokens.output",
         pptResult.analytics.tokenUsage?.output ?? 0,
       );
-      generateSpan.setAttribute(
-        "neurolink.cost",
-        pptResult.analytics.cost ?? 0,
-      );
+      generateSpan.setAttribute("cost", pptResult.analytics.cost ?? 0);
     }
     generateSpan.setStatus({ code: SpanStatusCode.OK });
     return pptResult;
@@ -6514,10 +6475,6 @@ Current user's request: ${currentInput}`;
       // generate() today. Declaring them is a public-type decision and is
       // deliberately left out of this fix.
       thinkingConfig: options.thinkingConfig,
-      // Lifecycle callbacks must reach the provider so non-AI-SDK paths
-      // (Vertex's native @google/genai, native Bedrock, Ollama, etc.) can
-      // invoke them directly. Pipeline A also still receives them via the
-      // wrapped middleware config set by applyGenerateLifecycleMiddleware.
       onFinish: options.onFinish,
       onError: options.onError,
     };
@@ -6695,12 +6652,6 @@ Current user's request: ${currentInput}`;
       }
     }
 
-    // Skip the top-level `generation:end` emission when the provider already
-    // emitted it from its native generate path (Vertex / Google AI Studio).
-    // Without this guard, native-path providers would surface TWO events
-    // per generate call (Pipeline A path: 1 from provider native + 1 here;
-    // standard AI-SDK path: 1 here). The observability suite asserts on
-    // emission count and would (and did) fail.
     const nativeAlreadyEmitted = !!(
       textResult as { _generationEndEmitted?: boolean }
     )._generationEndEmitted;
@@ -6721,10 +6672,6 @@ Current user's request: ${currentInput}`;
           (options as Record<string, unknown>).prompt,
         temperature: textOptions.temperature,
         maxTokens: textOptions.maxTokens,
-        // A2 fix: Signal that Pipeline A (AI SDK → @langfuse/otel) already
-        // creates a GENERATION observation for this call. The generation:end
-        // listener should skip creating a duplicate Pipeline B span.
-        pipelineAHandled: true,
       });
     }
     this.emitter.emit("response:end", textResult.content || "");
@@ -6850,19 +6797,16 @@ Current user's request: ${currentInput}`;
     this.scheduleGenerateMemoryStorage(options, originalPrompt, generateResult);
 
     generateSpan.setAttribute(
-      "neurolink.output_length",
+      "output_length",
       generateResult.content?.length || 0,
     );
+    generateSpan.setAttribute("tokens.input", generateResult.usage?.input || 0);
     generateSpan.setAttribute(
-      "neurolink.tokens.input",
-      generateResult.usage?.input || 0,
-    );
-    generateSpan.setAttribute(
-      "neurolink.tokens.output",
+      "tokens.output",
       generateResult.usage?.output || 0,
     );
     generateSpan.setAttribute(
-      "neurolink.finish_reason",
+      "finish_reason",
       generateResult.finishReason || "unknown",
     );
 
@@ -6870,18 +6814,15 @@ Current user's request: ${currentInput}`;
     // Read steps from the raw provider result (textResult), not the flattened DTO
     const stepCount = (textResult as { steps?: unknown[] })?.steps?.length ?? 1;
     const maxSteps = options.maxSteps ?? 200; // DEFAULT_MAX_STEPS
-    generateSpan.setAttribute("neurolink.step_count", stepCount);
-    generateSpan.setAttribute(
-      "neurolink.max_steps_reached",
-      stepCount >= maxSteps,
-    );
+    generateSpan.setAttribute("step_count", stepCount);
+    generateSpan.setAttribute("max_steps_reached", stepCount >= maxSteps);
 
     generateSpan.setAttribute(
-      "neurolink.result_provider",
+      "result_provider",
       generateResult.provider || "unknown",
     );
     generateSpan.setAttribute(
-      "neurolink.result_model",
+      "result_model",
       generateResult.model || "unknown",
     );
     generateSpan.setAttribute(
@@ -7064,8 +7005,8 @@ Current user's request: ${currentInput}`;
       ...musicOptions,
       prompt: musicOptions.prompt ?? options.input?.text ?? "",
     });
-    generateSpan.setAttribute("neurolink.music.provider", providerName);
-    generateSpan.setAttribute("neurolink.music.bytes", musicResult.size);
+    generateSpan.setAttribute("music.provider", providerName);
+    generateSpan.setAttribute("music.bytes", musicResult.size);
     generateSpan.setStatus({ code: SpanStatusCode.OK });
     return {
       content: `Music generated (${providerName}, ${musicResult.size} bytes, ${musicResult.format}).`,
@@ -7109,8 +7050,8 @@ Current user's request: ${currentInput}`;
       providerName,
       avatarOptions,
     );
-    generateSpan.setAttribute("neurolink.avatar.provider", providerName);
-    generateSpan.setAttribute("neurolink.avatar.bytes", avatarResult.size);
+    generateSpan.setAttribute("avatar.provider", providerName);
+    generateSpan.setAttribute("avatar.bytes", avatarResult.size);
     generateSpan.setStatus({ code: SpanStatusCode.OK });
     return {
       content: `Avatar generated (${providerName}, ${avatarResult.size} bytes, ${avatarResult.format}).`,
@@ -7479,12 +7420,10 @@ Current user's request: ${currentInput}`;
   private async generateTextInternal(
     options: TextGenerationOptions,
   ): Promise<TextGenerationResult> {
-    return tracers.sdk.startActiveSpan(
-      "neurolink.generateTextInternal",
-      { kind: SpanKind.INTERNAL },
-      (internalSpan) =>
-        this.executeGenerateTextInternalWithSpan(options, internalSpan),
-    );
+    const internalSpan = tracers.sdk.startSpan("generateTextInternal", {
+      kind: SpanKind.INTERNAL,
+    });
+    return this.executeGenerateTextInternalWithSpan(options, internalSpan);
   }
 
   private async executeGenerateTextInternalWithSpan(
@@ -7507,16 +7446,16 @@ Current user's request: ${currentInput}`;
         ...this.initializeGenerateTextInternalContext(options),
         eventSequence,
       };
-      internalSpan.setAttribute("neurolink.request_id", context.requestId);
+      internalSpan.setAttribute("request_id", context.requestId);
       internalSpan.setAttribute(
-        "neurolink.has_conversation_memory",
+        "has_conversation_memory",
         !!this.conversationMemory,
       );
       internalSpan.setAttribute(
-        "neurolink.provider",
+        "sdk.provider",
         (options.provider as string) || "auto",
       );
-      internalSpan.setAttribute("neurolink.model", options.model || "default");
+      internalSpan.setAttribute("sdk.model", options.model || "default");
 
       this.logGenerateTextInternalStart(
         context.generateInternalId,
@@ -7534,14 +7473,9 @@ Current user's request: ${currentInput}`;
       );
     } catch (error) {
       // Client aborts are user-initiated cancellations, not system faults.
-      // Setting status=ERROR forces Langfuse to level=ERROR (see
-      // ContextEnricher.onEnd → instrumentation.ts:691). Instead leave status
-      // unset and stamp ai.finishReason=aborted so applyNonErrorLangfuseLevel
-      // maps it to level=WARNING with the canonical "Generation aborted by
-      // client" status_message. Matches Curator telemetry-gaps Issue 5a.
       if (isAbortError(error)) {
         internalSpan.setAttribute("ai.finishReason", "aborted");
-        internalSpan.setAttribute("neurolink.aborted", true);
+        internalSpan.setAttribute("aborted", true);
       } else {
         internalSpan.recordException(
           error instanceof Error ? error : new Error(String(error)),
@@ -7760,19 +7694,10 @@ Current user's request: ${currentInput}`;
     if (path === "direct") {
       this.emitter.emit("message", "Text generation completed successfully");
     }
-    internalSpan.setAttribute("neurolink.path", path);
-    internalSpan.setAttribute(
-      "neurolink.tokens.input",
-      result.usage?.input || 0,
-    );
-    internalSpan.setAttribute(
-      "neurolink.tokens.output",
-      result.usage?.output || 0,
-    );
-    internalSpan.setAttribute(
-      "neurolink.result_provider",
-      result.provider || "unknown",
-    );
+    internalSpan.setAttribute("path", path);
+    internalSpan.setAttribute("tokens.input", result.usage?.input || 0);
+    internalSpan.setAttribute("tokens.output", result.usage?.output || 0);
+    internalSpan.setAttribute("result_provider", result.provider || "unknown");
     internalSpan.setStatus({ code: SpanStatusCode.OK });
 
     return result;
@@ -10147,6 +10072,7 @@ Current user's request: ${currentInput}`;
     const eventScope = Symbol("stream-conversation");
     return this.conversationEventContext.run(eventScope, () =>
       logger.runInInstanceScope(this.logInstanceId, async () => {
+        this.holdTelemetry();
         const result = await this.streamInInstanceScope(options);
         return preserveLiveStreamAccessors(result, {
           ...result,
@@ -10160,25 +10086,24 @@ Current user's request: ${currentInput}`;
   private bindConversationEventStream<T>(
     stream: AsyncIterable<T>,
     eventScope: symbol,
-  ): AsyncIterable<T> {
+  ): AsyncIterableIterator<T> {
     const scope = this.conversationEventContext;
-    return (async function* () {
-      const iterator = stream[Symbol.asyncIterator]();
-      try {
-        while (true) {
-          const next = await scope.run(eventScope, () => iterator.next());
-          if (next.done) {
-            return;
-          }
-          yield next.value;
-        }
-      } finally {
-        const close = iterator.return?.bind(iterator);
-        if (close) {
-          await scope.run(eventScope, () => close());
-        }
-      }
-    })();
+    const iterator = stream[Symbol.asyncIterator]();
+    const bound: AsyncIterableIterator<T> = {
+      next: () => scope.run(eventScope, () => iterator.next()),
+      async return(): Promise<IteratorResult<T>> {
+        await scope.run(eventScope, async () => iterator.return?.());
+        return { done: true, value: undefined };
+      },
+      async throw(error: Error): Promise<IteratorResult<T>> {
+        await scope.run(eventScope, async () => iterator.return?.());
+        throw error;
+      },
+      [Symbol.asyncIterator]() {
+        return bound;
+      },
+    };
+    return bound;
   }
 
   /**
@@ -10244,31 +10169,11 @@ Current user's request: ${currentInput}`;
       this.resolveFileToolRoots((options as StreamOptions).toolRoots),
     );
     const startedAt = Date.now();
-    // Retrieve once before provider/model fallback orchestration. Every fallback
-    // receives the same explicitly enriched options, without the retrieval helper
-    // mutating its input or injecting the same block more than once.
-    const knowledgeOutcome = await this.retrieveKnowledgeGrounding(options);
-    if (knowledgeOutcome?.ephemeralContext) {
-      const block = knowledgeOutcome.ephemeralContext.content;
-      options = {
-        ...options,
-        systemPrompt: this.appendKnowledgeGroundingBlockToSystemPrompt(
-          options.systemPrompt,
-          block,
-        ),
-      } as StreamOptions | DynamicOptions;
-    }
+    const turnOptions = options as StreamOptions;
     try {
-      const result = await this.streamWithIterationFallback(
-        options as StreamOptions,
+      return await this.setLangfuseContextFromOptions(turnOptions, () =>
+        this.runStreamTurn(turnOptions, agentModeVersion),
       );
-      if (knowledgeOutcome) {
-        result.knowledge = knowledgeOutcome.metadata;
-      }
-      if (agentModeVersion) {
-        result.agentModeVersion = agentModeVersion;
-      }
-      return result;
     } catch (error) {
       // Mirror generate(): fire consumer onError for failures that
       // happened before the wrapped language-model middleware could
@@ -10280,6 +10185,51 @@ Current user's request: ${currentInput}`;
       await this.fireConsumerOnErrorIfNotFired(options, error, startedAt);
       throw error;
     }
+  }
+
+  private async runStreamTurn(
+    options: StreamOptions,
+    agentModeVersion: TerminalAgentModeVersion | undefined,
+  ): Promise<StreamResult> {
+    const turnSpan = tracers.sdk.startSpan("stream", {
+      kind: SpanKind.INTERNAL,
+    });
+    const turnContext = trace.setSpan(context.active(), turnSpan);
+    let result: StreamResult;
+    try {
+      result = await context.with(turnContext, async () => {
+        const knowledgeOutcome = await this.retrieveKnowledgeGrounding(options);
+        const grounded = knowledgeOutcome?.ephemeralContext
+          ? ({
+              ...options,
+              systemPrompt: this.appendKnowledgeGroundingBlockToSystemPrompt(
+                options.systemPrompt,
+                knowledgeOutcome.ephemeralContext.content,
+              ),
+            } as StreamOptions)
+          : options;
+        startTurn(turnSpan, grounded);
+        const streamed = await this.streamWithIterationFallback(grounded);
+        if (knowledgeOutcome) {
+          streamed.knowledge = knowledgeOutcome.metadata;
+        }
+        if (agentModeVersion) {
+          streamed.agentModeVersion = agentModeVersion;
+        }
+        return streamed;
+      });
+    } catch (error) {
+      failTurnSpan(
+        turnSpan,
+        error instanceof Error ? error : new Error(String(error)),
+      );
+      turnSpan.end();
+      throw error;
+    }
+    return preserveLiveStreamAccessors(result, {
+      ...result,
+      stream: traceTurnStream(result, turnSpan, turnContext),
+    });
   }
 
   /**
@@ -10441,11 +10391,11 @@ Current user's request: ${currentInput}`;
     // Dynamic argument resolution — resolve any function-valued options before downstream use
     await this.resolveDynamicOptions(options);
 
-    const streamSpan = tracers.sdk.startSpan("neurolink.stream", {
+    const streamSpan = tracers.sdk.startSpan("stream.attempt", {
       kind: SpanKind.INTERNAL,
       attributes: {
         [ATTR.NL_PROVIDER]: (options.provider as string) || "default",
-        [ATTR.GEN_AI_MODEL]: options.model || "default",
+        ...(options.model && { [ATTR.NL_MODEL]: options.model }),
         [ATTR.NL_INPUT_LENGTH]: options.input?.text?.length || 0,
         // Count registered custom tools too — chat hosts put their MCP tools
         // in the registry, so options.tools alone under-reports.
@@ -10456,13 +10406,8 @@ Current user's request: ${currentInput}`;
         [ATTR.NL_STREAM_MODE]: true,
       },
     });
+    observe(streamSpan, "span", {});
 
-    // streamSpan isn't active yet, so context.active() is its parent — empty =
-    // root. Capture root-ness here, but defer the actual guest-rescue stamp to
-    // after validateStreamRequestOptions merges auth/requestContext identity
-    // into options.context (below) — otherwise an auth:{token} caller with no
-    // pre-set context.userId would stamp the root span as guest.
-    const streamIsRoot = !trace.getSpan(context.active());
     const spanStartTime = Date.now();
     this._disableToolCacheForCurrentRequest = !!options.disableToolCache;
     this._toolCacheKeysServedThisRequest = new Set();
@@ -10523,9 +10468,6 @@ Current user's request: ${currentInput}`;
 
       options.fileRegistry = this.fileRegistry;
       await this.validateStreamRequestOptions(options, startTime);
-
-      // options.context now carries any auth/requestContext-derived identity.
-      stampGuestRescueIdentity(streamSpan, options.context, streamIsRoot);
 
       const workflowResult = await this.maybeHandleWorkflowStreamRequest({
         options,
@@ -10601,8 +10543,8 @@ Current user's request: ${currentInput}`;
         : undefined;
 
       const streamResult = await context.with(streamSpanContext, () =>
-        this.setLangfuseContextFromOptions(options, () =>
-          this.runStandardStreamRequest({
+        this.setLangfuseContextFromOptions(options, async () => {
+          const attempt = await this.runStandardStreamRequest({
             options,
             streamSpan,
             spanStartTime,
@@ -10614,8 +10556,10 @@ Current user's request: ${currentInput}`;
             ttsMetadataSink: (metadata) => {
               streamTtsMetadata = metadata;
             },
-          }),
-        ),
+          });
+          attempt.stream = drainInContext(attempt.stream, context.active());
+          return attempt;
+        }),
       );
       if (streamSttTranscription) {
         streamResult.transcription = streamSttTranscription;
@@ -11333,7 +11277,7 @@ Current user's request: ${currentInput}`;
         self._toolCacheKeysServedThisRequest = new Set();
         self._generationTurnActive = false;
         params.streamSpan.setAttribute(
-          "neurolink.response_time_ms",
+          "response_time_ms",
           Date.now() - params.spanStartTime,
         );
         params.streamSpan.end();
@@ -11432,7 +11376,7 @@ Current user's request: ${currentInput}`;
       const mcpStreamOutcome = await this.createMCPStream(enhancedOptions);
       const { stream: mcpStream } = mcpStreamOutcome;
       const providerName = mcpStreamOutcome.provider ?? "unknown";
-      let streamedTTSResult: TTSResult | undefined;
+      const tts: { result?: TTSResult } = {};
       const { stream: incrementalStream, ttsMetadata: streamTtsMetadata } =
         await this.createIncrementalTTSStream({
           stream: mcpStream,
@@ -11440,7 +11384,7 @@ Current user's request: ${currentInput}`;
           providerName,
           fallbackProvider: enhancedOptions.provider,
           onComplete: (result) => {
-            streamedTTSResult = result;
+            tts.result = result;
           },
         });
       ttsMetadataSink?.(streamTtsMetadata);
@@ -11476,8 +11420,6 @@ Current user's request: ${currentInput}`;
 
       streamSpan.setAttribute(ATTR.NL_PROVIDER, providerName || "unknown");
 
-      let accumulatedContent = "";
-      let chunkCount = 0;
       const { eventSequence, cleanup: cleanupListeners } =
         this.setupStreamEventListeners();
       const metadata = {
@@ -11488,363 +11430,32 @@ Current user's request: ${currentInput}`;
         fallbackModel: undefined as string | undefined,
       };
 
-      const self = this;
       const streamStartTime = Date.now();
       const sessionId = (enhancedOptions.context as Record<string, unknown>)
         ?.sessionId as string | undefined;
-      const processedStream = (async function* () {
-        let streamError: unknown;
-        // Curator P2-4: hoist `resolvedUsage` so the finally block can emit a
-        // single `generation:end` event with cost data. Cost listeners
-        // subscribe here; previously the stream path never fired it.
-        let resolvedUsage: unknown;
-        // Reviewer follow-up: track *non-sentinel output chunks* (text,
-        // audio, image — anything the SDK considers real output) so the
-        // fallback gate fires only when the stream produced nothing
-        // useful. Counting only text content here would have spuriously
-        // triggered fallback for valid audio-only (Google Live) and
-        // image-only streams. The sentinel is the only thing we exclude
-        // — that path can mask real provider failures (DNS, auth,
-        // retry-exhaustion) that AI SDK rejects with
-        // NoOutputGeneratedError, and we want fallback to fire there.
-        let realOutputChunks = 0;
-        try {
-          for await (const chunk of incrementalStream) {
-            chunkCount++;
-            const isNoOutputSentinel =
-              chunk !== null &&
-              typeof chunk === "object" &&
-              "metadata" in chunk &&
-              (chunk as { metadata?: Record<string, unknown> }).metadata
-                ?.noOutput === true;
-            const hasTextContent =
-              chunk &&
-              "content" in chunk &&
-              typeof chunk.content === "string" &&
-              chunk.content.length > 0;
-            const hasMediaPayload =
-              chunk !== null &&
-              typeof chunk === "object" &&
-              "type" in chunk &&
-              ((chunk as { type?: unknown }).type === "audio" ||
-                (chunk as { type?: unknown }).type === "tts_audio" ||
-                (chunk as { type?: unknown }).type === "image");
-            if (!isNoOutputSentinel && (hasTextContent || hasMediaPayload)) {
-              realOutputChunks++;
-            }
-            if (
-              chunk &&
-              "content" in chunk &&
-              typeof chunk.content === "string"
-            ) {
-              accumulatedContent += chunk.content;
-              self.emitter.emit("response:chunk", chunk.content);
-              self.emitter.emit("stream:chunk", {
-                type: "stream:chunk",
-                content: chunk.content,
-                metadata: {
-                  chunkIndex: chunkCount,
-                  totalLength: accumulatedContent.length,
-                  ...(isNoOutputSentinel && { noOutput: true }),
-                },
-                timestamp: Date.now(),
-              });
-            }
-            yield chunk;
-          }
-
-          // Reviewer follow-up: fire fallback when no *non-sentinel*
-          // output was produced — sentinel-only and truly empty streams
-          // both qualify, but media-only streams (audio/image) do not.
-          //
-          // fallbackOnMaxSteps: false exempts one no-output shape — a turn
-          // the provider reports as ended at the caller's own maxSteps bound
-          // (metadata.stopReason "step-cap", a mutable reference the native
-          // loops fill by drain time). That bound is the caller's budget,
-          // not a provider failure, and retrying it on another provider
-          // spends that provider's tokens to exceed a budget the caller set.
-          const cappedByCallerBudget =
-            enhancedOptions.fallbackOnMaxSteps === false &&
-            mcpStreamOutcome.metadata?.stopReason === "step-cap";
-          if (
-            realOutputChunks === 0 &&
-            !cappedByCallerBudget &&
-            !metadata.fallbackAttempted &&
-            !enhancedOptions.disableInternalFallback &&
-            currentToolCalls().length === 0 &&
-            currentToolResults().length === 0
-          ) {
-            const fallbackStream = self.handleStreamFallback(
-              metadata,
-              streamState,
-              originalPrompt,
-              enhancedOptions,
-              providerName,
-              (content: string) => {
-                accumulatedContent += content;
-              },
-            );
-            const { stream: incrementalFallback } =
-              await self.createIncrementalTTSStream({
-                stream: fallbackStream,
-                ttsOptions: enhancedOptions.tts,
-                providerName,
-                fallbackProvider: enhancedOptions.provider,
-                ttsMetadata: streamTtsMetadata,
-                onComplete: (result) => {
-                  streamedTTSResult = result;
-                },
-              });
-            yield* incrementalFallback;
-          }
-
-          ttsResolver?.(streamedTTSResult);
-
-          // `streamState.finishReason` starts as a "stop" placeholder, before a
-          // single chunk exists. A provider that records how the turn really
-          // ended in metadata (a token-limit cut, a content filter, a step cap
-          // that left tool calls pending) has that adopted here, once the drain
-          // is done. Only the three unified values count: a raw vendor string
-          // or "stop" leaves the graded reason alone, and a fallback's own
-          // value is never overwritten.
-          const drainedFinishReason = mcpStreamOutcome.metadata?.finishReason;
-          if (
-            !metadata.fallbackAttempted &&
-            (drainedFinishReason === "length" ||
-              drainedFinishReason === "tool-calls" ||
-              drainedFinishReason === "content-filter")
-          ) {
-            streamState.finishReason = drainedFinishReason;
-          }
-
-          resolvedUsage = mcpStreamOutcome.usage;
-          if (!resolvedUsage && mcpStreamOutcome.analytics) {
-            try {
-              const resolved = await Promise.resolve(
-                mcpStreamOutcome.analytics,
-              );
-              if (resolved?.tokenUsage) {
-                resolvedUsage = resolved.tokenUsage;
-              }
-            } catch {
-              // non-blocking
-            }
-          }
-          if (resolvedUsage) {
-            mcpStreamOutcome.usage = resolvedUsage as TokenUsage;
-          }
-
-          self.emitter.emit("stream:complete", {
-            type: "stream:complete",
-            content: accumulatedContent,
-            provider: metadata.fallbackProvider ?? providerName,
-            model:
-              metadata.fallbackModel ??
-              mcpStreamOutcome.model ??
-              enhancedOptions.model,
-            finishReason: streamState.finishReason ?? "stop",
-            prompt:
-              enhancedOptions.input?.text ||
-              (enhancedOptions as Record<string, unknown>).prompt,
-            metadata: {
-              chunkCount,
-              totalLength: accumulatedContent.length,
-              durationMs: Date.now() - streamStartTime,
-              sessionId,
-              usage: resolvedUsage,
-              finishReason: streamState.finishReason ?? "stop",
-              ...(metadata.fallbackAttempted && {
-                primaryProvider: providerName,
-                primaryModel: enhancedOptions.model,
-                fallback: true,
-              }),
-            },
-            timestamp: Date.now(),
-          });
-        } catch (error) {
-          logger.debug("[NeuroLink.stream] Stream error occurred", {
-            error: error instanceof Error ? error.message : String(error),
-            name: error instanceof Error ? error.name : "UnknownError",
-            provider: providerName,
-            model: enhancedOptions.model,
-            chunkCount,
-            totalLength: accumulatedContent.length,
-            durationMs: Date.now() - streamStartTime,
-            sessionId,
-          });
-          streamError = error;
-          self.emitter.emit("stream:error", {
-            type: "stream:error",
-            content: error instanceof Error ? error.message : String(error),
-            provider: providerName,
-            model: enhancedOptions.model,
-            metadata: {
-              chunkCount,
-              totalLength: accumulatedContent.length,
-              durationMs: Date.now() - streamStartTime,
-              errorName: error instanceof Error ? error.name : "UnknownError",
-              sessionId,
-            },
-            timestamp: Date.now(),
-          });
-          throw error;
-        } finally {
-          // Belt-and-braces: if TTS Mode 2 was requested but synthesis never
-          // ran (stream errored before reaching the TTS block, or Mode 2 path
-          // was skipped), resolve the audio promise to undefined so callers
-          // awaiting `streamResult.audio` never hang. Uses the explicit
-          // `ttsResolver` param (M11), not a side-channel cast.
-          // m4: a duplicate resolution is a silent no-op — Promise resolvers
-          // never throw, so no try/catch needed here.
-          ttsResolver?.(undefined);
-
-          logger.debug(
-            "[NeuroLink.stream] Stream finished, performing cleanup",
-            {
-              provider: providerName,
-              model: enhancedOptions.model,
-              totalChunks: chunkCount,
-              totalLength: accumulatedContent.length,
-              durationMs: Date.now() - streamStartTime,
-              fallbackAttempted: metadata.fallbackAttempted,
-              guardrailsBlocked: metadata.guardrailsBlocked,
-              error: metadata.error,
-            },
-          );
-
-          // Curator P2-4: emit `generation:end` exactly once per stream so
-          // cost listeners receive the same contract as for `generate()`.
-          // The previous implementation only fired `stream:complete`, leaving
-          // any subscriber to `generation:end` with zero events.
-          //
-          // Dedup: native provider stream paths (Gemini 3 on Vertex / Google
-          // AI Studio) already emit `generation:end` themselves so Pipeline B
-          // (Langfuse) records a GENERATION observation. Skip our emit when
-          // they already fired — preserves their Pipeline B observation
-          // source and keeps the "exactly once" contract. Per-stream flag
-          // is concurrency-safe because it's scoped via AsyncLocalStorage.
-          if (!dedupContext.providerEmitted) {
-            try {
-              const finalProvider =
-                metadata.fallbackProvider ?? providerName ?? "unknown";
-              const finalModel =
-                metadata.fallbackModel ??
-                mcpStreamOutcome.model ??
-                enhancedOptions.model ??
-                "unknown";
-              const finalFinishReason = streamError
-                ? "error"
-                : (streamState.finishReason ?? "stop");
-              self.emitter.emit("generation:end", {
-                provider: finalProvider,
-                model: finalModel,
-                responseTime: Date.now() - streamStartTime,
-                toolsUsed: currentToolCalls().map((t) => t.toolName),
-                timestamp: Date.now(),
-                result: {
-                  content: accumulatedContent,
-                  usage: resolvedUsage,
-                  model: finalModel,
-                  provider: finalProvider,
-                  finishReason: finalFinishReason,
-                },
-                prompt:
-                  enhancedOptions.input?.text ||
-                  (enhancedOptions as Record<string, unknown>).prompt,
-                temperature: enhancedOptions.temperature,
-                maxTokens: enhancedOptions.maxTokens,
-                success: !streamError,
-                error: streamError
-                  ? streamError instanceof Error
-                    ? streamError.message
-                    : String(streamError)
-                  : undefined,
-                pipelineAHandled: true,
-              });
-            } catch (emitError) {
-              logger.debug(
-                "[NeuroLink.stream] generation:end listener threw — ignored",
-                {
-                  error:
-                    emitError instanceof Error
-                      ? emitError.message
-                      : String(emitError),
-                },
-              );
-            }
-          }
-
-          self._disableToolCacheForCurrentRequest = false;
-          self._toolCacheKeysServedThisRequest = new Set();
-          self._generationTurnActive = false;
-          cleanupListeners();
-
-          streamSpan.setAttribute(
-            "neurolink.response_time_ms",
-            Date.now() - spanStartTime,
-          );
-          streamSpan.setAttribute(
-            ATTR.NL_OUTPUT_LENGTH,
-            accumulatedContent.length,
-          );
-          const primaryFailed = !!(metadata.error || streamError);
-          streamSpan.setAttribute(
-            ATTR.GEN_AI_FINISH_REASON,
-            primaryFailed ? "error" : "stop",
-          );
-          if (metadata.fallbackAttempted) {
-            streamSpan.setAttribute("neurolink.fallback_triggered", true);
-            if (metadata.fallbackProvider) {
-              streamSpan.setAttribute(
-                "neurolink.fallback_provider",
-                metadata.fallbackProvider,
-              );
-            }
-          }
-          if (primaryFailed) {
-            streamSpan.setStatus({
-              code: SpanStatusCode.ERROR,
-              message:
-                metadata.error ||
-                (streamError instanceof Error
-                  ? streamError.message
-                  : String(streamError)),
-            });
-          } else {
-            streamSpan.setStatus({ code: SpanStatusCode.OK });
-          }
-          streamSpan.end();
-
-          if (accumulatedContent.trim()) {
-            logger.info(`[NeuroLink.stream] stream() - COMPLETE SUCCESS`, {
-              provider: providerName,
-              model: enhancedOptions.model,
-              responseTimeMs: Date.now() - startTime,
-              contentLength: accumulatedContent.length,
-              fallback: metadata.fallbackAttempted,
-            });
-          }
-
-          await self.storeStreamConversationMemory({
-            enhancedOptions,
-            providerName,
-            originalPrompt,
-            accumulatedContent,
-            startTime,
-            eventSequence,
-            // Read only now, after the stream drained: the provider's
-            // toolsUsed is a live getter that resolves as the loop runs.
-            resultToolsUsed: (() => {
-              const fromResult = mcpStreamOutcome.toolsUsed;
-              if (Array.isArray(fromResult) && fromResult.length > 0) {
-                return fromResult;
-              }
-              const fromCalls = currentToolCalls().map((t) => t.toolName);
-              return fromCalls.length > 0 ? fromCalls : undefined;
-            })(),
-          });
-        }
-      })();
+      const drain = {
+        enhancedOptions,
+        originalPrompt,
+        startTime,
+        streamStartTime,
+        sessionId,
+        streamSpan,
+        spanStartTime,
+        ttsResolver,
+        incrementalStream,
+        streamTtsMetadata,
+        tts,
+        mcpStreamOutcome,
+        providerName,
+        dedupContext,
+        streamState,
+        currentToolCalls,
+        currentToolResults,
+        metadata,
+        eventSequence,
+        cleanupListeners,
+      };
+      const processedStream = this.drainStandardStreamOnce(drain);
       const streamResult = await this.processStreamResult(
         processedStream,
         enhancedOptions,
@@ -11957,6 +11568,390 @@ Current user's request: ${currentInput}`;
         undefined,
       );
     }
+  }
+
+  private drainStandardStreamOnce(
+    drain: Parameters<NeuroLink["drainStandardStream"]>[0],
+  ): AsyncIterableIterator<ProviderStreamChunk> {
+    const stream = this.drainStandardStream(drain);
+    let started = false;
+    const guarded: AsyncIterableIterator<ProviderStreamChunk> = {
+      next: () => {
+        started = true;
+        return stream.next();
+      },
+      return: async (value) => {
+        if (!started) {
+          started = true;
+          await this.settleStandardStreamDrain(drain, {
+            accumulatedContent: "",
+            chunkCount: 0,
+            streamError: undefined,
+            resolvedUsage: undefined,
+          });
+        }
+        return stream.return(value);
+      },
+      throw: (error) => stream.throw(error),
+      [Symbol.asyncIterator]: () => guarded,
+    };
+    return guarded;
+  }
+
+  private async *drainStandardStream(drain: {
+    enhancedOptions: StreamOptions;
+    originalPrompt: string;
+    startTime: number;
+    streamStartTime: number;
+    sessionId: string | undefined;
+    streamSpan: ReturnType<typeof tracers.sdk.startSpan>;
+    spanStartTime: number;
+    ttsResolver?: (value: TTSResult | undefined) => void;
+    incrementalStream: AsyncIterable<ProviderStreamChunk>;
+    streamTtsMetadata: TTSMetadata | undefined;
+    tts: { result?: TTSResult };
+    mcpStreamOutcome: StreamResult;
+    providerName: string;
+    dedupContext: StreamGenerationEndContext;
+    streamState: Parameters<NeuroLink["handleStreamFallback"]>[1];
+    currentToolCalls: () => StreamToolCall[];
+    currentToolResults: () => StreamToolResult[];
+    metadata: Parameters<NeuroLink["handleStreamFallback"]>[0];
+    eventSequence: ReturnType<
+      NeuroLink["setupStreamEventListeners"]
+    >["eventSequence"];
+    cleanupListeners: () => void;
+  }): AsyncGenerator<ProviderStreamChunk> {
+    const {
+      enhancedOptions,
+      originalPrompt,
+      streamStartTime,
+      sessionId,
+      ttsResolver,
+      incrementalStream,
+      streamTtsMetadata,
+      tts,
+      mcpStreamOutcome,
+      providerName,
+      streamState,
+      currentToolCalls,
+      currentToolResults,
+      metadata,
+    } = drain;
+    let accumulatedContent = "";
+    let chunkCount = 0;
+    let streamError: Error | undefined;
+    let resolvedUsage: TokenUsage | undefined;
+    let realOutputChunks = 0;
+    try {
+      for await (const chunk of incrementalStream) {
+        chunkCount++;
+        const isNoOutputSentinel =
+          chunk !== null &&
+          typeof chunk === "object" &&
+          "metadata" in chunk &&
+          (chunk as { metadata?: { noOutput?: boolean } }).metadata
+            ?.noOutput === true;
+        const hasTextContent =
+          chunk &&
+          "content" in chunk &&
+          typeof chunk.content === "string" &&
+          chunk.content.length > 0;
+        const hasMediaPayload =
+          chunk !== null &&
+          typeof chunk === "object" &&
+          "type" in chunk &&
+          (chunk.type === "audio" ||
+            chunk.type === "tts_audio" ||
+            chunk.type === "image");
+        if (!isNoOutputSentinel && (hasTextContent || hasMediaPayload)) {
+          realOutputChunks++;
+        }
+        if (chunk && "content" in chunk && typeof chunk.content === "string") {
+          accumulatedContent += chunk.content;
+          this.emitter.emit("response:chunk", chunk.content);
+          this.emitter.emit("stream:chunk", {
+            type: "stream:chunk",
+            content: chunk.content,
+            metadata: {
+              chunkIndex: chunkCount,
+              totalLength: accumulatedContent.length,
+              ...(isNoOutputSentinel && { noOutput: true }),
+            },
+            timestamp: Date.now(),
+          });
+        }
+        yield chunk;
+      }
+
+      const cappedByCallerBudget =
+        enhancedOptions.fallbackOnMaxSteps === false &&
+        mcpStreamOutcome.metadata?.stopReason === "step-cap";
+      if (
+        realOutputChunks === 0 &&
+        !cappedByCallerBudget &&
+        !metadata.fallbackAttempted &&
+        !enhancedOptions.disableInternalFallback &&
+        currentToolCalls().length === 0 &&
+        currentToolResults().length === 0
+      ) {
+        const fallbackStream = this.handleStreamFallback(
+          metadata,
+          streamState,
+          originalPrompt,
+          enhancedOptions,
+          providerName,
+          (content: string) => {
+            accumulatedContent += content;
+          },
+        );
+        const { stream: incrementalFallback } =
+          await this.createIncrementalTTSStream({
+            stream: fallbackStream,
+            ttsOptions: enhancedOptions.tts,
+            providerName,
+            fallbackProvider: enhancedOptions.provider,
+            ttsMetadata: streamTtsMetadata,
+            onComplete: (result) => {
+              tts.result = result;
+            },
+          });
+        yield* incrementalFallback;
+      }
+
+      ttsResolver?.(tts.result);
+
+      const drainedFinishReason = mcpStreamOutcome.metadata?.finishReason;
+      if (
+        !metadata.fallbackAttempted &&
+        (drainedFinishReason === "length" ||
+          drainedFinishReason === "tool-calls" ||
+          drainedFinishReason === "content-filter")
+      ) {
+        streamState.finishReason = drainedFinishReason;
+      }
+
+      resolvedUsage = mcpStreamOutcome.usage;
+      if (!resolvedUsage && mcpStreamOutcome.analytics) {
+        try {
+          const resolved = await Promise.resolve(mcpStreamOutcome.analytics);
+          if (resolved?.tokenUsage) {
+            resolvedUsage = resolved.tokenUsage;
+          }
+        } catch {
+          // non-blocking
+        }
+      }
+      if (resolvedUsage) {
+        mcpStreamOutcome.usage = resolvedUsage;
+      }
+
+      this.emitter.emit("stream:complete", {
+        type: "stream:complete",
+        content: accumulatedContent,
+        provider: metadata.fallbackProvider ?? providerName,
+        model:
+          metadata.fallbackModel ??
+          mcpStreamOutcome.model ??
+          enhancedOptions.model,
+        finishReason: streamState.finishReason ?? "stop",
+        prompt:
+          enhancedOptions.input?.text ||
+          (enhancedOptions as StreamOptions & { prompt?: string }).prompt,
+        metadata: {
+          chunkCount,
+          totalLength: accumulatedContent.length,
+          durationMs: Date.now() - streamStartTime,
+          sessionId,
+          usage: resolvedUsage,
+          finishReason: streamState.finishReason ?? "stop",
+          ...(metadata.fallbackAttempted && {
+            primaryProvider: providerName,
+            primaryModel: enhancedOptions.model,
+            fallback: true,
+          }),
+        },
+        timestamp: Date.now(),
+      });
+    } catch (error) {
+      logger.debug("[NeuroLink.stream] Stream error occurred", {
+        error: error instanceof Error ? error.message : String(error),
+        name: error instanceof Error ? error.name : "UnknownError",
+        provider: providerName,
+        model: enhancedOptions.model,
+        chunkCount,
+        totalLength: accumulatedContent.length,
+        durationMs: Date.now() - streamStartTime,
+        sessionId,
+      });
+      streamError = error instanceof Error ? error : new Error(String(error));
+      this.emitter.emit("stream:error", {
+        type: "stream:error",
+        content: error instanceof Error ? error.message : String(error),
+        provider: providerName,
+        model: enhancedOptions.model,
+        metadata: {
+          chunkCount,
+          totalLength: accumulatedContent.length,
+          durationMs: Date.now() - streamStartTime,
+          errorName: error instanceof Error ? error.name : "UnknownError",
+          sessionId,
+        },
+        timestamp: Date.now(),
+      });
+      throw error;
+    } finally {
+      await this.settleStandardStreamDrain(drain, {
+        accumulatedContent,
+        chunkCount,
+        streamError,
+        resolvedUsage,
+      });
+    }
+  }
+
+  private async settleStandardStreamDrain(
+    drain: Parameters<NeuroLink["drainStandardStream"]>[0],
+    outcome: {
+      accumulatedContent: string;
+      chunkCount: number;
+      streamError: Error | undefined;
+      resolvedUsage: TokenUsage | undefined;
+    },
+  ): Promise<void> {
+    const {
+      enhancedOptions,
+      originalPrompt,
+      startTime,
+      streamStartTime,
+      streamSpan,
+      spanStartTime,
+      ttsResolver,
+      mcpStreamOutcome,
+      providerName,
+      dedupContext,
+      streamState,
+      currentToolCalls,
+      metadata,
+      eventSequence,
+      cleanupListeners,
+    } = drain;
+    const { accumulatedContent, chunkCount, streamError, resolvedUsage } =
+      outcome;
+    ttsResolver?.(undefined);
+
+    logger.debug("[NeuroLink.stream] Stream finished, performing cleanup", {
+      provider: providerName,
+      model: enhancedOptions.model,
+      totalChunks: chunkCount,
+      totalLength: accumulatedContent.length,
+      durationMs: Date.now() - streamStartTime,
+      fallbackAttempted: metadata.fallbackAttempted,
+      guardrailsBlocked: metadata.guardrailsBlocked,
+      error: metadata.error,
+    });
+
+    if (!dedupContext.providerEmitted) {
+      try {
+        const finalProvider =
+          metadata.fallbackProvider ?? providerName ?? "unknown";
+        const finalModel =
+          metadata.fallbackModel ??
+          mcpStreamOutcome.model ??
+          enhancedOptions.model ??
+          "unknown";
+        const finalFinishReason = streamError
+          ? "error"
+          : (streamState.finishReason ?? "stop");
+        this.emitter.emit("generation:end", {
+          provider: finalProvider,
+          model: finalModel,
+          responseTime: Date.now() - streamStartTime,
+          toolsUsed: currentToolCalls().map((t) => t.toolName),
+          timestamp: Date.now(),
+          result: {
+            content: accumulatedContent,
+            usage: resolvedUsage,
+            model: finalModel,
+            provider: finalProvider,
+            finishReason: finalFinishReason,
+          },
+          prompt:
+            enhancedOptions.input?.text ||
+            (enhancedOptions as StreamOptions & { prompt?: string }).prompt,
+          temperature: enhancedOptions.temperature,
+          maxTokens: enhancedOptions.maxTokens,
+          success: !streamError,
+          error: streamError?.message,
+          streamed: true,
+        });
+      } catch (emitError) {
+        logger.debug(
+          "[NeuroLink.stream] generation:end listener threw — ignored",
+          {
+            error:
+              emitError instanceof Error
+                ? emitError.message
+                : String(emitError),
+          },
+        );
+      }
+    }
+
+    this._disableToolCacheForCurrentRequest = false;
+    this._toolCacheKeysServedThisRequest = new Set();
+    this._generationTurnActive = false;
+    cleanupListeners();
+
+    streamSpan.setAttribute("response_time_ms", Date.now() - spanStartTime);
+    streamSpan.setAttribute(ATTR.NL_OUTPUT_LENGTH, accumulatedContent.length);
+    const primaryFailed = !!(metadata.error || streamError);
+    streamSpan.setAttribute(
+      ATTR.GEN_AI_FINISH_REASON,
+      primaryFailed ? "error" : "stop",
+    );
+    if (metadata.fallbackAttempted) {
+      streamSpan.setAttribute("fallback_triggered", true);
+      if (metadata.fallbackProvider) {
+        streamSpan.setAttribute("fallback_provider", metadata.fallbackProvider);
+      }
+    }
+    if (primaryFailed) {
+      streamSpan.setStatus({
+        code: SpanStatusCode.ERROR,
+        message: metadata.error || streamError?.message,
+      });
+    } else {
+      streamSpan.setStatus({ code: SpanStatusCode.OK });
+    }
+    streamSpan.end();
+
+    if (accumulatedContent.trim()) {
+      logger.info(`[NeuroLink.stream] stream() - COMPLETE SUCCESS`, {
+        provider: providerName,
+        model: enhancedOptions.model,
+        responseTimeMs: Date.now() - startTime,
+        contentLength: accumulatedContent.length,
+        fallback: metadata.fallbackAttempted,
+      });
+    }
+
+    await this.storeStreamConversationMemory({
+      enhancedOptions,
+      providerName,
+      originalPrompt,
+      accumulatedContent,
+      startTime,
+      eventSequence,
+      resultToolsUsed: (() => {
+        const fromResult = mcpStreamOutcome.toolsUsed;
+        if (Array.isArray(fromResult) && fromResult.length > 0) {
+          return fromResult;
+        }
+        const fromCalls = currentToolCalls().map((t) => t.toolName);
+        return fromCalls.length > 0 ? fromCalls : undefined;
+      })(),
+    });
   }
 
   /** Wrap one provider stream with incremental TTS synthesis. */
@@ -13621,7 +13616,7 @@ Current user's request: ${currentInput}`;
                 finishReason: "stop",
               },
               success: true,
-              pipelineAHandled: true,
+              streamed: true,
             });
           } catch {
             /* non-blocking */
@@ -14909,30 +14904,24 @@ Current user's request: ${currentInput}`;
       options,
     );
     return tracers.mcp.startActiveSpan(
-      "neurolink.tool.execute",
+      toolSpanName(toolName),
       {
         attributes: {
           "tool.name": toolName,
           "tool.type": executionContext.toolType,
           "tool.input_size": executionContext.inputSize,
-          "tool.input_preview": executionContext.truncatedInput,
-          // NOT marked langfuse.internal: this is the public entrypoint for
-          // `NeuroLink.executeTool()`. Direct API callers (not going through
-          // the AI SDK) would otherwise produce zero Langfuse observations —
-          // the lower-level registry/discovery spans are internal wrappers.
-          // AI-SDK-initiated custom tools will produce both ai.toolCall and
-          // this span, which is the accepted tradeoff for keeping direct
-          // invocations observable.
         },
       },
-      (toolSpan) =>
-        this.executeToolWithSpan<T>(
+      (toolSpan) => {
+        observe(toolSpan, "tool", { input: params });
+        return this.executeToolWithSpan<T>(
           toolName,
           params,
           options,
           executionContext,
           toolSpan,
-        ),
+        );
+      },
     ) as Promise<T>;
   }
 
@@ -14963,7 +14952,6 @@ Current user's request: ${currentInput}`;
       | undefined;
     toolType: "mcp" | "custom" | "external";
     inputSize: number;
-    truncatedInput: string;
     options: typeof options;
     hitlState: HITLExecutionState;
   } {
@@ -14991,8 +14979,6 @@ Current user's request: ${currentInput}`;
       externalTool,
       toolType,
       inputSize: inputStr.length,
-      truncatedInput:
-        inputStr.length > 2048 ? inputStr.substring(0, 2048) : inputStr,
       options,
       hitlState: { triggered: false },
     };
@@ -15026,17 +15012,30 @@ Current user's request: ${currentInput}`;
         options,
         executionContext,
       );
-      return await this.runPreparedToolExecution(
+      const result = await this.runPreparedToolExecution<T>(
         toolName,
         params,
         prepared,
         executionContext,
         toolSpan,
       );
+      const failed =
+        isNonNullObject(result) &&
+        "isError" in result &&
+        result.isError === true;
+      observe(toolSpan, "tool", {
+        output: result,
+        ...(failed && {
+          level: "ERROR",
+          statusMessage: extractMcpErrorText(result),
+        }),
+      });
+      return result;
     } catch (outerError) {
+      const errMsg =
+        outerError instanceof Error ? outerError.message : String(outerError);
+      observe(toolSpan, "tool", { level: "ERROR", statusMessage: errMsg });
       if (!(outerError instanceof NeuroLinkError)) {
-        const errMsg =
-          outerError instanceof Error ? outerError.message : String(outerError);
         toolSpan.recordException(
           outerError instanceof Error ? outerError : new Error(errMsg),
         );
@@ -18177,7 +18176,7 @@ Current user's request: ${currentInput}`;
     // so wrapping it to carry resolution metadata would be a breaking
     // change for every existing direct caller.
     tracers.mcp.startActiveSpan(
-      "neurolink.mcp.toolNameRepair",
+      "mcp.toolNameRepair",
       {
         attributes: {
           "mcp.server_id": serverId,
@@ -18917,7 +18916,16 @@ Current user's request: ${currentInput}`;
    * @throws when no decision provider is configured, or the call fails
    */
   async decide(options: DecisionOptions): Promise<DecisionResult> {
-    return this.runDecide(options);
+    const { sessionId, requestId }: DecisionCallerOptions = options;
+    this.holdTelemetry();
+    return setLangfuseContext(
+      {
+        ...options.context,
+        sessionId: sessionId ?? options.context?.sessionId,
+        requestId: requestId ?? options.context?.requestId,
+      },
+      () => this.runDecide(options),
+    );
   }
 
   /**
@@ -19118,7 +19126,7 @@ Current user's request: ${currentInput}`;
     if (
       !this.resolveDecisionProviderName(merged.provider, merged.credentials)
     ) {
-      return null;
+      return this.tryRunDecide(merged);
     }
 
     // Wire id → the host's own id, so answers can be handed back under the
@@ -19339,20 +19347,23 @@ Current user's request: ${currentInput}`;
       options.provider,
       options.credentials,
     );
-    if (!providerName) {
-      throw new Error(
-        `No decision provider is configured. Set ${describeDecisionProviderKeys()} (in the environment or in \`credentials\`), or pass \`provider\` explicitly.`,
-      );
-    }
-
     const questionIds = Object.keys(options.questions);
     const questionCount = questionIds.length;
+    const decisionDescriptor = providerName
+      ? PROVIDER_DESCRIPTORS_BY_NAME.get(
+          (PROVIDER_ALIAS_INDEX.get(providerName.toLowerCase()) ??
+            providerName) as AIProviderName,
+        )
+      : undefined;
+    const requestedModel =
+      options.model ??
+      (decisionDescriptor && this.registeredDecisionModel(decisionDescriptor));
     const stamped: DecisionCallerOptions = options;
+    const hostQuestionCount = questionIds.filter(isHostDecisionKey).length;
     const siteSpanAttributes = stamped.site
       ? {
           "decision.site": stamped.site,
-          "decision.host_question_count":
-            questionIds.filter(isHostDecisionKey).length,
+          "decision.host_question_count": hostQuestionCount,
         }
       : {};
 
@@ -19364,8 +19375,9 @@ Current user's request: ${currentInput}`;
     // stopped working looks exactly like one that was never configured.
     return withSpan(
       {
-        name: `gen_ai.${providerName}.decide`,
+        name: "decide",
         tracer: tracers.decision,
+        expectedFailure: () => !providerName,
         attributes: {
           "gen_ai.system": providerName,
           "gen_ai.operation.name": "decide",
@@ -19376,6 +19388,25 @@ Current user's request: ${currentInput}`;
         },
       },
       async (otelSpan) => {
+        observe(otelSpan, "generation", {
+          model: requestedModel,
+          input: { state: options.state, questions: options.questions },
+          metadata: {
+            provider: providerName,
+            ...(stamped.site && {
+              site: stamped.site,
+              host_question_count: hostQuestionCount,
+            }),
+          },
+        });
+        if (!providerName) {
+          const reason = `No decision provider is configured. Set ${describeDecisionProviderKeys()} (in the environment or in \`credentials\`), or pass \`provider\` explicitly.`;
+          observe(otelSpan, "generation", {
+            level: "WARNING",
+            statusMessage: reason,
+          });
+          throw new Error(reason);
+        }
         const { traceId, parentSpanId } = getActiveTraceContext();
         const startedAt = Date.now();
         let span = SpanSerializer.createSpan(
@@ -19444,6 +19475,15 @@ Current user's request: ${currentInput}`;
           if (result.requestId) {
             otelSpan.setAttribute("gen_ai.response.id", result.requestId);
           }
+          observe(otelSpan, "generation", {
+            model: result.model,
+            output: result.answers,
+            usageDetails: usageDetails({
+              input: result.usage.inputTokens,
+              output: result.usage.outputTokens,
+            }),
+            costDetails: { total: cost },
+          });
 
           span.durationMs = Date.now() - startedAt;
           span = SpanSerializer.updateAttributes(span, {
@@ -19511,6 +19551,7 @@ Current user's request: ${currentInput}`;
   async tryDecide(
     options: DecisionCallerOptions,
   ): Promise<DecisionResult | null> {
+    this.holdTelemetry();
     return this.siteDecide(options);
   }
 
@@ -20303,10 +20344,8 @@ Current user's request: ${currentInput}`;
    *
    * Worker mode is the framework-provided version of the config block every
    * consumer used to copy by hand: conversation memory OFF, orchestration
-   * OFF, observability inherited from this instance with
-   * `autoDetectExternalProvider: true` + `skipLangfuseSpanProcessor: true`
-   * (worker spans join the host's tracer without duplicate Langfuse
-   * exports), credentials inherited, the host's tool registry shared (so
+   * OFF, observability inherited from this instance (worker spans join the
+   * host's tracer provider), credentials inherited, the host's tool registry shared (so
    * worker tool calls reuse the host's connections), and an internal log
    * bridge attached with a caller-supplied tag.
    *
@@ -20328,14 +20367,7 @@ Current user's request: ${currentInput}`;
       // Worker-mode fields always win over the config merge.
       conversationMemory: { enabled: false },
       enableOrchestration: false,
-      observability: {
-        ...(this.observabilityConfig ?? {}),
-        langfuse: {
-          ...(this.observabilityConfig?.langfuse ?? {}),
-          autoDetectExternalProvider: true,
-          skipLangfuseSpanProcessor: true,
-        },
-      },
+      observability: this.observabilityConfig,
       ...(options?.shareToolRegistry !== false && {
         toolRegistry: this.toolRegistry,
       }),
@@ -21158,8 +21190,7 @@ Current user's request: ${currentInput}`;
       // 1. Flush and shutdown OpenTelemetry
       try {
         logger.debug("[NeuroLink] Flushing and shutting down OpenTelemetry...");
-        await flushOpenTelemetry();
-        await shutdownOpenTelemetry();
+        await this.releaseTelemetryHold();
         logger.debug("[NeuroLink] OpenTelemetry shutdown successfully");
       } catch (error) {
         const err =

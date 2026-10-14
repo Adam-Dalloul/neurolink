@@ -123,6 +123,25 @@ void runSuite(async () => {
     }
   });
 
+  await test("numeric settings in prose survive while credential assignments are masked", async () => {
+    const settings = "set max_tokens: 4096 and tokens: 5 for this run";
+    assert(
+      spanContentAttribute(settings) === settings,
+      "a numeric setting was masked",
+    );
+    const assignments =
+      "OPENAI_API_KEY=sk-abcdefghijklmnop1234 DB_PASSWORD=hunter2x GITHUB_TOKEN=ghp_abcdefghijklmnopqrst1234 Authorization: Bearer abcdefghijklmnop.qrstuvwx";
+    const written = spanContentAttribute(assignments);
+    for (const leaked of [
+      "sk-abcdefghijklmnop1234",
+      "hunter2x",
+      "ghp_abcdefghijklmnopqrst1234",
+      "abcdefghijklmnop.qrstuvwx",
+    ]) {
+      assert(!written.includes(leaked), `redaction left ${leaked}`);
+    }
+  });
+
   await test("odd values never throw and never leak", async () => {
     const circular: Record<string, unknown> = { name: "loop" };
     circular.self = circular;
@@ -256,12 +275,13 @@ void runSuite(async () => {
       system: "S".repeat(60_000),
       messages: [{ role: "user", content: "M".repeat(60_000) }],
     });
-    const parsed: { system?: string } = JSON.parse(body);
-    const opening = (parsed.system ?? "").match(/^S*/)?.[0].length ?? 0;
+    const parsed: Array<{ role: string; content: string }> = JSON.parse(body);
+    const system = parsed.find((entry) => entry.role === "system")?.content;
+    const opening = (system ?? "").match(/^S*/)?.[0].length ?? 0;
     assert(body.length <= 40_000, "the attribute exceeds the cap");
     assert(opening >= 2_000, `the system opening is ${opening} characters`);
     assert(
-      (parsed.system ?? "").includes("[truncated"),
+      (system ?? "").includes("[truncated"),
       "the system prompt does not say it was shortened",
     );
   });
@@ -290,9 +310,28 @@ void runSuite(async () => {
         ],
       },
     ]).flat();
-  type TrimmedRequest = {
-    messages?: Array<{ role?: string; content?: unknown }>;
-    omittedMessages?: number;
+  type ChatEntry = {
+    role?: string;
+    content?: string | Array<Record<string, string | number | boolean | null>>;
+  };
+  const omittedMarker = /^\[(\d+) earlier messages omitted\]$/;
+  const splitConversation = (
+    body: string,
+  ): { kept: ChatEntry[]; omitted: number } => {
+    const entries: ChatEntry[] = JSON.parse(body);
+    const marker = entries.find(
+      (entry) =>
+        entry.role === "system" &&
+        typeof entry.content === "string" &&
+        omittedMarker.test(entry.content),
+    );
+    const omitted = Number(
+      omittedMarker.exec(String(marker?.content ?? ""))?.[1] ?? 0,
+    );
+    return {
+      kept: entries.filter((entry) => entry.role !== "system"),
+      omitted,
+    };
   };
   const blocksOf = (message: {
     content?: unknown;
@@ -314,13 +353,9 @@ void runSuite(async () => {
         ...toolRoundTrips(30, 2_000),
       ],
     });
-    const parsed: TrimmedRequest = JSON.parse(body);
-    const kept = parsed.messages ?? [];
+    const { kept, omitted } = splitConversation(body);
     assert(body.length <= 40_000, `the attribute is ${body.length} characters`);
-    assert(
-      (parsed.omittedMessages ?? 0) > 0,
-      "the request should have been over the cap",
-    );
+    assert(omitted > 0, "the request should have been over the cap");
     assert(
       body.includes("CURRENT-QUESTION"),
       "the current question was dropped from an over-cap request",
@@ -437,8 +472,7 @@ void runSuite(async () => {
         ...toolRoundTrips(10, 4_000),
       ],
     });
-    const parsed: TrimmedRequest = JSON.parse(body);
-    const first = (parsed.messages ?? [])[0];
+    const first = splitConversation(body).kept[0];
     assert(body.length <= 40_000, `the attribute is ${body.length} characters`);
     assert(
       first?.role === "user" &&
@@ -460,7 +494,11 @@ void runSuite(async () => {
       ],
     };
     assert(
-      spanModelRequestAttribute(request) === JSON.stringify(request),
+      spanModelRequestAttribute(request) ===
+        JSON.stringify([
+          { role: "system", content: request.system },
+          ...request.messages,
+        ]),
       "a request that fits must serialize unchanged",
     );
   });
@@ -508,7 +546,7 @@ void runSuite(async () => {
       "a raised cap must keep a 100,000-character tool result whole",
     );
     assert(
-      raised.request === JSON.stringify(conversation),
+      raised.request === JSON.stringify(conversation.messages),
       "a raised cap must keep the whole conversation",
     );
   });

@@ -901,11 +901,9 @@ async function test_otel_spans_for_tools(): Promise<boolean | null> {
   const sdk = new NeuroLink({
     observability: {
       langfuse: {
-        enabled: true,
         publicKey: "test-public-key",
         secretKey: "test-secret-key",
         baseUrl: "http://localhost:9999",
-        useExternalTracerProvider: true,
       },
     },
   });
@@ -960,8 +958,7 @@ async function test_otel_spans_for_tools(): Promise<boolean | null> {
     // Look for tool execution spans with specific span names
     const toolSpan = allSpans.find(
       (s) =>
-        (s.name === "neurolink.tool.execute" ||
-          s.name === "neurolink.tools.execute_custom") &&
+        s.attributes["langfuse.observation.type"] === "tool" &&
         (getAttr(s, "gen_ai.tool.name") !== undefined ||
           getAttr(s, "mcp.tool_name") !== undefined ||
           getAttr(s, "tool.name") !== undefined),
@@ -983,8 +980,7 @@ async function test_otel_spans_for_tools(): Promise<boolean | null> {
       getAttr(toolSpan, "mcp.tool_name") ||
       getAttr(toolSpan, "tool.name");
     const providerAttr =
-      getAttr(toolSpan, "neurolink.provider") ||
-      getAttr(toolSpan, "gen_ai.system");
+      getAttr(toolSpan, "sdk.provider") || getAttr(toolSpan, "gen_ai.system");
     const statusCode = toolSpan.status.code;
 
     log(`  [detail] Tool span name: "${toolSpan.name}"`, "green");

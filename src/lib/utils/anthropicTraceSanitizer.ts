@@ -1,4 +1,4 @@
-import type { VertexAnthropicMessage } from "../types/index.js";
+import type { AnthropicTraceMessage } from "../types/index.js";
 
 /**
  * Strips base64 image/PDF payloads from Anthropic messages before they go on a
@@ -6,7 +6,7 @@ import type { VertexAnthropicMessage } from "../types/index.js";
  * Other block types pass through; the serializer still applies its length cap.
  */
 export function sanitizeAnthropicMessagesForTrace(
-  messages: VertexAnthropicMessage[],
+  messages: AnthropicTraceMessage[],
 ): Array<Record<string, unknown>> {
   return messages.map((message) => {
     if (typeof message.content === "string") {
@@ -15,7 +15,11 @@ export function sanitizeAnthropicMessagesForTrace(
     return {
       role: message.role,
       content: message.content.map((block) => {
-        if (block.type === "image" || block.type === "document") {
+        if (
+          (block.type === "image" || block.type === "document") &&
+          typeof block.source === "object" &&
+          typeof block.source.data === "string"
+        ) {
           return {
             type: block.type,
             media_type: block.source.media_type,

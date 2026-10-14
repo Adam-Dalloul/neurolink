@@ -1433,11 +1433,13 @@ NeuroLink creates a `search_knowledge_base` tool the model can call. For full co
 
 ### Observability (Langfuse + OTEL)
 
-NeuroLink initializes its own `TracerProvider` by default. If your app already has one, set `useExternalTracerProvider: true` to avoid duplicate registration errors, then add NeuroLink's span processors via `getSpanProcessors()` to your OTEL SDK setup.
+Set `LANGFUSE_PUBLIC_KEY` and `LANGFUSE_SECRET_KEY` (optionally `LANGFUSE_BASE_URL`, `LANGFUSE_TRACING_ENVIRONMENT`, `LANGFUSE_RELEASE`) and tracing turns on with no config. `observability: { langfuse: false }` disables it; `observability: { langfuse: { publicKey, secretKey, baseUrl, environment, release, mask, exportMode, flushAt, flushInterval } }` overrides env. Full input and output are captured by default; use `mask` for sensitive data.
 
-Use `setLangfuseContext({ userId, sessionId, conversationId, ... }, callback)` to attach context to traces. Trace names default to `userId:operationName`; customize with `traceNameFormat`.
+One instrumentation, one pipeline: OTEL spans -> `ExporterSpanProcessor` -> `SpanData` -> `ExporterRegistry` -> exporters. NeuroLink's own provider registers `LangfuseExporter` (OTLP/HTTP JSON to `POST /api/public/otel/v1/traces`) in the shared registry, plus an OTLP processor when `OTEL_EXPORTER_OTLP_ENDPOINT` is set; Observations keep their native types and carry user/session on every span. If the host already registered a global `TracerProvider`, NeuroLink creates no provider but still registers `LangfuseExporter` on the shared registry when Langfuse is configured; the host adds `createExporterSpanProcessor()` (recommended) to its provider, or `new LangfuseSpanProcessor()` (`@langfuse/otel`, a devDependency only) with its own keys and without NeuroLink's mask, chunking or retry. OpenTelemetry stays generic: other backends use their own span processor on the host provider, or `OTEL_EXPORTER_OTLP_ENDPOINT`.
 
-Key exports: `getSpanProcessors`, `setLangfuseContext`, `getLangfuseContext`, `getTracer`, `createContextEnricher`, `isUsingExternalTracerProvider`.
+Per-call attributes go on `generate({ context: { userId, sessionId, tags, metadata, traceName, conversationId, requestId } })`, or wrap code in `setLangfuseContext(params, fn)`. Observation attributes are written by NeuroLink; do not hand-write `langfuse.*` keys.
+
+Key exports: `flushOpenTelemetry`, `shutdownOpenTelemetry` (terminal; the last holder shuts down), `setLangfuseContext`, `getLangfuseHealthStatus`, `isOpenTelemetryInitialized`. Details and the migration table: `docs/features/observability.md`.
 
 ### Thinking Level
 

@@ -598,7 +598,7 @@ export class AnthropicOAuth {
   ): Promise<OAuthFlowTokens> {
     return withSpan(
       {
-        name: "neurolink.auth.oauth.exchange_code",
+        name: "auth.oauth.exchange_code",
         tracer: tracers.auth,
         attributes: { "auth.oauth.grant_type": "authorization_code" },
       },
@@ -724,7 +724,7 @@ export class AnthropicOAuth {
   ): Promise<OAuthFlowTokens> {
     return withSpan(
       {
-        name: "neurolink.auth.oauth.refresh",
+        name: "auth.oauth.refresh",
         tracer: tracers.auth,
         attributes: { "auth.oauth.grant_type": "refresh_token" },
       },
@@ -968,7 +968,7 @@ export class AnthropicOAuth {
   ): Promise<void> {
     return withSpan(
       {
-        name: "neurolink.auth.oauth.revoke",
+        name: "auth.oauth.revoke",
         tracer: tracers.auth,
         attributes: { "auth.oauth.token_type": tokenType },
       },

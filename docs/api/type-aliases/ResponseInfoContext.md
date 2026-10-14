@@ -35,3 +35,15 @@ Response-side details parsed from the upstream reply (model, finish, tools).
 > `optional` **toolCalls?**: `string`[]
 
 Names of the tools the model actually invoked (tool_use blocks).
+
+---
+
+### output?
+
+> `optional` **output?**: [`JsonValue`](JsonValue.md) \| `object`[]
+
+---
+
+### firstOutputAt?
+
+> `optional` **firstOutputAt?**: `number`

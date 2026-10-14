@@ -42,6 +42,8 @@ import { DEFAULT_MAX_STEPS } from "../core/constants.js";
 import { streamAnalyticsCollector } from "../core/streamAnalytics.js";
 import type { NeuroLink } from "../neurolink.js";
 import { createProxyFetch } from "../proxy/proxyFetch.js";
+import { observeGeneration } from "../telemetry/observation.js";
+import { StepSpans, withGeneration } from "../telemetry/withSpan.js";
 import type {
   DeferredUsage,
   LanguageModel,
@@ -1304,6 +1306,7 @@ export abstract class OpenAIChatCompletionsProvider extends BaseProvider {
       return runNativeGenerateLoop(
         {
           doGenerate,
+          provider: this.providerName,
           ...createNativeGenerateGuard({
             provider: this.providerName,
             availableInputTokens: getAvailableInputTokens(
@@ -1948,6 +1951,7 @@ export abstract class OpenAIChatCompletionsProvider extends BaseProvider {
         runNativeGenerateLoop(
           {
             doGenerate,
+            provider: this.providerName,
             conversation: conv,
             toolsRecord: {},
             modelId,
@@ -2691,6 +2695,7 @@ export abstract class OpenAIChatCompletionsProvider extends BaseProvider {
         ...(reasoningTokens > 0 ? { reasoningTokens } : {}),
       };
     };
+    const stepSpans = new StepSpans();
     try {
       // May grow mid-turn: hydrated tools with wire-unsafe names need
       // reverse-mapping even when the initial name set required none.
@@ -2705,6 +2710,7 @@ export abstract class OpenAIChatCompletionsProvider extends BaseProvider {
       const stepRecords: StepResult<Record<string, Tool>>[] = [];
 
       for (let step = 0; step < maxSteps; step++) {
+        stepSpans.begin(step + 1);
         const openAIToolChoice = await stepToolChoice(step, stepRecords);
         // Mid-turn discovery sync: search_tools (tools.discovery) hydrates
         // new tools into toolsRecord between steps. Dispatch already re-reads
@@ -2782,18 +2788,20 @@ export abstract class OpenAIChatCompletionsProvider extends BaseProvider {
           conversation.push(...guarded);
         }
 
-        const stepResult = await this.streamOneStep({
-          modelId,
-          url,
-          fetchImpl,
-          abortSignal,
-          options,
-          conversation,
-          openAITools,
-          openAIToolChoice,
-          pushChunk,
-          responseFormat,
-        });
+        const stepResult = await stepSpans.run(() =>
+          this.streamObservedStep({
+            modelId,
+            url,
+            fetchImpl,
+            abortSignal,
+            options,
+            conversation,
+            openAITools,
+            openAIToolChoice,
+            pushChunk,
+            responseFormat,
+          }),
+        );
         lastObservedPromptTokens = stepResult.usage?.prompt_tokens;
         stepFinish = stepResult.finishReason;
         if (stepResult.usage) {
@@ -2813,16 +2821,18 @@ export abstract class OpenAIChatCompletionsProvider extends BaseProvider {
           break;
         }
 
-        await this.executeToolBatch({
-          stepResult,
-          conversation,
-          toolsRecord,
-          toolNameFromWire: effectiveToolNameFromWire,
-          toolsUsed,
-          toolExecutionSummaries,
-          options,
-          stepIndex: step,
-        });
+        await stepSpans.run(() =>
+          this.executeToolBatch({
+            stepResult,
+            conversation,
+            toolsRecord,
+            toolNameFromWire: effectiveToolNameFromWire,
+            toolsUsed,
+            toolExecutionSummaries,
+            options,
+            stepIndex: step,
+          }),
+        );
         const executed = toolExecutionSummaries.slice(
           -stepResult.toolCalls.size,
         );
@@ -2895,7 +2905,64 @@ export abstract class OpenAIChatCompletionsProvider extends BaseProvider {
       resolveFinish("error");
       closeChannel();
       throw err;
+    } finally {
+      stepSpans.end();
     }
+  }
+
+  private streamObservedStep(
+    args: Parameters<OpenAIChatCompletionsProvider["streamOneStep"]>[0],
+  ): Promise<OpenAICompatSSEResult> {
+    return withGeneration(
+      {
+        operation: "stream",
+        provider: this.providerName,
+        model: args.modelId,
+        modelParameters: {
+          temperature: args.options.temperature,
+          maxTokens: args.options.maxTokens,
+          topP: args.options.topP,
+          thinkingLevel: args.options.thinkingConfig?.thinkingLevel,
+        },
+        input: { messages: args.conversation },
+      },
+      async (span) => {
+        let firstChunkAt: Date | undefined;
+        const result = await this.streamOneStep({
+          ...args,
+          pushChunk: (chunk) => {
+            firstChunkAt ??= new Date();
+            args.pushChunk(chunk);
+          },
+        });
+        const toolCalls = [...result.toolCalls.values()].map((call) => ({
+          id: call.id,
+          name: call.name,
+          args: call.argsBuffered,
+        }));
+        observeGeneration(span, {
+          provider: this.providerName,
+          model: args.modelId,
+          responseModel: result.model,
+          output: {
+            text: result.text,
+            ...(result.reasoning ? { reasoning: result.reasoning } : {}),
+            ...(toolCalls.length > 0 ? { toolCalls } : {}),
+          },
+          usage: result.usage && {
+            promptTokens: result.usage.prompt_tokens,
+            completionTokens: result.usage.completion_tokens,
+            prompt_tokens_details: result.usage.prompt_tokens_details,
+            reasoning_tokens:
+              result.usage.completion_tokens_details?.reasoning_tokens,
+          },
+          finishReason: result.finishReason ?? undefined,
+          aborted: args.abortSignal?.aborted,
+          completionStartTime: firstChunkAt,
+        });
+        return result;
+      },
+    );
   }
 
   private async streamOneStep(args: {

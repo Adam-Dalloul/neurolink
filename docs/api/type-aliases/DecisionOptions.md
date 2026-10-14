@@ -25,3 +25,9 @@ descriptor declares `"decide"` in `inferenceKinds`.
 > `optional` **credentials?**: [`NeurolinkCredentials`](NeurolinkCredentials.md)
 
 Per-call credential overrides, as `generate()` takes.
+
+### context?
+
+> `optional` **context?**: [`NeurolinkTraceContext`](NeurolinkTraceContext.md)
+
+Per-call trace attributes (user, session, tags, trace name, metadata) for this decision's spans.

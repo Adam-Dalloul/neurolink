@@ -1,9 +1,12 @@
 import { createStreamChannel } from "./streamChannel.js";
+import { observeGeneration } from "../telemetry/observation.js";
+import { StepSpans, withGeneration } from "../telemetry/withSpan.js";
 import type {
   AgenticLoopAdapter,
   AgenticLoopChunk,
   AgenticLoopOptions,
   AgenticLoopResult,
+  AgenticLoopStepRequest,
   AgenticLoopStepResult,
   AgenticLoopToolCall,
   AgenticLoopToolCallResult,
@@ -320,6 +323,78 @@ async function dispatchStepTools(params: {
   return { toolResults, executions, dispatched, abortedMidBatch };
 }
 
+async function executeObservedStep<TConversation>(
+  adapter: AgenticLoopAdapter<TConversation>,
+  request: AgenticLoopStepRequest,
+  channel: { push(chunk: AgenticLoopChunk): void },
+  signal: AbortSignal,
+  span: AgenticLoopOptions["span"],
+): Promise<AgenticLoopStepResult> {
+  // Pre-first-chunk 429/5xx retry: watch whether THIS attempt of
+  // THIS step pushes anything to the shared channel before it
+  // throws. `hasEmitted` resets at the top of every attempt
+  // withProviderRetry makes; the instant an attempt emits and then
+  // throws, the thrown error is rewrapped as a PostEmissionStepError
+  // (no status/branding info survives the rewrap), which
+  // isRetryableProviderError() duck-types as non-retryable — so
+  // withProviderRetry gives up immediately instead of sleeping and
+  // re-invoking executeStep, which would duplicate/interleave
+  // output already sent to the consumer. The original error (not
+  // the wrapper) is what the caller of runAgenticLoop ultimately
+  // sees, via the unwrap in the catch below.
+  let hasEmitted = false;
+  let firstChunkAt: Date | undefined;
+  const watchedChannel = {
+    push: (chunk: AgenticLoopChunk) => {
+      hasEmitted = true;
+      firstChunkAt ??= new Date();
+      channel.push(chunk);
+    },
+  };
+  return withGeneration(request.generation ?? {}, async (generationSpan) => {
+    let result: AgenticLoopStepResult;
+    try {
+      result = await withProviderRetry(
+        async () => {
+          hasEmitted = false;
+          try {
+            return await adapter.executeStep(request, watchedChannel, signal);
+          } catch (err) {
+            throw hasEmitted ? new PostEmissionStepError(err) : err;
+          }
+        },
+        span,
+        `${adapter.providerLabel}.step`,
+        undefined,
+        signal,
+      );
+    } catch (err) {
+      throw err instanceof PostEmissionStepError ? err.cause : err;
+    }
+    observeGeneration(generationSpan, {
+      provider: request.generation?.provider,
+      model: request.generation?.model,
+      responseModel: result.model,
+      output: {
+        text: result.text,
+        ...(result.reasoning ? { reasoning: result.reasoning } : {}),
+        ...(result.toolCalls.length > 0 ? { toolCalls: result.toolCalls } : {}),
+      },
+      usage: {
+        inputTokens: result.usage.inputTokens,
+        outputTokens: result.usage.outputTokens,
+        cacheReadTokens: result.usage.cacheReadTokens,
+        cacheCreationTokens: result.usage.cacheWriteTokens,
+        reasoningTokens: result.usage.reasoningTokens,
+      },
+      finishReason: result.rawStopReason,
+      aborted: signal.aborted,
+      completionStartTime: firstChunkAt,
+    });
+    return result;
+  });
+}
+
 /**
  * Run one adapter-parameterized agentic tool-calling turn. Owns the
  * maxSteps-bounded loop, generic tool dispatch (with an opt-in
@@ -373,12 +448,14 @@ export function runAgenticLoop<TConversation>(
     // ever writes to it, so the loop is the same loop it was.
     let stepCap = adapter.maxSteps;
     const turnStartedAt = Date.now();
+    const stepSpans = new StepSpans();
 
     try {
       for (let step = 0; step < stepCap; step++) {
         if (internalAbort.signal.aborted) {
           break;
         }
+        stepSpans.begin(step + 1);
 
         if (adapter.planReclaim) {
           const reclaimed = adapter.planReclaim(conversation, step);
@@ -404,51 +481,15 @@ export function runAgenticLoop<TConversation>(
           failedTools.delete(name);
         }
 
-        // Pre-first-chunk 429/5xx retry: watch whether THIS attempt of
-        // THIS step pushes anything to the shared channel before it
-        // throws. `hasEmitted` resets at the top of every attempt
-        // withProviderRetry makes; the instant an attempt emits and then
-        // throws, the thrown error is rewrapped as a PostEmissionStepError
-        // (no status/branding info survives the rewrap), which
-        // isRetryableProviderError() duck-types as non-retryable — so
-        // withProviderRetry gives up immediately instead of sleeping and
-        // re-invoking executeStep, which would duplicate/interleave
-        // output already sent to the consumer. The original error (not
-        // the wrapper) is what the caller of runAgenticLoop ultimately
-        // sees, via the unwrap in the catch below.
-        let hasEmitted = false;
-        const watchedChannel = {
-          push: (chunk: AgenticLoopChunk) => {
-            hasEmitted = true;
-            channel.push(chunk);
-          },
-        };
-        let stepResult: AgenticLoopStepResult;
-        try {
-          stepResult = await withProviderRetry(
-            async () => {
-              hasEmitted = false;
-              try {
-                return await adapter.executeStep(
-                  request,
-                  watchedChannel,
-                  internalAbort.signal,
-                );
-              } catch (err) {
-                throw hasEmitted ? new PostEmissionStepError(err) : err;
-              }
-            },
-            // The caller's span, when it passes one. withProviderRetry writes
-            // gen_ai.provider.total_attempts here, so a loop that threaded a
-            // span before it moved onto this engine keeps emitting it.
-            options.span,
-            `${adapter.providerLabel}.step`,
-            undefined,
+        const stepResult = await stepSpans.run(() =>
+          executeObservedStep(
+            adapter,
+            request,
+            channel,
             internalAbort.signal,
-          );
-        } catch (err) {
-          throw err instanceof PostEmissionStepError ? err.cause : err;
-        }
+            options.span,
+          ),
+        );
 
         usage = sumUsage(usage, stepResult.usage);
         rawStopReason = stepResult.rawStopReason;
@@ -478,14 +519,16 @@ export function runAgenticLoop<TConversation>(
           hadToolCallsAtCap = true;
         }
 
-        const dispatch = await dispatchStepTools({
-          calls: stepResult.toolCalls,
-          adapter,
-          tools: options.tools,
-          failedTools,
-          abortSignal: internalAbort.signal,
-          toolTimeoutMs: resolveToolTimeoutMs(options.toolTimeoutMs),
-        });
+        const dispatch = await stepSpans.run(() =>
+          dispatchStepTools({
+            calls: stepResult.toolCalls,
+            adapter,
+            tools: options.tools,
+            failedTools,
+            abortSignal: internalAbort.signal,
+            toolTimeoutMs: resolveToolTimeoutMs(options.toolTimeoutMs),
+          }),
+        );
         const toolResults = dispatch.toolResults;
         allToolCalls.push(...dispatch.dispatched);
         allToolExecutions.push(...dispatch.executions);
@@ -612,6 +655,7 @@ export function runAgenticLoop<TConversation>(
       channel.error(err);
       throw err;
     } finally {
+      stepSpans.end();
       // close() after error() is harmless: it only flips `done`, and
       // streamChannel.error() keeps its error state intact regardless of a
       // later close() call.

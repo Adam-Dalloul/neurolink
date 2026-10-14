@@ -5,30 +5,19 @@
  */
 
 import { logger } from "../utils/logger.js";
+import { getPropagatedAttributesFromContext } from "@langfuse/core";
+import { LangfuseOtelSpanAttributes } from "@langfuse/tracing";
 import { SpanStatusCode, propagation, context } from "@opentelemetry/api";
 import { tracers } from "../telemetry/tracers.js";
 import type { ProxyAgent } from "undici";
 import { shouldBypassProxy } from "./utils/noProxyUtils.js";
 import type {
   GoogleGenAIHttpOptions,
-  LangfuseContext,
   ParsedProxyConfig,
   ProxyEnvironmentSnapshot,
 } from "../types/index.js";
 import { createHash } from "node:crypto";
 import { TRANSIENT_NETWORK_CODES } from "../constants/networkErrorCodes.js";
-
-async function getLangfuseContext(): Promise<LangfuseContext | undefined> {
-  try {
-    // Dynamic import to avoid hard dependency — getLangfuseContext is only
-    // available when the observability module is loaded.
-    const mod =
-      await import("../services/server/ai/observability/instrumentation.js");
-    return mod.getLangfuseContext?.();
-  } catch {
-    return undefined;
-  }
-}
 
 /**
  * Inject OTel trace context (traceparent/tracestate) and NeuroLink session context
@@ -54,23 +43,26 @@ function mergeTraceHeaders(
   return existingHeaders;
 }
 
-async function injectTraceContext(
+function injectTraceContext(
   input: RequestInfo | URL,
   init?: RequestInit,
-): Promise<RequestInit> {
+): RequestInit {
   const carrier: Record<string, string> = {};
   propagation.inject(context.active(), carrier);
 
-  // Also inject NeuroLink session context from Langfuse AsyncLocalStorage
-  const langfuseContext = await getLangfuseContext();
-  if (langfuseContext?.sessionId) {
-    carrier["x-neurolink-session-id"] = langfuseContext.sessionId;
-  }
-  if (langfuseContext?.userId) {
-    carrier["x-neurolink-user-id"] = langfuseContext.userId;
-  }
-  if (langfuseContext?.conversationId) {
-    carrier["x-neurolink-conversation-id"] = langfuseContext.conversationId;
+  const propagated = getPropagatedAttributesFromContext(context.active());
+  for (const [header, key] of [
+    ["x-neurolink-session-id", LangfuseOtelSpanAttributes.TRACE_SESSION_ID],
+    ["x-neurolink-user-id", LangfuseOtelSpanAttributes.TRACE_USER_ID],
+    [
+      "x-neurolink-conversation-id",
+      `${LangfuseOtelSpanAttributes.TRACE_METADATA}.conversationId`,
+    ],
+  ]) {
+    const value = propagated[key];
+    if (typeof value === "string" && value) {
+      carrier[header] = value;
+    }
   }
 
   if (Object.keys(carrier).length === 0) {
@@ -156,69 +148,66 @@ async function fetchWithRetry(
 ): Promise<Response> {
   const hostname = extractHostname(url);
 
-  return fetchTracer.startActiveSpan(
-    "neurolink.http.fetchWithRetry",
-    async (span) => {
-      span.setAttribute("http.request.max_retries", maxRetries);
-      span.setAttribute("http.request.hostname", hostname);
-      span.setAttribute("http.request.method", init?.method || "GET");
+  return fetchTracer.startActiveSpan("http.fetchWithRetry", async (span) => {
+    span.setAttribute("http.request.max_retries", maxRetries);
+    span.setAttribute("http.request.hostname", hostname);
+    span.setAttribute("http.request.method", init?.method || "GET");
 
-      // eslint-disable-next-line no-useless-assignment
-      let totalAttempts = 0;
+    // eslint-disable-next-line no-useless-assignment
+    let totalAttempts = 0;
 
-      try {
-        for (let attempt = 0; attempt <= maxRetries; attempt++) {
-          totalAttempts = attempt + 1;
-          try {
-            const response = await fetch(url as RequestInfo | URL, init);
+    try {
+      for (let attempt = 0; attempt <= maxRetries; attempt++) {
+        totalAttempts = attempt + 1;
+        try {
+          const response = await fetch(url as RequestInfo | URL, init);
 
-            // Record success attributes
+          // Record success attributes
+          span.setAttribute("http.request.total_attempts", totalAttempts);
+          span.setAttribute("http.response.status_code", response.status);
+          span.setStatus({ code: SpanStatusCode.OK });
+
+          return response;
+        } catch (error: unknown) {
+          const isRetryable = isTransientNetworkError(error);
+          const err = error as { code?: string; message?: string };
+
+          if (!isRetryable || attempt === maxRetries) {
+            // Final failure — record on span and rethrow
             span.setAttribute("http.request.total_attempts", totalAttempts);
-            span.setAttribute("http.response.status_code", response.status);
-            span.setStatus({ code: SpanStatusCode.OK });
-
-            return response;
-          } catch (error: unknown) {
-            const isRetryable = isTransientNetworkError(error);
-            const err = error as { code?: string; message?: string };
-
-            if (!isRetryable || attempt === maxRetries) {
-              // Final failure — record on span and rethrow
-              span.setAttribute("http.request.total_attempts", totalAttempts);
-              span.setStatus({
-                code: SpanStatusCode.ERROR,
-                message:
-                  err?.message || err?.code || "fetchWithRetry final failure",
-              });
-              span.recordException(
-                error instanceof Error ? error : new Error(String(error)),
-              );
-              throw error;
-            }
-
-            // Transient error — add retry event and continue loop
-            const delay = baseDelay * Math.pow(2, attempt);
-            span.addEvent("http.request.retry", {
-              "retry.attempt": attempt + 1,
-              "retry.delay_ms": delay,
-              "retry.error": (err?.code || err?.message || String(error)).slice(
-                0,
-                256,
-              ),
+            span.setStatus({
+              code: SpanStatusCode.ERROR,
+              message:
+                err?.message || err?.code || "fetchWithRetry final failure",
             });
-
-            logger.debug(
-              `[fetchWithRetry] Transient error (${err?.code || err?.message}), retrying in ${delay}ms (attempt ${attempt + 1}/${maxRetries})`,
+            span.recordException(
+              error instanceof Error ? error : new Error(String(error)),
             );
-            await new Promise((r) => setTimeout(r, delay));
+            throw error;
           }
+
+          // Transient error — add retry event and continue loop
+          const delay = baseDelay * Math.pow(2, attempt);
+          span.addEvent("http.request.retry", {
+            "retry.attempt": attempt + 1,
+            "retry.delay_ms": delay,
+            "retry.error": (err?.code || err?.message || String(error)).slice(
+              0,
+              256,
+            ),
+          });
+
+          logger.debug(
+            `[fetchWithRetry] Transient error (${err?.code || err?.message}), retrying in ${delay}ms (attempt ${attempt + 1}/${maxRetries})`,
+          );
+          await new Promise((r) => setTimeout(r, delay));
         }
-        throw new Error("fetchWithRetry exhausted"); // unreachable
-      } finally {
-        span.end();
       }
-    },
-  );
+      throw new Error("fetchWithRetry exhausted"); // unreachable
+    } finally {
+      span.end();
+    }
+  });
 }
 
 /**
@@ -499,7 +488,7 @@ function createDirectFetchHandler(): typeof fetch {
     input: RequestInfo | URL,
     init?: RequestInit,
   ): Promise<Response> => {
-    const enrichedInit = await injectTraceContext(input, init);
+    const enrichedInit = injectTraceContext(input, init);
     const reqId = `req-${Date.now()}-${Math.random().toString(36).substring(2, 11)}`;
     const startTs = Date.now();
     const url = getTargetUrl(input);
@@ -557,7 +546,7 @@ async function executeProxiedFetch(
   proxyEnv: ProxyEnvironmentSnapshot,
 ): Promise<Response> {
   const { httpsProxy, httpProxy, allProxy, socksProxy, noProxy } = proxyEnv;
-  init = await injectTraceContext(input, init);
+  init = injectTraceContext(input, init);
   const requestId = `req-${Date.now()}-${Math.random().toString(36).substring(2, 11)}`;
   const requestStartTime = Date.now();
   const targetUrl = getTargetUrl(input);

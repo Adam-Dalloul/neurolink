@@ -319,6 +319,8 @@ export const isValidTraceId=()=>false;
 export const isValidSpanId=()=>false;
 export const INVALID_SPAN_CONTEXT={traceId:'0',spanId:'0',traceFlags:0};
 export const baggageEntryMetadataFromString=()=>({});
+export const createContextKey=(d)=>Symbol.for(d);
+export const ProxyTracerProvider=class{getTracer(){return NOOP_TRACER}getDelegate(){return this}setDelegate(){}getDelegateTracer(){}};
 export const NodeSDK=class{start(){}shutdown(){return Promise.resolve()}};
 export const BasicTracerProvider=class{constructor(){}register(){}addSpanProcessor(){}getTracer(){return NOOP_TRACER}shutdown(){return Promise.resolve()}};
 export const NodeTracerProvider=class{register(){}addSpanProcessor(){}getTracer(){return NOOP_TRACER}shutdown(){return Promise.resolve()}};

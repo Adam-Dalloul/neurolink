@@ -138,7 +138,7 @@ export class TokenStore {
   async saveTokens(provider: string, tokens: StoredOAuthTokens): Promise<void> {
     return withSpan(
       {
-        name: "neurolink.auth.token.save",
+        name: "auth.token.save",
         tracer: tracers.auth,
         attributes: {
           "auth.provider": provider,
@@ -246,7 +246,7 @@ export class TokenStore {
   async loadTokens(provider: string): Promise<StoredOAuthTokens | null> {
     return withSpan(
       {
-        name: "neurolink.auth.token.load",
+        name: "auth.token.load",
         tracer: tracers.auth,
         attributes: { "auth.provider": provider },
       },
@@ -352,7 +352,7 @@ export class TokenStore {
   async clearTokens(provider: string): Promise<void> {
     return withSpan(
       {
-        name: "neurolink.auth.token.clear",
+        name: "auth.token.clear",
         tracer: tracers.auth,
         attributes: { "auth.provider": provider },
       },
@@ -431,7 +431,7 @@ export class TokenStore {
   async getValidToken(provider: string): Promise<string | null> {
     return withSpan(
       {
-        name: "neurolink.auth.token.get_valid",
+        name: "auth.token.get_valid",
         tracer: tracers.auth,
         attributes: { "auth.provider": provider },
       },

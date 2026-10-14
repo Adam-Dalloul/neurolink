@@ -1,113 +1,107 @@
-/**
- * Langfuse Exporter
- * Exports spans to Langfuse observability platform
- */
-
+import {
+  DEFAULT_BASE_URL,
+  DEFAULT_FLUSH_AT,
+  DEFAULT_FLUSH_INTERVAL_MS,
+  DEFAULT_TIMEOUT_MS,
+  HEALTH_PATH,
+  TRACES_PATH,
+} from "../../constants/langfuse.js";
 import type {
   ExporterHealthStatus,
   ExportResult,
+  LangfuseAttributePolicy,
   LangfuseExporterConfig,
+  OtlpSpan,
   SpanData,
 } from "../../types/index.js";
-import { SpanType } from "../../types/index.js";
-import { SpanSerializer } from "../utils/spanSerializer.js";
+import { logger } from "../../utils/logger.js";
+import {
+  chunkOtlpSpans,
+  toOtlpAttributes,
+  toOtlpSpan,
+} from "../otlpEncoding.js";
 import { BaseExporter } from "./baseExporter.js";
 
+let credentialsWarned = false;
+
+function isRetryable(status: number): boolean {
+  return status === 429 || status >= 500;
+}
+
 /**
- * Langfuse exporter for LLM observability
- * Supports traces, generations, spans, and scores
+ * @description Exporter that delivers observation spans to Langfuse's OTLP/HTTP JSON endpoint (`POST /api/public/otel/v1/traces`), which keeps native observation types and identity on every observation. Spans are queued without blocking and sent in batches; failed requests are retried with backoff when the failure is transient (429, 5xx, network).
  */
 export class LangfuseExporter extends BaseExporter {
-  private readonly publicKey: string;
-  private readonly secretKey: string;
+  private readonly authorization: string;
   private readonly baseUrl: string;
-  private readonly release?: string;
-  private readonly redactIO: boolean;
+  private readonly policy: LangfuseAttributePolicy;
+  private readonly inflight = new Set<Promise<void>>();
 
-  constructor(config: LangfuseExporterConfig) {
-    super("langfuse", config);
-    this.publicKey = config.publicKey;
-    this.secretKey = config.secretKey;
-    this.baseUrl = config.baseUrl ?? "https://cloud.langfuse.com";
-    this.release = config.release;
-    this.redactIO = config.redactIO ?? false;
+  /**
+   * @description Creates an exporter for one Langfuse project.
+   * @param config {LangfuseExporterConfig} - Credentials, endpoint, environment, release, masking and batching options. `environment` and `release` fall back to `LANGFUSE_TRACING_ENVIRONMENT` and `LANGFUSE_RELEASE`, and only fill spans that do not carry them already.
+   */
+  constructor(private readonly langfuse: LangfuseExporterConfig) {
+    super("langfuse", {
+      ...langfuse,
+      maxBufferSize: langfuse.maxBufferSize ?? DEFAULT_FLUSH_AT,
+    });
+    this.authorization = `Basic ${Buffer.from(
+      `${langfuse.publicKey}:${langfuse.secretKey}`,
+    ).toString("base64")}`;
+    this.baseUrl = (langfuse.baseUrl ?? DEFAULT_BASE_URL).replace(/\/+$/, "");
+    this.policy = {
+      environment:
+        langfuse.environment ?? process.env.LANGFUSE_TRACING_ENVIRONMENT,
+      release: langfuse.release ?? process.env.LANGFUSE_RELEASE,
+      redactIO: langfuse.redactIO ?? false,
+      mask: langfuse.mask,
+    };
   }
 
   async initialize(): Promise<void> {
     if (this.initialized) {
       return;
     }
-
-    // Verify credentials with a simple check
-    if (!this.publicKey || !this.secretKey) {
+    if (!this.langfuse.publicKey || !this.langfuse.secretKey) {
       throw new Error("Langfuse publicKey and secretKey are required");
     }
-
     this.initialized = true;
-    this.startFlushInterval(this.config.flushIntervalMs ?? 5000);
+    this.startFlushInterval(
+      this.config.flushIntervalMs ?? DEFAULT_FLUSH_INTERVAL_MS,
+    );
+    this.flushInterval?.unref();
   }
 
   async exportSpan(span: SpanData): Promise<ExportResult> {
-    const startTime = Date.now();
-
-    try {
-      // Create trace if this is a root span
-      if (!span.parentSpanId) {
-        await this.createTrace(span);
-      }
-
-      // Create span/generation based on type
-      if (span.type === SpanType.MODEL_GENERATION) {
-        await this.createGeneration(span);
-      } else {
-        await this.createSpan(span);
-      }
-
-      return this.createSuccessResult(1, Date.now() - startTime);
-    } catch (error) {
-      return this.createFailureResult(
-        [span.spanId],
-        error instanceof Error ? error.message : String(error),
-        Date.now() - startTime,
-      );
-    }
+    this.bufferSpan(span);
+    return this.createSuccessResult(1, 0);
   }
 
   async exportBatch(spans: SpanData[]): Promise<ExportResult> {
     const startTime = Date.now();
-    const results = await Promise.allSettled(
-      spans.map((s) => this.exportSpan(s)),
-    );
-
-    const successful = results.filter(
-      (r) => r.status === "fulfilled" && r.value.success,
-    ).length;
-    const failed = spans.length - successful;
-
-    return {
-      success: failed === 0,
-      exportedCount: successful,
-      failedCount: failed,
-      errors: results
-        .filter(
-          (r) =>
-            r.status === "rejected" ||
-            (r.status === "fulfilled" && !r.value.success),
-        )
-        .map((r, i) => ({
-          spanId: spans[i].spanId,
-          error: r.status === "rejected" ? String(r.reason) : "Export failed",
-          retryable: true,
-        })),
-      durationMs: Date.now() - startTime,
-    };
+    await this.deliver(spans.map((span) => toOtlpSpan(span, this.policy)));
+    return this.createSuccessResult(spans.length, Date.now() - startTime);
   }
 
   async flush(): Promise<void> {
-    if (this.buffer.length > 0) {
-      const spans = [...this.buffer];
-      this.buffer = [];
+    const spans = this.buffer;
+    this.buffer = [];
+    if (spans.length > 0) {
+      const pending = this.exportQuietly(spans);
+      this.inflight.add(pending);
+      void pending.finally(() => this.inflight.delete(pending));
+    }
+    await Promise.all(this.inflight);
+  }
+
+  private async exportQuietly(spans: SpanData[]): Promise<void> {
+    try {
       await this.exportBatch(spans);
+    } catch (error) {
+      logger.warn("[langfuse] Export failed", {
+        error: error instanceof Error ? error.message : String(error),
+      });
     }
   }
 
@@ -126,138 +120,75 @@ export class LangfuseExporter extends BaseExporter {
     }
   }
 
-  /**
-   * Verify connectivity to Langfuse API
-   */
   protected async ping(): Promise<void> {
-    const credentials = Buffer.from(
-      `${this.publicKey}:${this.secretKey}`,
-    ).toString("base64");
-
-    const response = await fetch(`${this.baseUrl}/api/public/health`, {
-      method: "GET",
-      headers: {
-        Authorization: `Basic ${credentials}`,
-      },
+    const response = await fetch(`${this.baseUrl}${HEALTH_PATH}`, {
+      headers: { Authorization: this.authorization },
+      signal: AbortSignal.timeout(this.config.timeoutMs ?? DEFAULT_TIMEOUT_MS),
     });
-
-    if (!response.ok && response.status !== 404) {
-      // 404 is acceptable as health endpoint may not exist
+    if (!response.ok) {
       throw new Error(`Langfuse API unreachable: ${response.status}`);
     }
   }
 
-  /**
-   * Create a Langfuse trace
-   */
-  private async createTrace(span: SpanData): Promise<void> {
-    const body = {
-      id: span.traceId,
-      name: span.name,
-      userId: span.attributes["user.id"] as string | undefined,
-      sessionId: span.attributes["session.id"] as string | undefined,
-      // Only pick safe, non-PII attributes for metadata — intentionally excludes
-      // input, output, error.stack, and other user content to match Braintrust exporter
-      metadata: filterSafeMetadata(span.attributes),
-      release: this.release,
-      tags: this.extractTags(span),
-    };
-
-    await this.apiCall("/api/public/traces", body);
-  }
-
-  /**
-   * Create a Langfuse span
-   */
-  private async createSpan(span: SpanData): Promise<void> {
-    const langfuseSpan = SpanSerializer.toLangfuseFormat(span);
-
-    const body: Record<string, unknown> = {
-      ...langfuseSpan,
-      traceId: span.traceId,
-    };
-
-    if (this.redactIO) {
-      delete body["input"];
-      delete body["output"];
+  private async deliver(spans: OtlpSpan[]): Promise<void> {
+    for (const chunk of chunkOtlpSpans(spans)) {
+      try {
+        await this.withRetry(() => this.post(chunk), "export");
+      } catch (error) {
+        logger.warn(`[langfuse] Dropped ${chunk.length} spans`, {
+          error: error instanceof Error ? error.message : String(error),
+        });
+      }
     }
-
-    await this.apiCall("/api/public/spans", body);
   }
 
-  /**
-   * Create a Langfuse generation (for LLM calls)
-   */
-  private async createGeneration(span: SpanData): Promise<void> {
-    const langfuseSpan = SpanSerializer.toLangfuseFormat(span);
-
-    const body: Record<string, unknown> = {
-      traceId: span.traceId,
-      id: langfuseSpan.id,
-      parentObservationId: langfuseSpan.parentObservationId,
-      name: langfuseSpan.name,
-      startTime: langfuseSpan.startTime,
-      endTime: langfuseSpan.endTime,
-      model: span.attributes["ai.model"],
-      modelParameters: {
-        temperature: span.attributes["ai.temperature"],
-        maxTokens: span.attributes["ai.max_tokens"],
-        topP: span.attributes["ai.top_p"],
-      },
-      input: this.redactIO ? undefined : langfuseSpan.input,
-      output: this.redactIO ? undefined : langfuseSpan.output,
-      usage: langfuseSpan.usage,
-      metadata: langfuseSpan.metadata,
-      level: langfuseSpan.level,
-      statusMessage: langfuseSpan.statusMessage,
-    };
-
-    await this.apiCall("/api/public/generations", body);
-  }
-
-  /**
-   * Make API call to Langfuse
-   */
-  private async apiCall(
-    path: string,
-    body: Record<string, unknown>,
-  ): Promise<void> {
-    const credentials = Buffer.from(
-      `${this.publicKey}:${this.secretKey}`,
-    ).toString("base64");
-
-    const response = await fetch(`${this.baseUrl}${path}`, {
+  private async post(spans: OtlpSpan[]): Promise<void> {
+    const response = await fetch(`${this.baseUrl}${TRACES_PATH}`, {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
-        Authorization: `Basic ${credentials}`,
+        Authorization: this.authorization,
+        "x-langfuse-sdk-name": "javascript",
+        "x-langfuse-ingestion-version": "4",
+        "x-langfuse-public-key": this.langfuse.publicKey,
       },
-      body: JSON.stringify(body),
+      body: JSON.stringify({
+        resourceSpans: [
+          {
+            resource: {
+              attributes: toOtlpAttributes({ "service.name": "service" }),
+            },
+            scopeSpans: [{ scope: { name: "sdk" }, spans }],
+          },
+        ],
+      }),
+      signal: AbortSignal.timeout(this.config.timeoutMs ?? DEFAULT_TIMEOUT_MS),
     });
-
+    if (response.status === 401 || response.status === 403) {
+      if (!credentialsWarned) {
+        credentialsWarned = true;
+        logger.warn("[langfuse] Langfuse credentials rejected");
+      }
+      return;
+    }
+    if (isRetryable(response.status)) {
+      throw new Error(`Langfuse API error: ${response.status}`);
+    }
     if (!response.ok) {
-      const text = await response.text();
-      throw new Error(`Langfuse API error: ${response.status} - ${text}`);
+      logger.warn(`[langfuse] Export rejected with ${response.status}`);
+      return;
     }
-  }
-
-  /**
-   * Extract tags from span attributes
-   */
-  private extractTags(span: SpanData): string[] {
-    const tags: string[] = [];
-    if (span.attributes["ai.provider"]) {
-      tags.push(`provider:${span.attributes["ai.provider"]}`);
+    const body = (await response.json().catch(() => ({}))) as {
+      partialSuccess?: {
+        rejectedSpans?: number | string;
+        errorMessage?: string;
+      };
+    };
+    const rejected = Number(body.partialSuccess?.rejectedSpans ?? 0);
+    if (rejected > 0) {
+      logger.warn(`[langfuse] ${rejected} spans rejected`, {
+        message: body.partialSuccess?.errorMessage,
+      });
     }
-    if (span.attributes["ai.model"]) {
-      tags.push(`model:${span.attributes["ai.model"]}`);
-    }
-    if (span.attributes["deployment.environment"]) {
-      tags.push(`env:${span.attributes["deployment.environment"]}`);
-    }
-    return tags;
   }
 }
-
-// Safe metadata filtering imported from shared module to avoid duplication
-import { filterSafeMetadata } from "../utils/safeMetadata.js";

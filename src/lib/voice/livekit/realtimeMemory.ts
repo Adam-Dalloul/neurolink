@@ -18,6 +18,10 @@
  */
 
 import type { JobContext } from "@livekit/agents";
+import { context, trace } from "@opentelemetry/api";
+import { setLangfuseContext } from "../../services/server/ai/observability/instrumentation.js";
+import { observe, observeTrace } from "../../telemetry/observation.js";
+import { tracers } from "../../telemetry/tracers.js";
 import { logger } from "../../utils/logger.js";
 import {
   VOICE_MEMORY_SECRET_ENV,
@@ -29,14 +33,95 @@ import type {
   LiveKitVoiceEventType,
   RealtimeCallMemory,
   RealtimeVoiceMemoryConfig,
+  VoiceTurnRecord,
 } from "../../types/index.js";
 
 const DEFAULT_FLUSH_BUDGET_MS = 800;
+
+function traceTurn(
+  turn: VoiceTurnRecord,
+  call: {
+    sessionId: string;
+    userId: string;
+    roomName?: string;
+    model?: string;
+  },
+): void {
+  const { sessionId, userId, roomName, model } = call;
+  try {
+    setLangfuseContext(
+      {
+        sessionId,
+        userId,
+        tags: ["voice"],
+        traceName: "realtime-turn",
+        metadata: { roomName },
+      },
+      () => {
+        const level = turn.interrupted ? "WARNING" : undefined;
+        const endTime = new Date();
+        const root = tracers.sdk.startSpan("realtime-turn", {
+          startTime: turn.startTime,
+        });
+        observe(root, "agent", {
+          input: turn.userMessage,
+          output: turn.aiResponse,
+          level,
+        });
+        observeTrace(root, {
+          input: turn.userMessage,
+          output: turn.aiResponse,
+        });
+        const inRoot = trace.setSpan(context.active(), root);
+        const generation = tracers.generation.startSpan(
+          "realtime",
+          { startTime: turn.startTime },
+          inRoot,
+        );
+        observe(generation, "generation", {
+          ...(model && { model }),
+          input: [{ role: "user", content: turn.userMessage }],
+          output: [{ role: "assistant", content: turn.aiResponse }],
+          level,
+          metadata: { provider: "vertex" },
+        });
+        generation.end(endTime);
+
+        const events = turn.events ?? [];
+        for (const start of events.filter((e) => e.type === "tool:start")) {
+          const end = events.find(
+            (e) =>
+              e.type === "tool:end" &&
+              e.tool === start.tool &&
+              e.seq > start.seq,
+          );
+          const tool = tracers.sdk.startSpan(
+            String(start.tool),
+            { startTime: start.timestamp },
+            inRoot,
+          );
+          observe(tool, "tool", {
+            input: start.args,
+            output: end?.result ?? end?.error,
+            level: end?.success === false ? "ERROR" : undefined,
+          });
+          tool.end(Math.min(end?.timestamp ?? Infinity, endTime.getTime()));
+        }
+        root.end(endTime);
+      },
+    );
+  } catch (error) {
+    logger.debug("realtime.memory.traceFailed", {
+      error: error instanceof Error ? error.message : String(error),
+    });
+  }
+}
 
 /** Verify the call's binding and prepare its recorder; `undefined` means "no memory for this call". */
 export async function setUpRealtimeCallMemory(
   ctx: Pick<JobContext, "room" | "addShutdownCallback">,
   config: RealtimeVoiceMemoryConfig | undefined,
+  model?: string,
 ): Promise<RealtimeCallMemory | undefined> {
   if (!config) {
     return undefined;
@@ -71,9 +156,14 @@ export async function setUpRealtimeCallMemory(
   let publish:
     | ((type: LiveKitVoiceEventType, data: Record<string, unknown>) => void)
     | undefined;
+  const tracedTurns = new Set<string>();
   const recorder = createVoiceTurnRecorder({
     ...(config.settleMs !== undefined ? { settleMs: config.settleMs } : {}),
     write: async (turn) => {
+      if (!tracedTurns.has(turn.turnId)) {
+        tracedTurns.add(turn.turnId);
+        traceTurn(turn, { sessionId, userId, roomName: ctx.room.name, model });
+      }
       const result = await neurolink.recordConversationTurn({
         sessionId,
         userId,

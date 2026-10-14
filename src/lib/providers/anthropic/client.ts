@@ -1,5 +1,5 @@
 import Anthropic from "@anthropic-ai/sdk";
-import { SpanKind, trace } from "@opentelemetry/api";
+import { trace } from "@opentelemetry/api";
 import {
   existsSync,
   mkdirSync,
@@ -93,7 +93,6 @@ import type {
   SageMakerAsLanguageModel,
   VertexAnthropicMessage,
 } from "../../types/index.js";
-import { calculateCost } from "../../utils/pricing.js";
 import { stringifyAnthropicToolOutput } from "./toolOutput.js";
 import { createAnthropicLoopAdapter } from "./loopAdapter.js";
 import { DEFAULT_BEFORE_STEP_TIMEOUT_MS } from "../../utils/parameterValidation.js";
@@ -209,8 +208,6 @@ function normalizeAnthropicBaseURL(
   }
   return stripped;
 }
-
-const streamTracer = trace.getTracer("neurolink.provider.anthropic");
 
 /**
  * Get OAuth token from stored credentials file or environment.
@@ -2041,6 +2038,7 @@ export class AnthropicProvider extends BaseProvider {
     const loop = await runNativeGenerateLoop(
       {
         doGenerate,
+        provider: this.providerName,
         ...createNativeGenerateGuard({
           provider: "anthropic",
           availableInputTokens: getAvailableInputTokens(
@@ -2331,17 +2329,6 @@ export class AnthropicProvider extends BaseProvider {
     // See the generate path: `disabled` is sent, but only ON constrains sampling.
     const thinkingOn = thinking?.type === "enabled";
 
-    // Wrap the native stream in an OTel span to capture provider-level
-    // latency and token usage (same span name as the pre-migration path so
-    // dashboards stay continuous).
-    const streamSpan = streamTracer.startSpan("neurolink.provider.streamText", {
-      kind: SpanKind.CLIENT,
-      attributes: {
-        "gen_ai.system": "anthropic",
-        "gen_ai.request.model": modelId,
-      },
-    });
-
     const maxSteps = options.maxSteps || DEFAULT_MAX_STEPS;
     const channel = createStreamChannel<{
       content: string;
@@ -2350,52 +2337,6 @@ export class AnthropicProvider extends BaseProvider {
     const { push: pushChunk } = channel;
     const { usagePromise, finishPromise, resolveUsage, resolveFinish } =
       createDeferredAnalytics();
-
-    usagePromise
-      .then((usage) => {
-        streamSpan.setAttribute(
-          "gen_ai.usage.input_tokens",
-          usage.promptTokens || 0,
-        );
-        streamSpan.setAttribute(
-          "gen_ai.usage.output_tokens",
-          usage.completionTokens || 0,
-        );
-        if (usage.cacheReadTokens) {
-          streamSpan.setAttribute(
-            "gen_ai.usage.cached_input_tokens",
-            usage.cacheReadTokens,
-          );
-        }
-        const cost = calculateCost(this.providerName, this.modelName, {
-          input: usage.promptTokens || 0,
-          output: usage.completionTokens || 0,
-          total: usage.totalTokens || 0,
-          ...(usage.cacheReadTokens
-            ? { cacheReadTokens: usage.cacheReadTokens }
-            : {}),
-          ...(usage.cacheCreationTokens
-            ? { cacheCreationTokens: usage.cacheCreationTokens }
-            : {}),
-        });
-        if (cost && cost > 0) {
-          streamSpan.setAttribute("neurolink.cost", cost);
-        }
-      })
-      .catch(() => {
-        // usage may never resolve if the stream is aborted before completion
-      });
-    finishPromise
-      .then((reason) => {
-        streamSpan.setAttribute(
-          "gen_ai.response.finish_reason",
-          reason || "unknown",
-        );
-        streamSpan.end();
-      })
-      .catch(() => {
-        streamSpan.end();
-      });
 
     let capturedProviderError: unknown;
     const client = this.client;
@@ -2665,6 +2606,7 @@ export class AnthropicProvider extends BaseProvider {
 
       const baseAdapter = createAnthropicLoopAdapter({
         client,
+        provider: this.providerName,
         maxSteps,
         toolsRecord,
         buildParams,
@@ -2843,12 +2785,6 @@ export class AnthropicProvider extends BaseProvider {
         };
       }
 
-      // The active span goes with it. Before this loop moved onto the shared
-      // engine it called
-      //   withProviderRetry(fn, trace.getActiveSpan() ?? undefined, label)
-      // and that span is where gen_ai.provider.total_attempts is recorded.
-      // The engine passed `undefined` in its place, so the attribute silently
-      // stopped being emitted for every native Anthropic turn.
       const activeSpan = trace.getActiveSpan();
 
       // The caller's step-boundary callback, made finite and cancellable

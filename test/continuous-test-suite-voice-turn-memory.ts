@@ -1464,7 +1464,7 @@ void runSuite(async () => {
     );
     assertEqual(
       JSON.stringify(greeting.context),
-      "{}",
+      '{"tags":["voice"]}',
       "no session and no user in context",
     );
     assertEqual(greeting.modality, "voice", "still marked voice");

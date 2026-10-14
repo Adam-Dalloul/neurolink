@@ -64,6 +64,9 @@ import {
   type TestRecord,
 } from "./utils/mockFetch.js";
 
+delete process.env.LANGFUSE_PUBLIC_KEY;
+delete process.env.LANGFUSE_SECRET_KEY;
+
 const results: TestRecord[] = [];
 
 // ───────────────────────────────────────────────────────────────────────

@@ -40,3 +40,22 @@ When true, `input` and `output` fields are omitted from exported spans and
 generations. Enable in compliance-sensitive deployments where prompt/response
 content is considered PII or subject to data-minimisation requirements.
 Defaults to false (input/output are exported).
+
+### mask?
+
+> `optional` **mask?**: (`params`) => [`JsonValue`](JsonValue.md)
+
+Applied to input, output and metadata before they are sent. When it
+throws, the value is replaced by `<fully masked>`.
+
+#### Parameters
+
+##### params
+
+###### data
+
+[`JsonValue`](JsonValue.md)
+
+#### Returns
+
+[`JsonValue`](JsonValue.md)

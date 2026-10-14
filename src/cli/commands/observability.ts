@@ -6,7 +6,6 @@
  * Commands for monitoring and managing observability features:
  * - status: Show telemetry status
  * - metrics: Show metrics summary
- * - exporters: List configured exporters
  * - costs: Show cost breakdown
  */
 
@@ -20,7 +19,6 @@ import { redactUrlCredentials } from "../../lib/utils/logSanitize.js";
 import type {
   ObservabilityStatusArgs as StatusArgs,
   ObservabilityMetricsArgs as MetricsArgs,
-  ObservabilityExportersArgs as ExportersArgs,
   ObservabilityCostsArgs as CostsArgs,
 } from "../../lib/types/index.js";
 
@@ -40,7 +38,6 @@ export class ObservabilityCommandFactory {
         return yargs
           .command(ObservabilityCommandFactory.createStatusCommand())
           .command(ObservabilityCommandFactory.createMetricsCommand())
-          .command(ObservabilityCommandFactory.createExportersCommand())
           .command(ObservabilityCommandFactory.createCostsCommand())
           .demandCommand(1, "Please specify a subcommand")
           .strict();
@@ -153,18 +150,6 @@ export class ObservabilityCommandFactory {
                 logger.always(
                   formatRow("  Service:", status.openTelemetry.serviceName),
                 );
-              }
-            }
-
-            // Exporters summary
-            if (status.exporters && status.exporters.length > 0) {
-              logger.always("");
-              logger.always(chalk.bold("Active Exporters:"));
-              for (const exporter of status.exporters) {
-                const exporterStatus = exporter.healthy
-                  ? chalk.green("Healthy")
-                  : chalk.red("Unhealthy");
-                logger.always(formatRow(`  ${exporter.name}:`, exporterStatus));
               }
             }
 
@@ -367,123 +352,6 @@ export class ObservabilityCommandFactory {
         } catch (error) {
           if (spinner) {
             spinner.fail("Failed to get metrics");
-          }
-          logger.error(
-            "Error:",
-            error instanceof Error ? error.message : String(error),
-          );
-          process.exit(1);
-        }
-      },
-    };
-  }
-
-  /**
-   * Create the exporters subcommand
-   */
-  static createExportersCommand(): CommandModule<object, ExportersArgs> {
-    return {
-      command: "exporters",
-      aliases: ["exp"],
-      describe: "List configured exporters",
-      builder: (yargs: Argv<object>) => {
-        return yargs
-          .option("format", {
-            alias: "f",
-            type: "string",
-            choices: ["text", "json", "table"] as const,
-            default: "text",
-            describe: "Output format",
-          })
-          .option("quiet", {
-            alias: "q",
-            type: "boolean",
-            default: false,
-            describe: "Minimal output",
-          }) as Argv<ExportersArgs>;
-      },
-      handler: async (args) => {
-        const spinner = args.quiet
-          ? null
-          : ora("Checking exporters...").start();
-
-        try {
-          const neurolink = new NeuroLink();
-          const status = neurolink.getTelemetryStatus();
-
-          if (spinner) {
-            spinner.succeed("Exporters retrieved");
-          }
-
-          const exporters = status.exporters ?? [];
-
-          if (args.format === "json") {
-            logger.always(JSON.stringify(exporters, null, 2));
-          } else {
-            logger.always("");
-            logger.always(chalk.bold.cyan("=== Configured Exporters ==="));
-            logger.always("");
-
-            if (exporters.length === 0) {
-              logger.always(chalk.gray("No exporters configured."));
-              logger.always("");
-              logger.always("Available exporters:");
-              logger.always("  - Langfuse (langfuse)");
-              logger.always("  - LangSmith (langsmith)");
-              logger.always("  - OpenTelemetry (otel)");
-              logger.always("  - Datadog (datadog)");
-              logger.always("  - Sentry (sentry)");
-              logger.always("  - Braintrust (braintrust)");
-              logger.always("  - Arize (arize)");
-              logger.always("  - PostHog (posthog)");
-              logger.always("  - Laminar (laminar)");
-            } else {
-              for (const exporter of exporters) {
-                const healthIcon = exporter.healthy
-                  ? chalk.green("[OK]")
-                  : chalk.red("[ERROR]");
-
-                logger.always(`${healthIcon} ${chalk.bold(exporter.name)}`);
-
-                if (exporter.latencyMs !== undefined) {
-                  logger.always(
-                    formatRow(
-                      "    Latency:",
-                      `${exporter.latencyMs.toFixed(2)}ms`,
-                    ),
-                  );
-                }
-
-                if (exporter.pendingSpans !== undefined) {
-                  logger.always(
-                    formatRow(
-                      "    Pending spans:",
-                      exporter.pendingSpans.toLocaleString(),
-                    ),
-                  );
-                }
-
-                if (exporter.lastExportTime) {
-                  const lastExport = new Date(exporter.lastExportTime);
-                  logger.always(
-                    formatRow("    Last export:", lastExport.toISOString()),
-                  );
-                }
-
-                if (exporter.errors && exporter.errors.length > 0) {
-                  logger.always(chalk.yellow("    Errors:"));
-                  for (const error of exporter.errors.slice(0, 3)) {
-                    logger.always(chalk.red(`      - ${error}`));
-                  }
-                }
-
-                logger.always("");
-              }
-            }
-          }
-        } catch (error) {
-          if (spinner) {
-            spinner.fail("Failed to get exporters");
           }
           logger.error(
             "Error:",

@@ -512,10 +512,10 @@ Export analytics to OpenTelemetry:
 ```typescript
 import { trace, SpanStatusCode } from "@opentelemetry/api";
 
-const tracer = trace.getTracer("neurolink");
+const tracer = trace.getTracer("my-app");
 
 async function trackedGenerate(options: GenerateOptions) {
-  return tracer.startActiveSpan("neurolink.generate", async (span) => {
+  return tracer.startActiveSpan("tracked-generate", async (span) => {
     try {
       const result = await neurolink.generate({
         ...options,

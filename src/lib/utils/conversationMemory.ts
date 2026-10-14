@@ -187,7 +187,7 @@ export async function getConversationMessages(
   }
 
   return memoryTracer.startActiveSpan(
-    "neurolink.conversation.getMessages",
+    "conversation.getMessages",
     {
       kind: SpanKind.INTERNAL,
       attributes: {
@@ -232,7 +232,7 @@ export async function getConversationMessages(
         const messages = repair.messages;
         if (repair.repaired) {
           span.setAttribute(
-            "neurolink.memory.tool_pairs_repaired",
+            "memory.tool_pairs_repaired",
             repair.orphanedCallsFixed + repair.orphanedResultsFixed,
           );
           logger.debug(
@@ -252,10 +252,7 @@ export async function getConversationMessages(
           // signal. The warn log is deduped per session so a long-lived
           // polluted conversation only generates one log line, not one per
           // turn (would otherwise be noisy at scale).
-          span.setAttribute(
-            "neurolink.memory.polluted_turns_dropped",
-            droppedCount,
-          );
+          span.setAttribute("memory.polluted_turns_dropped", droppedCount);
           const alreadyWarned = pollutedWarnedSessions.has(sessionId);
           if (!alreadyWarned) {
             if (pollutedWarnedSessions.size >= POLLUTED_WARN_DEDUP_MAX) {
@@ -488,7 +485,7 @@ export async function storeConversationTurn(
   }
 
   await memoryTracer.startActiveSpan(
-    "neurolink.conversation.storeTurn",
+    "conversation.storeTurn",
     {
       kind: SpanKind.INTERNAL,
       attributes: {

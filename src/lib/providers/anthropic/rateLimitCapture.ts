@@ -334,18 +334,15 @@ export function setLimitSpanAttributes(snapshot: ClaudeLimitSnapshot): void {
   }
   const { rateLimit } = snapshot;
   const attrs: Array<[string, string | number | undefined]> = [
-    ["neurolink.claude.quota.session_left_pct", rateLimit.sessionLeftPct],
-    ["neurolink.claude.quota.weekly_left_pct", rateLimit.weeklyLeftPct],
-    ["neurolink.claude.quota.requests_remaining", rateLimit.requestsRemaining],
-    ["neurolink.claude.quota.tokens_remaining", rateLimit.tokensRemaining],
-    ["neurolink.claude.quota.source", snapshot.quotaSource],
-    ["neurolink.claude.account", snapshot.account],
-    ["neurolink.claude.served_by", snapshot.servedBy],
-    ["neurolink.claude.pool.available", snapshot.pool?.available],
-    [
-      "neurolink.claude.pool.best_session_left_pct",
-      snapshot.pool?.bestSessionLeftPct,
-    ],
+    ["claude.quota.session_left_pct", rateLimit.sessionLeftPct],
+    ["claude.quota.weekly_left_pct", rateLimit.weeklyLeftPct],
+    ["claude.quota.requests_remaining", rateLimit.requestsRemaining],
+    ["claude.quota.tokens_remaining", rateLimit.tokensRemaining],
+    ["claude.quota.source", snapshot.quotaSource],
+    ["claude.account", snapshot.account],
+    ["claude.served_by", snapshot.servedBy],
+    ["claude.pool.available", snapshot.pool?.available],
+    ["claude.pool.best_session_left_pct", snapshot.pool?.bestSessionLeftPct],
   ];
   for (const [key, value] of attrs) {
     if (value !== undefined) {

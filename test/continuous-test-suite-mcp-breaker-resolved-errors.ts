@@ -11,8 +11,7 @@ import "dotenv/config";
  * set the span status and returned: `Promise.race` saw a clean resolve, so
  * `MCPCircuitBreaker` recorded a SUCCESS regardless of the isError flag. A
  * tool that only ever "fails" by resolving an error could therefore never
- * open its own circuit breaker, and completion telemetry counted every one
- * of those calls as a success.
+ * open its own circuit breaker.
  *
  * Drives a real stdio MCP server
  * (test/fixtures/mcp-breaker-resolved-errors-server.mjs) through the shipped
@@ -31,13 +30,6 @@ import "dotenv/config";
  *
  * No AI provider, no network — a real child-process MCP server is the only
  * moving part, so this is fully deterministic.
- *
- * Rule 15 exception (listed in eslint.config.js `neurolink/e2e-tests-only`
- * allow): one deep import of `../dist/telemetry/telemetryService.js`.
- * TelemetryService is not a root export, and whether a resolved isError
- * result is recorded as success=false in mcp_tool_calls_total is observable
- * only on that singleton — the value returned to the caller is identical
- * either way. Everything else here goes through ../dist/index.js.
  *
  * Run: pnpm run build && pnpm run test:mcp-breaker-resolved-errors
  */
@@ -58,10 +50,6 @@ import {
   logSection,
 } from "./helpers/harness.js";
 import { assertDistFresh } from "./helpers/distFreshness.js";
-import { observe, withStubs } from "./helpers/stubs.js";
-// Deep dist import (not src/): TelemetryService is not a root export, and the
-// telemetry label is only observable on the singleton the manager records to.
-import { TelemetryService } from "../dist/telemetry/telemetryService.js";
 
 // Fail loudly rather than silently testing a stale build (see distFreshness.ts).
 assertDistFresh();
@@ -211,39 +199,14 @@ await test("10 consecutive resolved isError results still reach the caller uncha
   }
 });
 
-await test("a single resolved isError call is counted as a failure but does not open the breaker on its own", async () => {
+await test("a single resolved isError call is counted as a breaker failure but does not open the breaker on its own", async () => {
   const h = await createHarness();
   try {
-    // ExternalServerManager.executeTool records every completed call on the
-    // TelemetryService singleton; before this fix a resolved isError result
-    // was labelled success=true in mcp_tool_calls_total.
-    const telemetry = observe(
-      TelemetryService.getInstance() as unknown as Record<string, unknown>,
-      "recordMCPToolCall",
-    );
-    const result = await withStubs([telemetry], () => h.call());
+    const result = await h.call();
     assert(
       isErrorResult(result),
       "expected a resolved isError result from the fixture",
     );
-    assertEqual(
-      telemetry.callCount,
-      1,
-      "exactly one mcp_tool_calls_total record for the one call",
-    );
-    const [recordedTool, , recordedSuccess] = telemetry.calls[0] as [
-      string,
-      number,
-      boolean,
-    ];
-    assertEqual(recordedTool, TOOL_NAME, "telemetry should name the tool");
-    assertEqual(
-      recordedSuccess,
-      false,
-      "a resolved isError result must be recorded as success=false, " +
-        "not counted as a successful tool call",
-    );
-
     const breaker = globalCircuitBreakerManager.getBreaker(h.breakerName);
     assertEqual(
       breaker.getStats().state,
@@ -262,7 +225,7 @@ await test("a single resolved isError call is counted as a failure but does not 
   }
 });
 
-await test("a resolved isError call is reflected in getStatistics()'s totalErrors, matching the breaker/telemetry/ToolDiscoveryService failure count", async () => {
+await test("a resolved isError call is reflected in getStatistics()'s totalErrors, matching the breaker/ToolDiscoveryService failure count", async () => {
   const h = await createHarness();
   try {
     const before = h.manager.getStatistics();
@@ -284,8 +247,8 @@ await test("a resolved isError call is reflected in getStatistics()'s totalError
       before.totalErrors + 1,
       "a resolved isError result must be counted in getStatistics()'s " +
         "totalErrors (and therefore NeuroLink.getExternalMCPStatistics()), " +
-        "the same way it is already counted by the circuit breaker, " +
-        "TelemetryService and ToolDiscoveryService's failedCalls",
+        "the same way it is already counted by the circuit breaker " +
+        "and ToolDiscoveryService's failedCalls",
     );
   } finally {
     await h.cleanup();

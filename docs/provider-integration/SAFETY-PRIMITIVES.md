@@ -127,7 +127,7 @@ import {
 protected async executeStream(options): Promise<StreamResult> {
   return withClientStreamSpan(
     {
-      name: "neurolink.provider.stream",
+      name: "provider.stream",
       tracer: tracers.provider,
       attributes: {
         [ATTR.GEN_AI_SYSTEM]: "<provider>",

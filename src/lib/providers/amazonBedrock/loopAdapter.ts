@@ -314,7 +314,20 @@ export function createBedrockLoopAdapter(config: {
       conversation: BedrockMessage[],
       step: number,
     ): AgenticLoopStepRequest {
-      return { raw: config.buildCommandInput(conversation, step) };
+      const input = config.buildCommandInput(conversation, step);
+      return {
+        raw: input,
+        generation: {
+          provider: "bedrock",
+          model: input.modelId,
+          modelParameters: {
+            temperature: input.inferenceConfig?.temperature,
+            maxTokens: input.inferenceConfig?.maxTokens,
+            topP: input.inferenceConfig?.topP,
+          },
+          input: { system: input.system, messages: input.messages },
+        },
+      };
     },
 
     async executeStep(

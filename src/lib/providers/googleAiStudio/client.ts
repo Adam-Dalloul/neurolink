@@ -1,3 +1,4 @@
+import type { Span } from "@opentelemetry/api";
 import {
   type AIProviderName,
   ErrorCategory,
@@ -56,6 +57,8 @@ import {
   cancelStream,
   releaseIterator,
 } from "../../utils/streamCancellation.js";
+import { observeGeneration } from "../../telemetry/observation.js";
+import { withGeneration } from "../../telemetry/withSpan.js";
 import { createGeminiLoopAdapter } from "../../core/geminiLoopAdapter.js";
 import { isDirectTTSRequest } from "../../core/resolveRequestKind.js";
 import { runAgenticLoop } from "../../core/loopEngine.js";
@@ -531,6 +534,20 @@ export class GoogleAIStudioProvider extends BaseProvider {
   protected async executeImageGeneration(
     options: TextGenerationOptions,
   ): Promise<EnhancedGenerateResult> {
+    return withGeneration(
+      {
+        provider: this.providerName,
+        model: options.model || this.modelName,
+        input: { prompt: options.prompt || options.input?.text || "" },
+      },
+      (span) => this.generateImage(options, span),
+    );
+  }
+
+  private async generateImage(
+    options: TextGenerationOptions,
+    span: Span,
+  ): Promise<EnhancedGenerateResult> {
     // Image-to-image generation takes reference images through the same
     // `input.images` array, and generate() routes here BEFORE reaching its own
     // normalization call — so a reference photo in HEIC/BMP/AVIF would arrive
@@ -715,6 +732,12 @@ export class GoogleAIStudioProvider extends BaseProvider {
                   },
                 };
 
+                observeGeneration(span, {
+                  responseModel: imageModelName,
+                  output: result.content,
+                  usage: result.usage,
+                  finishReason: "stop",
+                });
                 return await this.enhanceResult(result, options, startTime);
               }
 
@@ -781,6 +804,12 @@ export class GoogleAIStudioProvider extends BaseProvider {
                 },
               };
 
+              observeGeneration(span, {
+                responseModel: imageModelName,
+                output: result.content,
+                usage: result.usage,
+                finishReason: "stop",
+              });
               return await this.enhanceResult(result, options, startTime);
             }
 
@@ -1012,12 +1041,11 @@ export class GoogleAIStudioProvider extends BaseProvider {
 
     return withClientStreamSpan(
       {
-        name: "neurolink.provider.stream",
+        name: "provider.stream",
         tracer: tracers.provider,
+        detached: true,
         attributes: {
-          [ATTR.GEN_AI_SYSTEM]: "google-ai",
-          [ATTR.GEN_AI_MODEL]: modelName,
-          [ATTR.GEN_AI_OPERATION]: "stream",
+          [ATTR.NL_MODEL]: modelName,
           [ATTR.NL_PROVIDER]: this.providerName,
         },
       },
@@ -1258,6 +1286,7 @@ export class GoogleAIStudioProvider extends BaseProvider {
               // performed inline.
               const baseAdapter = createGeminiLoopAdapter({
                 providerLabel: "GoogleAIStudio",
+                provider: this.providerName,
                 maxSteps,
                 // Same threshold the hand-rolled dispatcher used, which is
                 // what makes an always-failing tool dispatch exactly twice.
@@ -1610,14 +1639,6 @@ export class GoogleAIStudioProvider extends BaseProvider {
                 metadata.rawFinishReason = lastFinishReason;
               }
 
-              // Set token usage and finish reason on the span
-              span.setAttribute(ATTR.GEN_AI_INPUT_TOKENS, totalInputTokens);
-              span.setAttribute(ATTR.GEN_AI_OUTPUT_TOKENS, totalOutputTokens);
-              span.setAttribute(
-                ATTR.GEN_AI_FINISH_REASON,
-                hitStepLimitWithoutFinalAnswer ? "max_steps" : "stop",
-              );
-
               // Gemini promptTokenCount is OVERLAPPING: it already includes
               // cachedContentTokenCount. Subtract once here so calculateCost
               // bills the cached portion at the cheaper cacheRead rate without
@@ -1891,12 +1912,11 @@ export class GoogleAIStudioProvider extends BaseProvider {
 
     return withClientSpan(
       {
-        name: "neurolink.provider.generate",
+        name: "provider.generate",
         tracer: tracers.provider,
+        detached: true,
         attributes: {
-          [ATTR.GEN_AI_SYSTEM]: "google-ai",
-          [ATTR.GEN_AI_MODEL]: modelName,
-          [ATTR.GEN_AI_OPERATION]: "generate",
+          [ATTR.NL_MODEL]: modelName,
           [ATTR.NL_PROVIDER]: this.providerName,
         },
       },
@@ -2127,6 +2147,7 @@ export class GoogleAIStudioProvider extends BaseProvider {
             // the turn's text comes from the result.
             const baseAdapter = createGeminiLoopAdapter({
               providerLabel: "GoogleAIStudio",
+              provider: this.providerName,
               maxSteps,
               toolFailureBreaker: { maxRetries: DEFAULT_TOOL_MAX_RETRIES },
               liveTools: options.tools ?? {},
@@ -2396,14 +2417,6 @@ export class GoogleAIStudioProvider extends BaseProvider {
                 elapsedMs: turnClock.elapsedMs(),
               });
             }
-
-            // Set token usage and finish reason on the span
-            span.setAttribute(ATTR.GEN_AI_INPUT_TOKENS, totalInputTokens);
-            span.setAttribute(ATTR.GEN_AI_OUTPUT_TOKENS, totalOutputTokens);
-            span.setAttribute(
-              ATTR.GEN_AI_FINISH_REASON,
-              step >= maxSteps ? "max_steps" : "stop",
-            );
 
             // Build EnhancedGenerateResult and route through enhanceResult so
             // analytics / evaluation / tracing stay attached. The native AI
@@ -2720,10 +2733,6 @@ export class GoogleAIStudioProvider extends BaseProvider {
     }
 
     // Route ALL models through native @google/genai SDK (no more @ai-sdk/google dependency).
-    // Emit Pipeline B `generation:end` so the observability listener
-    // creates a `model.generation` span — AI Studio's native path bypasses
-    // the AI SDK + experimental_telemetry plumbing the same way Vertex's
-    // does, so the event has to be emitted manually.
     const generateStartTime = Date.now();
     const inputPrompt =
       (mergedOptions.input as { text?: string } | undefined)?.text ||
@@ -2736,12 +2745,12 @@ export class GoogleAIStudioProvider extends BaseProvider {
       // of using BaseProvider's shared flow, so the span is added here.
       let result = await withSpan(
         {
-          name: "neurolink.executeGeneration",
+          name: "executeGeneration",
           tracer: tracers.provider,
+          detached: true,
           attributes: {
-            [ATTR.GEN_AI_SYSTEM]: this.providerName,
-            [ATTR.GEN_AI_MODEL]: modelName,
-            "neurolink.path": "native.google-genai",
+            [ATTR.NL_MODEL]: modelName,
+            path: "native.google-genai",
           },
         },
         async () => this.executeNativeGemini3Generate(mergedOptions),
@@ -2749,7 +2758,7 @@ export class GoogleAIStudioProvider extends BaseProvider {
       // Pipe through TTS-of-AI-response when caller asks for it. No-op when
       // tts is disabled or useAiResponse is false.
       result = await this.synthesizeAIResponseIfNeeded(result, options);
-      this.emitPipelineBGenerationEvent(
+      this.emitGenerationEnd(
         modelName,
         result,
         generateStartTime,
@@ -2759,7 +2768,7 @@ export class GoogleAIStudioProvider extends BaseProvider {
       );
       return result;
     } catch (error) {
-      this.emitPipelineBGenerationEvent(
+      this.emitGenerationEnd(
         modelName,
         null,
         generateStartTime,
@@ -2772,12 +2781,10 @@ export class GoogleAIStudioProvider extends BaseProvider {
   }
 
   /**
-   * Emit `generation:end` so the Pipeline B observability listener creates
-   * a `model.generation` span for native Google AI Studio generate calls.
-   * Without this hand-off the native path silently disappears from
-   * Pipeline B exporters (Langfuse, custom OTEL collectors).
+   * Emit `generation:end` for native Google AI Studio generate calls, so
+   * analytics listeners see them.
    */
-  private emitPipelineBGenerationEvent(
+  private emitGenerationEnd(
     modelName: string,
     result: EnhancedGenerateResult | null,
     startTime: number,
@@ -2801,12 +2808,6 @@ export class GoogleAIStudioProvider extends BaseProvider {
       (result as { _generationEndEmitted?: boolean })._generationEndEmitted =
         true;
     }
-    // The failure path has no result to carry that flag — `result` is null —
-    // so mark the error instead. Without this the provider's own
-    // `generation:end` (success: false) and the SDK's emitGenerateErrorEvent
-    // both fire for one failed native generate, double-counting every failure
-    // in analytics and as two Pipeline B spans. The success path above was
-    // already deduplicated; only the catch branch was missed.
     if (!success && error && typeof error === "object") {
       (error as { _generationEndEmitted?: boolean })._generationEndEmitted =
         true;
@@ -2815,9 +2816,6 @@ export class GoogleAIStudioProvider extends BaseProvider {
       provider: this.providerName,
       responseTime: Date.now() - startTime,
       timestamp: Date.now(),
-      // The Pipeline B listener reads `data.prompt` to populate the
-      // `input` span attribute. Without this, the Observability Spans
-      // test fails with "input capture not working".
       prompt: prompt || "",
       result: {
         content: result?.content || "",

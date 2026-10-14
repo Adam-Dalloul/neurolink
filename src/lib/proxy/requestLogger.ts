@@ -2,7 +2,7 @@
  * Proxy Request Logger
  * Logs proxy request/response metadata to a rotating log file.
  * Also emits OTLP log records to OpenObserve (or any OTLP-compatible backend)
- * when a LoggerProvider is configured via OpenTelemetry instrumentation.
+ * when OTEL_EXPORTER_OTLP_ENDPOINT configures an OTLP LoggerProvider.
  * Useful for debugging and auditing proxy traffic.
  */
 
@@ -56,11 +56,16 @@ import type {
   ProxyRequestLoggerSnapshot,
   ProxyRequestLogSinkSnapshot,
 } from "../types/index.js";
+import { trace } from "@opentelemetry/api";
 import { isBorrowedRequest } from "./shareContext.js";
-import { OtelBridge } from "../observability/otelBridge.js";
 import { createRequire } from "node:module";
 import type { SeverityNumber as SeverityNumberType } from "@opentelemetry/api-logs";
-import type { LoggerProvider } from "@opentelemetry/sdk-logs";
+import { OTLPLogExporter } from "@opentelemetry/exporter-logs-otlp-http";
+import { resourceFromAttributes } from "@opentelemetry/resources";
+import {
+  BatchLogRecordProcessor,
+  LoggerProvider,
+} from "@opentelemetry/sdk-logs";
 
 /**
  * Loaded via require() on first actual use rather than a top-level import,
@@ -229,6 +234,7 @@ export async function flushRequestLogs(
       );
     }
   }
+  await otlpLoggerProvider?.forceFlush();
 }
 
 /** @internal Test-only hook for exercising shutdown behavior without real I/O. */
@@ -251,15 +257,8 @@ export const __requestLoggerTestHooks = {
   },
 };
 
-/**
- * Lazily-resolved LoggerProvider from OTel instrumentation.
- * null = not resolved yet (will retry), LoggerProvider = resolved, false = permanently unavailable.
- */
-let otelLoggerProvider: LoggerProvider | null | false = null;
-/** Number of times we've tried to resolve the LoggerProvider. */
-let otelResolveAttempts = 0;
-/** Max number of resolve attempts before giving up. */
-const MAX_RESOLVE_ATTEMPTS = 10;
+let otlpLoggerProvider: LoggerProvider | undefined;
+let otlpLoggerInitialized = false;
 
 const BODY_OTLP_CHUNK_SIZE = 16_000;
 
@@ -476,44 +475,45 @@ export async function logRequestAttempt(
   }
 }
 
-/**
- * Lazily resolve the LoggerProvider from OTel instrumentation.
- * Uses dynamic import to avoid hard dependency — if instrumentation.ts
- * hasn't been loaded or OTLP is not configured, this is a no-op.
- * Retries up to MAX_RESOLVE_ATTEMPTS times to handle race conditions
- * where OTel initialization completes after the first log request.
- */
+function createOtlpLoggerProvider(): LoggerProvider | undefined {
+  const endpoint = process.env.OTEL_EXPORTER_OTLP_ENDPOINT;
+  if (!endpoint) {
+    return undefined;
+  }
+  try {
+    return new LoggerProvider({
+      resource: resourceFromAttributes({
+        "service.name": process.env.OTEL_SERVICE_NAME || "neurolink",
+      }),
+      processors: [
+        new BatchLogRecordProcessor(
+          new OTLPLogExporter({ url: `${endpoint}/v1/logs` }),
+          {
+            maxQueueSize: 2048,
+            maxExportBatchSize: 64,
+            scheduledDelayMillis: 2000,
+            exportTimeoutMillis: 30000,
+          },
+        ),
+      ],
+    });
+  } catch (error) {
+    logger.warn("[RequestLogger] Failed to create OTLP log exporter", {
+      error: error instanceof Error ? error.message : String(error),
+    });
+    return undefined;
+  }
+}
+
 async function resolveLoggerProvider(): Promise<LoggerProvider | undefined> {
   if (isProxyOtelOnly()) {
     return initializeProxyOtelLogs();
   }
-  if (otelLoggerProvider === false) {
-    return undefined;
-  } // permanently unavailable
-  if (otelLoggerProvider !== null) {
-    return otelLoggerProvider;
+  if (!otlpLoggerInitialized) {
+    otlpLoggerInitialized = true;
+    otlpLoggerProvider = createOtlpLoggerProvider();
   }
-  // Not resolved yet — try to resolve
-  otelResolveAttempts++;
-  try {
-    const { getLoggerProvider } =
-      await import("../services/server/ai/observability/instrumentation.js");
-    const provider = getLoggerProvider();
-    if (provider) {
-      otelLoggerProvider = provider;
-      return provider;
-    }
-    // Provider not available yet — if we've exceeded max attempts, give up
-    if (otelResolveAttempts >= MAX_RESOLVE_ATTEMPTS) {
-      otelLoggerProvider = false; // permanently unavailable
-    }
-    // Otherwise leave as null so we retry next time
-    return undefined;
-  } catch {
-    // instrumentation.ts not available (e.g. standalone mode) — disable permanently
-    otelLoggerProvider = false;
-    return undefined;
-  }
+  return otlpLoggerProvider;
 }
 
 /**
@@ -1047,8 +1047,7 @@ export async function logStreamError(entry: {
     return;
   }
 
-  const bridge = new OtelBridge();
-  const traceCtx = bridge.getCurrentTraceContext();
+  const traceCtx = trace.getActiveSpan()?.spanContext();
 
   const logEntry: Record<string, unknown> = {
     ...entry,

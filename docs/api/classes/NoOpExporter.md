@@ -95,7 +95,7 @@ Provides zero-overhead behavior
 
 #### Inherited from
 
-`BaseExporter.flushInterval`
+[`LangfuseExporter`](LangfuseExporter.md).[`flushInterval`](LangfuseExporter.md#flushinterval)
 
 ---
 

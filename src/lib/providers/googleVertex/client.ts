@@ -1,6 +1,7 @@
 /* eslint-disable max-lines-per-function */
 // Native SDK imports - no more @ai-sdk/google-vertex dependency
 import fs from "fs";
+import { LangfuseOtelSpanAttributes } from "@langfuse/tracing";
 import { guardToolExecutor } from "../../core/toolExecutionGuards.js";
 import path from "path";
 import type { ZodType } from "zod";
@@ -144,10 +145,12 @@ import {
   resolveTurnStopReason,
   DedupExecuteMap,
 } from "../googleNativeGemini3/index.js";
-import { createGeminiLoopAdapter } from "../../core/geminiLoopAdapter.js";
+import {
+  createGeminiLoopAdapter,
+  describeGeminiRequest,
+} from "../../core/geminiLoopAdapter.js";
 import { runAgenticLoop } from "../../core/loopEngine.js";
 import { createAnthropicLoopAdapter } from "../anthropic/loopAdapter.js";
-import { extractMcpToolErrorMessage } from "../../utils/mcpErrorText.js";
 import { createStreamChannel } from "../../core/streamChannel.js";
 import { toNativeToolDeclarations } from "../../core/nativeToolFormat.js";
 import {
@@ -157,9 +160,7 @@ import {
 import { resolveLiveTool } from "../../tools/toolDiscovery.js";
 import {
   ATTR,
-  LANGFUSE_ATTR,
   spanContentAttribute,
-  spanJsonAttribute,
   spanModelRequestAttribute,
   tracers,
   withClientSpan,
@@ -167,12 +168,17 @@ import {
   withSpan,
 } from "../../telemetry/index.js";
 import {
+  observe,
+  observeGeneration,
+  observeTrace,
+} from "../../telemetry/observation.js";
+import { withGeneration, withStepSpan } from "../../telemetry/withSpan.js";
+import {
+  context as otelContext,
   SpanKind,
   SpanStatusCode,
-  context as otelContext,
   trace as otelTrace,
 } from "@opentelemetry/api";
-import { calculateCost } from "../../utils/pricing.js";
 import { transformToolExecutions } from "../../utils/transformationUtils.js";
 import { resolveToolExecutionRecords } from "../../core/toolExecutionRecorder.js";
 import {
@@ -187,7 +193,7 @@ import type {
   ImageWithAltText,
   CollectedChunkResult,
   NativeFunctionCall,
-  ToolSpanCall,
+  SpanModelRequest,
   VertexUsageCounter,
 } from "../../types/index.js";
 
@@ -1349,16 +1355,15 @@ export class GoogleVertexProvider extends BaseProvider {
     // for any provider — each native provider has to add it itself.
     return withClientStreamSpan(
       {
-        name: "neurolink.provider.stream",
+        name: "provider.stream",
         tracer: tracers.provider,
+        detached: true,
         attributes: {
-          [ATTR.GEN_AI_SYSTEM]: this.providerName,
-          [ATTR.GEN_AI_MODEL]: modelName,
-          [ATTR.GEN_AI_OPERATION]: "stream",
+          [ATTR.NL_MODEL]: modelName,
           [ATTR.NL_PROVIDER]: this.providerName,
         },
       },
-      async (streamSpan) => {
+      async () => {
         const streamStartTime = Date.now();
 
         // Tool filter (a0269210): trust options.tools — caller (BaseProvider.stream)
@@ -1375,7 +1380,7 @@ export class GoogleVertexProvider extends BaseProvider {
         // assertion has to skip on every native-Vertex stream.
         const processedOptions = await withSpan(
           {
-            name: "neurolink.message.build",
+            name: "message.build",
             tracer: tracers.provider,
             attributes: {
               [ATTR.NL_PROVIDER]: this.providerName,
@@ -1434,14 +1439,6 @@ export class GoogleVertexProvider extends BaseProvider {
                 this.executeNativeGemini3Stream(effectiveOptions),
             );
           }
-          // Cost / token usage on the stream span. Native streams resolve
-          // usage synchronously (the stream loop has already drained), so
-          // `result.usage` is populated by the time we reach this point.
-          this.attachUsageAndCostAttributes(
-            streamSpan,
-            modelName,
-            result?.usage,
-          );
           // Wrap the result's async iterable to fire onChunk / onFinish
           // lifecycle callbacks. Pipeline A gets these via the AI SDK
           // wrapStream middleware; the native path has to fire them here.
@@ -2268,6 +2265,7 @@ export class GoogleVertexProvider extends BaseProvider {
       // nudge, and the terminal block below.
       const engineAdapter = createGeminiLoopAdapter({
         providerLabel: "GoogleVertex",
+        provider: this.providerName,
         maxSteps,
         // Ported verbatim: the same DEFAULT_TOOL_MAX_RETRIES threshold, plus
         // the two rules this loop has always had and the engine did not.
@@ -3267,7 +3265,7 @@ export class GoogleVertexProvider extends BaseProvider {
     // Cross-step text accumulation + last SDK finish reason, so the
     // maxSteps-exhaustion exit can surface real gathered text (Bug 1) and a
     // meaningful finishReason (Bug 2) instead of a placeholder / "unknown".
-    let accumulatedText = "";
+    const accumulatedText = "";
     let lastFinishReason: string | undefined;
     const allToolCalls: Array<{
       toolCallId: string;
@@ -3353,6 +3351,7 @@ export class GoogleVertexProvider extends BaseProvider {
       // nudge, and the terminal block below.
       const engineAdapter = createGeminiLoopAdapter({
         providerLabel: "GoogleVertex",
+        provider: this.providerName,
         maxSteps,
         // Ported verbatim: the same DEFAULT_TOOL_MAX_RETRIES threshold, plus
         // the two rules this loop has always had and the engine did not.
@@ -3925,82 +3924,106 @@ export class GoogleVertexProvider extends BaseProvider {
       // Vertex endpoint would hang the maxSteps recovery path indefinitely.
       // On timeout withTimeout rejects (TimeoutError) and the catch below
       // falls back to the placeholder — no new failure path is introduced.
-      return await withTimeout(
-        (async () => {
-          const stream = await client.models.generateContentStream({
-            model: modelName,
-            contents,
-            config: synthConfig,
-          });
+      return await withGeneration(
+        describeGeminiRequest(this.providerName, {
+          model: modelName,
+          contents,
+          config,
+        }),
+        async (span) => {
+          const synth = await withTimeout(
+            (async () => {
+              const stream = await client.models.generateContentStream({
+                model: modelName,
+                contents,
+                config: synthConfig,
+              });
 
-          const parts: unknown[] = [];
-          let finishReason: string | undefined;
-          let inputTokens = 0;
-          let outputTokens = 0;
-          let reasoningTokens = 0;
-          for await (const chunk of stream) {
-            const chunkRecord = chunk as Record<string, unknown>;
-            const candidates = chunkRecord.candidates as
-              | Array<Record<string, unknown>>
-              | undefined;
-            const firstCandidate = candidates?.[0];
-            const chunkFinishReason = firstCandidate?.finishReason;
-            if (typeof chunkFinishReason === "string" && chunkFinishReason) {
-              finishReason = chunkFinishReason;
-            }
-            const chunkContent = firstCandidate?.content as
-              | Record<string, unknown>
-              | undefined;
-            if (chunkContent && Array.isArray(chunkContent.parts)) {
-              parts.push(...chunkContent.parts);
-            }
-            const usageMetadata = chunkRecord.usageMetadata as
-              | {
-                  promptTokenCount?: number;
-                  candidatesTokenCount?: number;
-                  thoughtsTokenCount?: number;
+              const parts: unknown[] = [];
+              let finishReason: string | undefined;
+              let inputTokens = 0;
+              let outputTokens = 0;
+              let reasoningTokens = 0;
+              for await (const chunk of stream) {
+                const chunkRecord = chunk as Record<string, unknown>;
+                const candidates = chunkRecord.candidates as
+                  | Array<Record<string, unknown>>
+                  | undefined;
+                const firstCandidate = candidates?.[0];
+                const chunkFinishReason = firstCandidate?.finishReason;
+                if (
+                  typeof chunkFinishReason === "string" &&
+                  chunkFinishReason
+                ) {
+                  finishReason = chunkFinishReason;
                 }
-              | undefined;
-            if (usageMetadata) {
-              if (
-                usageMetadata.promptTokenCount !== undefined &&
-                usageMetadata.promptTokenCount > 0
-              ) {
-                inputTokens = usageMetadata.promptTokenCount;
+                const chunkContent = firstCandidate?.content as
+                  | Record<string, unknown>
+                  | undefined;
+                if (chunkContent && Array.isArray(chunkContent.parts)) {
+                  parts.push(...chunkContent.parts);
+                }
+                const usageMetadata = chunkRecord.usageMetadata as
+                  | {
+                      promptTokenCount?: number;
+                      candidatesTokenCount?: number;
+                      thoughtsTokenCount?: number;
+                    }
+                  | undefined;
+                if (usageMetadata) {
+                  if (
+                    usageMetadata.promptTokenCount !== undefined &&
+                    usageMetadata.promptTokenCount > 0
+                  ) {
+                    inputTokens = usageMetadata.promptTokenCount;
+                  }
+                  if (
+                    usageMetadata.candidatesTokenCount !== undefined &&
+                    usageMetadata.candidatesTokenCount > 0
+                  ) {
+                    outputTokens = usageMetadata.candidatesTokenCount;
+                  }
+                  if (
+                    usageMetadata.thoughtsTokenCount !== undefined &&
+                    usageMetadata.thoughtsTokenCount > 0
+                  ) {
+                    reasoningTokens = usageMetadata.thoughtsTokenCount;
+                  }
+                }
               }
-              if (
-                usageMetadata.candidatesTokenCount !== undefined &&
-                usageMetadata.candidatesTokenCount > 0
-              ) {
-                outputTokens = usageMetadata.candidatesTokenCount;
-              }
-              if (
-                usageMetadata.thoughtsTokenCount !== undefined &&
-                usageMetadata.thoughtsTokenCount > 0
-              ) {
-                reasoningTokens = usageMetadata.thoughtsTokenCount;
-              }
-            }
-          }
 
-          const text = parts
-            .filter(
-              (part): part is { text: string } =>
-                typeof (part as Record<string, unknown>).text === "string",
-            )
-            .map((part) => part.text)
-            .join("");
+              const text = parts
+                .filter(
+                  (part): part is { text: string } =>
+                    typeof (part as Record<string, unknown>).text === "string",
+                )
+                .map((part) => part.text)
+                .join("");
 
-          return {
-            text,
-            finishReason,
-            inputTokens,
-            outputTokens,
-            reasoningTokens,
-          };
-        })(),
-        timeoutMs,
-        "Gemini synthesis call timed out",
+              return {
+                text,
+                finishReason,
+                inputTokens,
+                outputTokens,
+                reasoningTokens,
+              };
+            })(),
+            timeoutMs,
+            "Gemini synthesis call timed out",
+          );
+          observeGeneration(span, {
+            provider: this.providerName,
+            model: modelName,
+            output: synth.text,
+            usage: {
+              inputTokens: synth.inputTokens,
+              outputTokens: synth.outputTokens,
+              reasoningTokens: synth.reasoningTokens,
+            },
+            finishReason: synth.finishReason,
+          });
+          return synth;
+        },
       );
     } catch (error) {
       logger.warn(
@@ -4573,24 +4596,18 @@ export class GoogleVertexProvider extends BaseProvider {
     const turnSpan = tracers.provider.startSpan("anthropic.vertex.stream", {
       kind: SpanKind.CLIENT,
       attributes: {
-        // Mark as span, not generation — without it Langfuse infers "generation"
-        // from the gen_ai.* attributes; the model calls live in child spans.
-        [LANGFUSE_ATTR.OBSERVATION_TYPE]: "span",
-        [ATTR.GEN_AI_SYSTEM]: "anthropic",
-        [ATTR.GEN_AI_MODEL]: modelName,
-        [ATTR.GEN_AI_OPERATION]: "stream",
+        [ATTR.NL_MODEL]: modelName,
         [ATTR.NL_PROVIDER]: this.providerName,
         [ATTR.NL_TOOL_COUNT]: offeredToolNames.length,
-        [LANGFUSE_ATTR.OBSERVATION_INPUT]: turnInputAttribute,
-        // Also lift IO to the trace — Langfuse reads trace input/output from
-        // langfuse.trace.* and the trace list is unreadable without it.
-        [LANGFUSE_ATTR.TRACE_INPUT]: turnInputAttribute,
-        [LANGFUSE_ATTR.OBSERVATION_METADATA]: spanJsonAttribute({
-          toolsOffered: offeredToolNames,
-          toolCount: offeredToolNames.length,
-          maxSteps,
-          structuredOutput: useFinalResultTool,
-        }),
+      },
+    });
+    observe(turnSpan, "span", {
+      input: turnInputAttribute,
+      metadata: {
+        toolsOffered: offeredToolNames,
+        toolCount: offeredToolNames.length,
+        maxSteps,
+        structuredOutput: useFinalResultTool,
       },
     });
     const turnContext = otelTrace.setSpan(otelContext.active(), turnSpan);
@@ -4655,7 +4672,6 @@ export class GoogleVertexProvider extends BaseProvider {
     const loopPromise = (async () => {
       let step = 0;
       const currentMessages = [...messages];
-      let stepConversation = currentMessages;
       // Step-cap / abort bookkeeping (mirrors the generate twin): read by the
       // terminal recovery block after the loop and by the finishReason
       // mapping written into finishReasonRef.
@@ -4676,91 +4692,6 @@ export class GoogleVertexProvider extends BaseProvider {
       >();
 
       try {
-        // Restores the per-tool observation the hand-rolled dispatch had.
-        // The execution runs INSIDE the span's context so spans the tool opens
-        // itself nest under this call rather than dangling beside the turn, and
-        // the settled RESULT is inspected — an MCP tool reports failure in its
-        // payload, so an observation that only watches for throws records a
-        // failed call as successful.
-        //
-        // Stream path only: the generate twin never had per-tool spans, and
-        // giving it them here would be behaviour GAINED under cover of a
-        // migration. Shared with resolveToolOnMiss below: the old dispatch
-        // opened the span before the executor lookup, so a tool hydrated
-        // mid-turn was observed exactly like one declared up front.
-        const withToolSpan = <T>(
-          toolCallName: string,
-          run: () => Promise<T>,
-          call?: ToolSpanCall,
-        ): Promise<T> => {
-          // Arguments are inputs: honour the same opt-out the AI SDK path uses.
-          const argsAttribute =
-            call?.args !== undefined &&
-            process.env.NEUROLINK_RECORD_INPUTS?.trim().toLowerCase() !==
-              "false"
-              ? spanContentAttribute(call.args)
-              : undefined;
-          const toolSpan = tracers.mcp.startSpan(
-            "ai.toolCall",
-            {
-              kind: SpanKind.INTERNAL,
-              attributes: {
-                [LANGFUSE_ATTR.OBSERVATION_TYPE]: "tool",
-                [ATTR.GEN_AI_TOOL_NAME]: toolCallName,
-                "ai.toolCall.name": toolCallName,
-                ...(call?.toolCallId
-                  ? { "ai.toolCall.id": call.toolCallId }
-                  : {}),
-                ...(argsAttribute !== undefined
-                  ? {
-                      "ai.toolCall.args": argsAttribute,
-                      [LANGFUSE_ATTR.OBSERVATION_INPUT]: argsAttribute,
-                    }
-                  : {}),
-              },
-            },
-            turnContext,
-          );
-          const finish = (output: unknown, errorMessage?: string) => {
-            const outputAttribute = spanContentAttribute(output);
-            toolSpan.setAttribute("ai.toolCall.result", outputAttribute);
-            toolSpan.setAttribute(
-              LANGFUSE_ATTR.OBSERVATION_OUTPUT,
-              outputAttribute,
-            );
-            if (errorMessage) {
-              toolSpan.setAttribute(LANGFUSE_ATTR.OBSERVATION_LEVEL, "ERROR");
-              toolSpan.setAttribute(
-                LANGFUSE_ATTR.OBSERVATION_STATUS_MESSAGE,
-                errorMessage,
-              );
-              toolSpan.setStatus({
-                code: SpanStatusCode.ERROR,
-                message: errorMessage,
-              });
-            } else {
-              toolSpan.setStatus({ code: SpanStatusCode.OK });
-            }
-            toolSpan.end();
-          };
-          return otelContext.with(
-            otelTrace.setSpan(turnContext, toolSpan),
-            async () => {
-              try {
-                const result = await run();
-                finish(result, extractMcpToolErrorMessage(result));
-                return result;
-              } catch (error) {
-                finish(
-                  { error: true },
-                  error instanceof Error ? error.message : String(error),
-                );
-                throw error;
-              }
-            },
-          );
-        };
-
         // Executors handed to the engine, taken through the turn's
         // DedupExecuteMap so an identical repeated call is answered from the
         // per-turn cache rather than run again (BZ-3327). `.get()` returns the
@@ -4782,18 +4713,10 @@ export class GoogleVertexProvider extends BaseProvider {
               toolTimeoutMs: toolExecTimeoutMs,
               abortSignal: internalAbort.signal,
               onProgress: () => turnClock.noteProgress(),
-              withToolSpan,
             }),
           };
         }
 
-        // The turn runs on the shared engine. The step cap, tool dispatch, the
-        // failure breaker, per-step usage accumulation and the pre-first-chunk
-        // provider retry all live there now. What stays here is everything the
-        // engine has no opinion about: the turn clock, the context guard, the
-        // per-step Langfuse generation span, conversation-memory storage, the
-        // wrap-up nudge, and the reserved finalization in the terminal block.
-        //
         // maxSteps is agenticStepBudget, NOT maxSteps: when structured output is
         // active the last slot is reserved for the forced final_result call, and
         // the engine must never spend it.
@@ -4801,6 +4724,7 @@ export class GoogleVertexProvider extends BaseProvider {
         // MessageParam and every hook here is typed against the wrong shape.
         const baseAdapter = createAnthropicLoopAdapter<VertexAnthropicMessage>({
           client,
+          provider: this.providerName,
           maxSteps: agenticStepBudget,
           toolsRecord: options.tools ?? {},
           // Set here and NOT for native Anthropic: these loops have always had
@@ -4920,15 +4844,10 @@ export class GoogleVertexProvider extends BaseProvider {
             : {}),
         });
 
-        // Wrapped rather than configured: both of these fire once PER STEP, and
-        // these are the only hooks that see a single step's request and results.
-        // Reading them off the turn's final result would batch every step into
-        // one late write and lose the per-step generation span entirely.
         const adapter: typeof baseAdapter = {
           ...baseAdapter,
           buildStepRequest: (conversation, engineStep) => {
             step = engineStep + 1;
-            stepConversation = conversation;
             turnClock.noteProgress();
             return baseAdapter.buildStepRequest(conversation, engineStep);
           },
@@ -4954,96 +4873,25 @@ export class GoogleVertexProvider extends BaseProvider {
                 toolTimeoutMs: toolExecTimeoutMs,
                 abortSignal: internalAbort.signal,
                 onProgress: () => turnClock.noteProgress(),
-                // Same observation as an up-front executor: the hand-rolled
-                // dispatch spanned at the call, after the executor lookup, so
-                // a hydrated tool was never the one unobserved call in a turn.
-                withToolSpan,
               }),
             };
           },
           executeStep: async (request, stepChannel, signal) => {
-            // One generation observation per API call: request in, content and
-            // usage out. Started here rather than inside the adapter because the
-            // attributes are this provider's, not the engine's.
-            const generationSpan = tracers.generation.startSpan(
-              "anthropic.messages.stream",
+            const result = await baseAdapter.executeStep(
+              request,
               {
-                kind: SpanKind.CLIENT,
-                attributes: {
-                  [LANGFUSE_ATTR.OBSERVATION_TYPE]: "generation",
-                  [LANGFUSE_ATTR.OBSERVATION_MODEL_NAME]: modelName,
-                  [LANGFUSE_ATTR.OBSERVATION_MODEL_PARAMETERS]:
-                    spanJsonAttribute({
-                      max_tokens: requestParams.max_tokens,
-                      temperature: requestParams.temperature,
-                      top_p: requestParams.top_p,
-                    }),
-                  [LANGFUSE_ATTR.OBSERVATION_INPUT]: spanModelRequestAttribute({
-                    system: systemPromptWithSchema,
-                    messages:
-                      sanitizeAnthropicMessagesForTrace(stepConversation),
-                  }),
-                  [LANGFUSE_ATTR.OBSERVATION_METADATA]: spanJsonAttribute({
-                    step,
-                    toolsOffered: offeredToolNames.length,
-                  }),
-                  [ATTR.GEN_AI_SYSTEM]: "anthropic",
-                  [ATTR.GEN_AI_MODEL]: modelName,
-                  [ATTR.GEN_AI_OPERATION]: "chat",
+                push: (chunk) => {
+                  turnClock.noteProgress();
+                  stepChannel.push(chunk);
                 },
               },
-              turnContext,
+              signal,
             );
-            let firstDeltaSeen = false;
-            try {
-              const result = await baseAdapter.executeStep(
-                request,
-                {
-                  push: (chunk) => {
-                    turnClock.noteProgress();
-                    if (chunk.content && !firstDeltaSeen) {
-                      firstDeltaSeen = true;
-                      // Time-to-first-token for this generation.
-                      generationSpan.setAttribute(
-                        LANGFUSE_ATTR.OBSERVATION_COMPLETION_START_TIME,
-                        new Date().toISOString(),
-                      );
-                    }
-                    stepChannel.push(chunk);
-                  },
-                },
-                signal,
-              );
-              turnCacheUsage.read += result.usage.cacheReadTokens ?? 0;
-              turnCacheUsage.creation += result.usage.cacheWriteTokens ?? 0;
-              turnCacheUsage.creation5m += result.usage.cacheWrite5mTokens ?? 0;
-              turnCacheUsage.creation1h += result.usage.cacheWrite1hTokens ?? 0;
-              generationSpan.setAttribute(
-                LANGFUSE_ATTR.OBSERVATION_OUTPUT,
-                spanContentAttribute({
-                  text: result.text,
-                  ...(result.toolCalls.length > 0
-                    ? { toolCalls: result.toolCalls }
-                    : {}),
-                }),
-              );
-              generationSpan.setAttribute(
-                `${LANGFUSE_ATTR.OBSERVATION_METADATA}.finishReason`,
-                result.rawStopReason ?? "unknown",
-              );
-              return result;
-            } catch (error) {
-              generationSpan.setStatus({
-                code: SpanStatusCode.ERROR,
-                message: error instanceof Error ? error.message : String(error),
-              });
-              if (error instanceof Error) {
-                generationSpan.recordException(error);
-              }
-              throw error;
-            } finally {
-              generationSpan.end();
-            }
+            turnCacheUsage.read += result.usage.cacheReadTokens ?? 0;
+            turnCacheUsage.creation += result.usage.cacheWriteTokens ?? 0;
+            turnCacheUsage.creation5m += result.usage.cacheWrite5mTokens ?? 0;
+            turnCacheUsage.creation1h += result.usage.cacheWrite1hTokens ?? 0;
+            return result;
           },
           buildToolResultMessages: (
             conversation,
@@ -5121,18 +4969,17 @@ export class GoogleVertexProvider extends BaseProvider {
           },
         };
 
-        const activeSpan = otelTrace.getSpan(turnContext);
-        const { stream: engineStream, resultPromise } = runAgenticLoop(
-          adapter,
-          currentMessages.slice(),
-          {
-            tools: engineTools,
-            abortSignal: internalAbort.signal,
-            ...(activeSpan ? { span: activeSpan } : {}),
-            // Same value `guardToolExecutor` already received above, so the
-            // engine's own per-tool bound cannot undercut it.
-            toolTimeoutMs: toolExecTimeoutMs,
-          },
+        const { stream: engineStream, resultPromise } = otelContext.with(
+          turnContext,
+          () =>
+            runAgenticLoop(adapter, currentMessages.slice(), {
+              tools: engineTools,
+              abortSignal: internalAbort.signal,
+              span: turnSpan,
+              // Same value `guardToolExecutor` already received above, so the
+              // engine's own per-tool bound cannot undercut it.
+              toolTimeoutMs: toolExecTimeoutMs,
+            }),
         );
 
         const pump = (async () => {
@@ -5287,43 +5134,57 @@ export class GoogleVertexProvider extends BaseProvider {
                 tools,
                 messages: currentMessages,
               });
-              const finalizationStream = await client.messages.stream({
-                ...requestParams,
-                max_tokens: terminalMaxTokens,
-                // Resized, not inherited: terminalMaxTokens can sit below the
-                // budget requestParams' thinking was sized for.
-                thinking: this.buildClaudeThinkingParam(
-                  options,
-                  terminalMaxTokens,
-                  forceFinalResult,
-                ),
-                ...(forceFinalResult && {
-                  tool_choice: {
-                    type: "tool" as const,
-                    name: "final_result",
-                  },
-                }),
-                ...(cachedFinal.system !== undefined && {
-                  system: cachedFinal.system as Parameters<
-                    typeof client.messages.stream
-                  >[0]["system"],
-                }),
-                ...(cachedFinal.tools &&
-                  cachedFinal.tools.length > 0 && {
-                    tools: cachedFinal.tools as Parameters<
+              const response = await this.withClaudeGeneration(
+                {
+                  stepNumber: maxSteps + 1,
+                  model: requestParams.model,
+                  maxTokens: terminalMaxTokens,
+                  temperature: requestParams.temperature,
+                  topP: requestParams.top_p,
+                  system: cachedFinal.system,
+                  messages: cachedFinal.messages,
+                },
+                async () => {
+                  const finalizationStream = await client.messages.stream({
+                    ...requestParams,
+                    max_tokens: terminalMaxTokens,
+                    // Resized, not inherited: terminalMaxTokens can sit below the
+                    // budget requestParams' thinking was sized for.
+                    thinking: this.buildClaudeThinkingParam(
+                      options,
+                      terminalMaxTokens,
+                      forceFinalResult,
+                    ),
+                    ...(forceFinalResult && {
+                      tool_choice: {
+                        type: "tool" as const,
+                        name: "final_result",
+                      },
+                    }),
+                    ...(cachedFinal.system !== undefined && {
+                      system: cachedFinal.system as Parameters<
+                        typeof client.messages.stream
+                      >[0]["system"],
+                    }),
+                    ...(cachedFinal.tools &&
+                      cachedFinal.tools.length > 0 && {
+                        tools: cachedFinal.tools as Parameters<
+                          typeof client.messages.stream
+                        >[0]["tools"],
+                      }),
+                    messages: cachedFinal.messages as Parameters<
                       typeof client.messages.stream
-                    >[0]["tools"],
-                  }),
-                messages: cachedFinal.messages as Parameters<
-                  typeof client.messages.stream
-                >[0]["messages"],
-              });
-              // Mid-flight aborts are covered by the shared abortHandler via
-              // activeStream; already-fired aborts were handled by the
-              // terminal-entry re-check above.
-              activeStream = finalizationStream;
-              const response = await finalizationStream.finalMessage();
-              activeStream = undefined;
+                    >[0]["messages"],
+                  });
+                  // Mid-flight aborts are covered by the shared abortHandler via
+                  // activeStream; already-fired aborts were handled by the
+                  // terminal-entry re-check above.
+                  activeStream = finalizationStream;
+                  const message = await finalizationStream.finalMessage();
+                  activeStream = undefined;
+                  return message;
+                },
+              );
               usage.input += response.usage?.input_tokens || 0;
               usage.output += response.usage?.output_tokens || 0;
               turnCacheUsage.read +=
@@ -5454,32 +5315,46 @@ export class GoogleVertexProvider extends BaseProvider {
                   terminalMaxTokens,
                   false,
                 );
-                const backstopStream = await client.messages.stream({
-                  ...requestParams,
-                  max_tokens: terminalMaxTokens,
-                  // Assigned outright, never a conditional spread: spreading
-                  // requestParams above may already carry a `thinking` sized
-                  // for the original max_tokens, and only adding a key when
-                  // backstopThinking is truthy would leave that stale value
-                  // in place instead of clearing it.
-                  thinking: backstopThinking,
-                  tool_choice: { type: "none" as const },
-                  system: cachedBackstop.system as Parameters<
-                    typeof client.messages.stream
-                  >[0]["system"],
-                  ...(cachedBackstop.tools &&
-                    cachedBackstop.tools.length > 0 && {
-                      tools: cachedBackstop.tools as Parameters<
+                const response = await this.withClaudeGeneration(
+                  {
+                    stepNumber: maxSteps + 1,
+                    model: requestParams.model,
+                    maxTokens: terminalMaxTokens,
+                    temperature: requestParams.temperature,
+                    topP: requestParams.top_p,
+                    system: cachedBackstop.system,
+                    messages: cachedBackstop.messages,
+                  },
+                  async () => {
+                    const backstopStream = await client.messages.stream({
+                      ...requestParams,
+                      max_tokens: terminalMaxTokens,
+                      // Assigned outright, never a conditional spread: spreading
+                      // requestParams above may already carry a `thinking` sized
+                      // for the original max_tokens, and only adding a key when
+                      // backstopThinking is truthy would leave that stale value
+                      // in place instead of clearing it.
+                      thinking: backstopThinking,
+                      tool_choice: { type: "none" as const },
+                      system: cachedBackstop.system as Parameters<
                         typeof client.messages.stream
-                      >[0]["tools"],
-                    }),
-                  messages: cachedBackstop.messages as Parameters<
-                    typeof client.messages.stream
-                  >[0]["messages"],
-                });
-                activeStream = backstopStream;
-                const response = await backstopStream.finalMessage();
-                activeStream = undefined;
+                      >[0]["system"],
+                      ...(cachedBackstop.tools &&
+                        cachedBackstop.tools.length > 0 && {
+                          tools: cachedBackstop.tools as Parameters<
+                            typeof client.messages.stream
+                          >[0]["tools"],
+                        }),
+                      messages: cachedBackstop.messages as Parameters<
+                        typeof client.messages.stream
+                      >[0]["messages"],
+                    });
+                    activeStream = backstopStream;
+                    const message = await backstopStream.finalMessage();
+                    activeStream = undefined;
+                    return message;
+                  },
+                );
                 usage.input += response.usage?.input_tokens || 0;
                 usage.output += response.usage?.output_tokens || 0;
                 turnCacheUsage.read +=
@@ -5667,22 +5542,16 @@ export class GoogleVertexProvider extends BaseProvider {
           usage.cacheCreationTokens = turnCacheUsage.creation;
         }
 
-        const turnOutputAttribute = spanContentAttribute({
-          text: aggregatedTurnText,
-          ...(structuredOutputRef.value
-            ? { structuredOutput: structuredOutputRef.value }
-            : {}),
-        });
-        turnSpan.setAttribute(
-          LANGFUSE_ATTR.OBSERVATION_OUTPUT,
-          turnOutputAttribute,
-        );
-        turnSpan.setAttribute(LANGFUSE_ATTR.TRACE_OUTPUT, turnOutputAttribute);
-        // Turn usage is metadata-only (not usage_details) — see the note at the
-        // top of this method on why it must not contribute to the cost rollup.
-        turnSpan.setAttribute(
-          LANGFUSE_ATTR.OBSERVATION_METADATA,
-          spanJsonAttribute({
+        observe(turnSpan, "span", {
+          output: {
+            text: aggregatedTurnText,
+            ...(structuredOutputRef.value
+              ? { structuredOutput: structuredOutputRef.value }
+              : {}),
+          },
+          // Turn usage is metadata-only (not usage_details) — see the note at the
+          // top of this method on why it must not contribute to the cost rollup.
+          metadata: {
             toolsOffered: offeredToolNames,
             toolCount: offeredToolNames.length,
             maxSteps,
@@ -5699,35 +5568,32 @@ export class GoogleVertexProvider extends BaseProvider {
               input_cache_creation_5m: turnCacheUsage.creation5m,
               input_cache_creation_1h: turnCacheUsage.creation1h,
             },
-          }),
-        );
+          },
+        });
         // How the turn ended, on the trace itself, so an evaluator can select
         // only turns that finished ("completed") and skip capped, timed-out,
         // aborted and failed ones. A trace holding several turns keeps the last
         // one's; each turn's own is in its observation metadata above.
         if (stopReasonRef.value) {
-          turnSpan.setAttribute(
-            `${LANGFUSE_ATTR.TRACE_METADATA}.stopReason`,
-            stopReasonRef.value,
-          );
+          observeTrace(turnSpan, {
+            metadata: { stopReason: stopReasonRef.value },
+          });
         }
         turnSpan.setStatus({ code: SpanStatusCode.OK });
         channel.close();
       } catch (err) {
-        turnSpan.setAttribute(
-          LANGFUSE_ATTR.OBSERVATION_METADATA,
-          spanJsonAttribute({
+        observe(turnSpan, "span", {
+          level: "ERROR",
+          statusMessage: err instanceof Error ? err.message : String(err),
+          metadata: {
             toolsOffered: offeredToolNames,
             toolCount: offeredToolNames.length,
             maxSteps,
             structuredOutput: useFinalResultTool,
             stopReason: "provider-error",
-          }),
-        );
-        turnSpan.setAttribute(
-          `${LANGFUSE_ATTR.TRACE_METADATA}.stopReason`,
-          "provider-error",
-        );
+          },
+        });
+        observeTrace(turnSpan, { metadata: { stopReason: "provider-error" } });
         turnSpan.setStatus({
           code: SpanStatusCode.ERROR,
           message: err instanceof Error ? err.message : String(err),
@@ -6205,7 +6071,7 @@ export class GoogleVertexProvider extends BaseProvider {
     let hitStepLimit = false;
     let hitContextLimit = false;
     let synthesizedFinalAnswer = false;
-    let modelFinished = false;
+    const modelFinished = false;
     const currentMessages = [...messages];
 
     // In-loop context guard: stop calling tools when the accumulated
@@ -6283,6 +6149,7 @@ export class GoogleVertexProvider extends BaseProvider {
     // engine must never spend it.
     const baseAdapter = createAnthropicLoopAdapter<VertexAnthropicMessage>({
       client,
+      provider: this.providerName,
       maxSteps: agenticStepBudget,
       toolsRecord: options.tools ?? {},
       toolFailureBreaker: {
@@ -6633,43 +6500,55 @@ export class GoogleVertexProvider extends BaseProvider {
             tools,
             messages: currentMessages,
           });
-          const response = await withTimeout(
-            client.messages.create(
-              {
-                ...requestParams,
-                max_tokens: terminalMaxTokens,
-                // Resized, not inherited: terminalMaxTokens can sit below the
-                // budget requestParams' thinking was sized for.
-                thinking: this.buildClaudeThinkingParam(
-                  options,
-                  terminalMaxTokens,
-                  forceFinalResult,
-                ),
-                ...(forceFinalResult && {
-                  tool_choice: {
-                    type: "tool" as const,
-                    name: "final_result",
-                  },
-                }),
-                ...(cachedFinal.system !== undefined && {
-                  system: cachedFinal.system as Parameters<
-                    typeof client.messages.create
-                  >[0]["system"],
-                }),
-                ...(cachedFinal.tools &&
-                  cachedFinal.tools.length > 0 && {
-                    tools: cachedFinal.tools as Parameters<
+          const response = await this.withClaudeGeneration(
+            {
+              stepNumber: maxSteps + 1,
+              model: requestParams.model,
+              maxTokens: terminalMaxTokens,
+              temperature: requestParams.temperature,
+              topP: requestParams.top_p,
+              system: cachedFinal.system,
+              messages: cachedFinal.messages,
+            },
+            () =>
+              withTimeout(
+                client.messages.create(
+                  {
+                    ...requestParams,
+                    max_tokens: terminalMaxTokens,
+                    // Resized, not inherited: terminalMaxTokens can sit below the
+                    // budget requestParams' thinking was sized for.
+                    thinking: this.buildClaudeThinkingParam(
+                      options,
+                      terminalMaxTokens,
+                      forceFinalResult,
+                    ),
+                    ...(forceFinalResult && {
+                      tool_choice: {
+                        type: "tool" as const,
+                        name: "final_result",
+                      },
+                    }),
+                    ...(cachedFinal.system !== undefined && {
+                      system: cachedFinal.system as Parameters<
+                        typeof client.messages.create
+                      >[0]["system"],
+                    }),
+                    ...(cachedFinal.tools &&
+                      cachedFinal.tools.length > 0 && {
+                        tools: cachedFinal.tools as Parameters<
+                          typeof client.messages.create
+                        >[0]["tools"],
+                      }),
+                    messages: cachedFinal.messages as Parameters<
                       typeof client.messages.create
-                    >[0]["tools"],
-                  }),
-                messages: cachedFinal.messages as Parameters<
-                  typeof client.messages.create
-                >[0]["messages"],
-              },
-              { signal: internalAbort.signal },
-            ),
-            generateTimeoutMs,
-            "Anthropic finalization call timed out",
+                    >[0]["messages"],
+                  },
+                  { signal: internalAbort.signal },
+                ),
+                generateTimeoutMs,
+                "Anthropic finalization call timed out",
+              ),
           );
           totalInputTokens += response.usage?.input_tokens || 0;
           totalOutputTokens += response.usage?.output_tokens || 0;
@@ -6785,35 +6664,47 @@ export class GoogleVertexProvider extends BaseProvider {
               terminalMaxTokens,
               false,
             );
-            const response = await withTimeout(
-              client.messages.create(
-                {
-                  ...requestParams,
-                  max_tokens: terminalMaxTokens,
-                  // Assigned outright, never a conditional spread: spreading
-                  // requestParams above may already carry a `thinking` sized
-                  // for the original max_tokens, and only adding a key when
-                  // backstopThinking is truthy would leave that stale value
-                  // in place instead of clearing it.
-                  thinking: backstopThinking,
-                  tool_choice: { type: "none" as const },
-                  system: cachedBackstop.system as Parameters<
-                    typeof client.messages.create
-                  >[0]["system"],
-                  ...(cachedBackstop.tools &&
-                    cachedBackstop.tools.length > 0 && {
-                      tools: cachedBackstop.tools as Parameters<
+            const response = await this.withClaudeGeneration(
+              {
+                stepNumber: maxSteps + 1,
+                model: requestParams.model,
+                maxTokens: terminalMaxTokens,
+                temperature: requestParams.temperature,
+                topP: requestParams.top_p,
+                system: cachedBackstop.system,
+                messages: cachedBackstop.messages,
+              },
+              () =>
+                withTimeout(
+                  client.messages.create(
+                    {
+                      ...requestParams,
+                      max_tokens: terminalMaxTokens,
+                      // Assigned outright, never a conditional spread: spreading
+                      // requestParams above may already carry a `thinking` sized
+                      // for the original max_tokens, and only adding a key when
+                      // backstopThinking is truthy would leave that stale value
+                      // in place instead of clearing it.
+                      thinking: backstopThinking,
+                      tool_choice: { type: "none" as const },
+                      system: cachedBackstop.system as Parameters<
                         typeof client.messages.create
-                      >[0]["tools"],
-                    }),
-                  messages: cachedBackstop.messages as Parameters<
-                    typeof client.messages.create
-                  >[0]["messages"],
-                },
-                { signal: internalAbort.signal },
-              ),
-              generateTimeoutMs,
-              "Anthropic backstop call timed out",
+                      >[0]["system"],
+                      ...(cachedBackstop.tools &&
+                        cachedBackstop.tools.length > 0 && {
+                          tools: cachedBackstop.tools as Parameters<
+                            typeof client.messages.create
+                          >[0]["tools"],
+                        }),
+                      messages: cachedBackstop.messages as Parameters<
+                        typeof client.messages.create
+                      >[0]["messages"],
+                    },
+                    { signal: internalAbort.signal },
+                  ),
+                  generateTimeoutMs,
+                  "Anthropic backstop call timed out",
+                ),
             );
             totalInputTokens += response.usage?.input_tokens || 0;
             totalOutputTokens += response.usage?.output_tokens || 0;
@@ -7190,6 +7081,18 @@ export class GoogleVertexProvider extends BaseProvider {
     return super.stream(optionsOrPrompt);
   }
 
+  private observeMediaGeneration(
+    model: string,
+    run: () => Promise<EnhancedGenerateResult | null>,
+  ): Promise<EnhancedGenerateResult | null> {
+    const call = { provider: this.providerName, model };
+    return withGeneration(call, async (span) => {
+      const result = await run();
+      observeGeneration(span, { ...call, usage: result?.usage });
+      return result;
+    });
+  }
+
   /**
    * Override generate to route ALL models to native SDKs
    * No more @ai-sdk/google-vertex dependency
@@ -7213,12 +7116,11 @@ export class GoogleVertexProvider extends BaseProvider {
     // without this wrapping the provider span never gets emitted.
     return withClientSpan(
       {
-        name: "neurolink.provider.generate",
+        name: "provider.generate",
         tracer: tracers.provider,
+        detached: true,
         attributes: {
-          [ATTR.GEN_AI_SYSTEM]: this.providerName,
-          [ATTR.GEN_AI_MODEL]: modelName,
-          [ATTR.GEN_AI_OPERATION]: "generate",
+          [ATTR.NL_MODEL]: modelName,
           [ATTR.NL_PROVIDER]: this.providerName,
         },
       },
@@ -7244,14 +7146,8 @@ export class GoogleVertexProvider extends BaseProvider {
             "[GoogleVertex] Routing video-mode generate to handleVideoGeneration",
             { model: modelName },
           );
-          const videoResult = await this.handleVideoGeneration(
-            options,
-            generateStartTime,
-          );
-          this.attachUsageAndCostAttributes(
-            generateSpan,
-            modelName,
-            videoResult?.usage,
+          const videoResult = await this.observeMediaGeneration(modelName, () =>
+            this.handleVideoGeneration(options, generateStartTime),
           );
           this.emitGenerationEnd(
             modelName,
@@ -7289,11 +7185,8 @@ export class GoogleVertexProvider extends BaseProvider {
             "[GoogleVertex] Routing image generation model to executeImageGeneration",
             { model: modelName },
           );
-          const imageResult = await this.executeImageGeneration(options);
-          this.attachUsageAndCostAttributes(
-            generateSpan,
-            modelName,
-            imageResult?.usage,
+          const imageResult = await this.observeMediaGeneration(modelName, () =>
+            this.executeImageGeneration(options),
           );
           this.emitGenerationEnd(
             modelName,
@@ -7324,7 +7217,7 @@ export class GoogleVertexProvider extends BaseProvider {
         // assertion has to skip on every native-Vertex run.
         const processedOptions = await withSpan(
           {
-            name: "neurolink.message.build",
+            name: "message.build",
             tracer: tracers.provider,
             attributes: {
               [ATTR.NL_PROVIDER]: this.providerName,
@@ -7358,7 +7251,7 @@ export class GoogleVertexProvider extends BaseProvider {
           prompt: inputPrompt,
         });
         generateSpan.setAttribute(
-          LANGFUSE_ATTR.OBSERVATION_INPUT,
+          LangfuseOtelSpanAttributes.OBSERVATION_INPUT,
           generationInputAttribute,
         );
 
@@ -7371,15 +7264,16 @@ export class GoogleVertexProvider extends BaseProvider {
           // provider overrides generate(), so the span is added here.
           result = await withSpan(
             {
-              name: "neurolink.executeGeneration",
+              name: "executeGeneration",
               tracer: tracers.provider,
+              detached: true,
               attributes: {
-                [ATTR.GEN_AI_SYSTEM]: this.providerName,
-                [ATTR.GEN_AI_MODEL]: modelName,
-                "neurolink.path": isAnthropicModel(modelName)
+                [ATTR.NL_MODEL]: modelName,
+                path: isAnthropicModel(modelName)
                   ? "native.anthropic"
                   : "native.google-genai",
-                [LANGFUSE_ATTR.OBSERVATION_INPUT]: generationInputAttribute,
+                [LangfuseOtelSpanAttributes.OBSERVATION_INPUT]:
+                  generationInputAttribute,
               },
             },
             async (executionSpan) => {
@@ -7417,16 +7311,11 @@ export class GoogleVertexProvider extends BaseProvider {
                 );
               }
               executionSpan.setAttribute(
-                LANGFUSE_ATTR.OBSERVATION_OUTPUT,
+                LangfuseOtelSpanAttributes.OBSERVATION_OUTPUT,
                 spanContentAttribute(nativeResult?.content ?? ""),
               );
               return nativeResult;
             },
-          );
-          this.attachUsageAndCostAttributes(
-            generateSpan,
-            modelName,
-            result?.usage,
           );
           // Pipe through TTS-of-AI-response when caller asks for it. The
           // shared `synthesizeAIResponseIfNeeded` no-ops when tts is not
@@ -7434,7 +7323,7 @@ export class GoogleVertexProvider extends BaseProvider {
           // non-TTS paths.
           result = await this.synthesizeAIResponseIfNeeded(result, options);
           generateSpan.setAttribute(
-            LANGFUSE_ATTR.OBSERVATION_OUTPUT,
+            LangfuseOtelSpanAttributes.OBSERVATION_OUTPUT,
             spanContentAttribute(result?.content ?? ""),
           );
           // Fire onFinish lifecycle callback for the native generate path.
@@ -8263,75 +8152,65 @@ export class GoogleVertexProvider extends BaseProvider {
     return wrapped;
   }
 
-  /**
-   * Attach `gen_ai.usage.*` and `neurolink.cost` attributes to a span.
-   * Pulled out so the generate / stream / image-gen paths share one
-   * implementation, and so observability/tracing tests find consistent
-   * attributes regardless of which native sub-route fulfilled the request.
-   */
-  private attachUsageAndCostAttributes(
-    span: import("@opentelemetry/api").Span | undefined,
-    modelName: string,
-    usage:
-      | {
-          input?: number;
-          output?: number;
-          total?: number;
-          inputTokens?: number;
-          outputTokens?: number;
-          totalTokens?: number;
-          cacheReadTokens?: number;
-          cacheCreationTokens?: number;
-        }
-      | undefined,
-  ): void {
-    if (!span || !usage) {
-      return;
-    }
-    const inputTokens = usage.input ?? usage.inputTokens ?? 0;
-    const outputTokens = usage.output ?? usage.outputTokens ?? 0;
-    const totalTokens =
-      usage.total ?? usage.totalTokens ?? inputTokens + outputTokens;
-    const cacheReadTokens = usage.cacheReadTokens ?? 0;
-    const cacheCreationTokens = usage.cacheCreationTokens ?? 0;
-    if (inputTokens > 0) {
-      span.setAttribute("gen_ai.usage.input_tokens", inputTokens);
-    }
-    if (outputTokens > 0) {
-      span.setAttribute("gen_ai.usage.output_tokens", outputTokens);
-    }
-    if (totalTokens > 0) {
-      span.setAttribute("gen_ai.usage.total_tokens", totalTokens);
-    }
-    if (cacheReadTokens > 0) {
-      span.setAttribute(
-        "gen_ai.usage.cache_read_input_tokens",
-        cacheReadTokens,
-      );
-    }
-    if (cacheCreationTokens > 0) {
-      span.setAttribute(
-        "gen_ai.usage.cache_creation_input_tokens",
-        cacheCreationTokens,
-      );
-    }
-    try {
-      // Pass cache tokens through so calculateCost prices the ~0.1x cache-read
-      // and ~1.25x cache-write tiers instead of billing cached content at the
-      // full input rate.
-      const cost = calculateCost(this.providerName, modelName, {
-        input: inputTokens,
-        output: outputTokens,
-        total: totalTokens,
-        cacheReadTokens,
-        cacheCreationTokens,
-      });
-      if (typeof cost === "number" && cost > 0) {
-        span.setAttribute("neurolink.cost", cost);
-      }
-    } catch {
-      // Pricing table miss is not fatal — leave the attribute unset.
-    }
+  private withClaudeGeneration<
+    T extends {
+      model?: string;
+      content: object[];
+      stop_reason?: string | null;
+      usage?: {
+        input_tokens?: number;
+        output_tokens?: number;
+        cache_read_input_tokens?: number | null;
+        cache_creation_input_tokens?: number | null;
+      };
+    },
+  >(
+    sent: {
+      stepNumber: number;
+      model: string;
+      maxTokens: number;
+      temperature?: number;
+      topP?: number;
+      system: SpanModelRequest["system"];
+      messages: Parameters<typeof sanitizeAnthropicMessagesForTrace>[0];
+    },
+    send: () => Promise<T>,
+  ): Promise<T> {
+    const call = { provider: this.providerName, model: sent.model };
+    return withStepSpan(sent.stepNumber, () =>
+      withGeneration(
+        {
+          ...call,
+          modelParameters: {
+            temperature: sent.temperature,
+            maxTokens: sent.maxTokens,
+            topP: sent.topP,
+          },
+          input: {
+            system: sent.system,
+            messages: sanitizeAnthropicMessagesForTrace(sent.messages),
+          },
+        },
+        async (span) => {
+          const response = await send();
+          observeGeneration(span, {
+            ...call,
+            responseModel: response.model,
+            output: response.content,
+            usage: {
+              inputTokens: response.usage?.input_tokens,
+              outputTokens: response.usage?.output_tokens,
+              cacheReadTokens:
+                response.usage?.cache_read_input_tokens ?? undefined,
+              cacheCreationTokens:
+                response.usage?.cache_creation_input_tokens ?? undefined,
+            },
+            finishReason: response.stop_reason ?? undefined,
+          });
+          return response;
+        },
+      ),
+    );
   }
 
   /**

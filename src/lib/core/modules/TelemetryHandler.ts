@@ -1,7 +1,7 @@
 /**
  * Telemetry Handler Module
  *
- * Handles analytics, evaluation, performance metrics, and telemetry configuration.
+ * Handles analytics, evaluation and performance metrics.
  * Extracted from BaseProvider to follow Single Responsibility Principle.
  *
  * Responsibilities:
@@ -9,7 +9,6 @@
  * - Evaluation generation
  * - Performance metrics recording
  * - Cost calculation
- * - Telemetry configuration
  *
  * @module core/modules/TelemetryHandler
  */
@@ -17,7 +16,6 @@
 import { nanoid } from "nanoid";
 import type { NeuroLink } from "../../neurolink.js";
 import type {
-  Context,
   StreamOptions,
   AIProviderName,
   AnalyticsData,
@@ -28,14 +26,11 @@ import type {
   RawUsageObject,
   TextGenerationOptions,
   TokenUsage,
-  TTSMetadata,
 } from "../../types/index.js";
 import { extractTokenUsage } from "../../utils/tokenUtils.js";
 import { logger } from "../../utils/logger.js";
 import { recordProviderPerformanceFromMetrics } from "../evaluationProviders.js";
-import { TelemetryService } from "../../telemetry/telemetryService.js";
 import { calculateCost, hasPricing } from "../../utils/pricing.js";
-import { getLangfuseContext } from "../../services/server/ai/observability/instrumentation.js";
 
 /**
  * TelemetryHandler class - Handles analytics and telemetry for AI providers
@@ -122,15 +117,6 @@ export class TelemetryHandler {
         success: true,
       });
 
-      // Wire TelemetryService metrics so OTEL counters/histograms are populated
-      TelemetryService.getInstance().recordAIRequest(
-        this.providerName,
-        this.modelName,
-        totalTokens,
-        responseTime,
-        actualCost !== undefined && actualCost > 0 ? actualCost : undefined,
-      );
-
       logger.debug(`Performance recorded for ${this.providerName}`, {
         responseTime: `${responseTime}ms`,
         tokens: totalTokens,
@@ -139,35 +125,6 @@ export class TelemetryHandler {
       });
     } catch (perfError) {
       logger.warn("⚠️ Performance recording failed:", perfError);
-    }
-  }
-
-  /**
-   * Record a TTS synthesis failure without affecting the generation result.
-   */
-  recordTTSFailure(
-    ttsProvider: string,
-    error: NonNullable<TTSMetadata["error"]>,
-    latency: number,
-  ): void {
-    try {
-      const labels = {
-        provider: ttsProvider,
-        error_code: error.code,
-        ...(error.retriable !== undefined
-          ? { retriable: error.retriable.toString() }
-          : {}),
-      };
-      const telemetry = TelemetryService.getInstance();
-
-      telemetry.recordCustomMetric("tts_failures", 1, labels);
-      telemetry.recordCustomHistogram(
-        "tts_failure_latency_ms",
-        latency,
-        labels,
-      );
-    } catch (telemetryError) {
-      logger.warn("TTS failure telemetry recording failed:", telemetryError);
     }
   }
 
@@ -188,65 +145,6 @@ export class TelemetryHandler {
       logger.debug(`Cost calculation failed for ${this.providerName}:`, error);
       return undefined;
     }
-  }
-
-  /**
-   * Create telemetry configuration for Vercel AI SDK experimental_telemetry
-   * This enables automatic OpenTelemetry tracing when telemetry is enabled
-   */
-  getTelemetryConfig(
-    options: StreamOptions | TextGenerationOptions,
-    operationType: "stream" | "generate" = "stream",
-  ):
-    | {
-        isEnabled: boolean;
-        functionId?: string;
-        metadata?: Record<string, string | number | boolean>;
-        recordInputs?: boolean;
-        recordOutputs?: boolean;
-      }
-    | undefined {
-    // Check if telemetry is enabled via NeuroLink observability config
-    if (!this.neurolink?.isTelemetryEnabled()) {
-      return undefined;
-    }
-
-    const context = options.context as Context;
-    const langfuseContext = getLangfuseContext();
-    const traceName = context?.traceName ?? langfuseContext?.traceName;
-    const userId = context?.userId ?? langfuseContext?.userId;
-    const functionId = traceName ? traceName : userId ? userId : "guest";
-
-    const metadata: Record<string, string | number | boolean> = {
-      ...(context?.metadata || {}),
-      provider: this.providerName,
-      model: this.modelName,
-      toolsEnabled: !options.disableTools,
-      neurolink: true,
-      operationType,
-      originalProvider: this.providerName,
-    };
-
-    // Add sessionId if available
-    if ("sessionId" in options && options.sessionId) {
-      const sessionId = options.sessionId;
-      if (
-        typeof sessionId === "string" ||
-        typeof sessionId === "number" ||
-        typeof sessionId === "boolean"
-      ) {
-        metadata.sessionId = sessionId;
-      }
-    }
-
-    return {
-      isEnabled: true,
-      functionId,
-      metadata,
-      recordInputs:
-        process.env.NEUROLINK_RECORD_INPUTS?.toLowerCase() !== "false",
-      recordOutputs: true,
-    };
   }
 
   /**

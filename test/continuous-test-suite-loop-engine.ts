@@ -1261,10 +1261,11 @@ await test("the Gemini adapter uses a supplied collectStep instead of the shared
   // the first step asks for a tool and the second ends the turn.
   let called = 0;
   const adapter = createGeminiLoopAdapter({
+    provider: "probe",
     providerLabel: "probe",
     maxSteps: 3,
     liveTools: {},
-    buildRequest: () => ({}),
+    buildRequest: () => ({ model: "probe", contents: [] }),
     sendStep: async () => ({}) as never,
     collectStep: async () => {
       called++;

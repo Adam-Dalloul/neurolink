@@ -1,8 +1,10 @@
+import { LangfuseOtelSpanAttributes } from "@langfuse/tracing";
 import { trace, context as otelContext } from "@opentelemetry/api";
 import type {
   StreamNoOutputSentinel,
   StreamNoOutputSentinelResultLike,
 } from "../types/index.js";
+import { observationLevel } from "../telemetry/observation.js";
 import { NoOutputGeneratedError } from "./generationErrors.js";
 
 export async function buildNoOutputSentinel(
@@ -142,47 +144,26 @@ export async function detectPostStreamNoOutput(
 }
 
 /**
- * Reviewer follow-up: every provider's post-stream NoOutput detect must
- * stamp the active OTel span so Pipeline B (`ContextEnricher.onEnd()` →
- * `applyNonErrorLangfuseLevel`) surfaces a WARNING-level Langfuse
- * observation with the enriched status message. Without this, only
- * `StreamHandler`-based providers produced the rich telemetry; the
- * provider-specific paths (openAI, openaiCompatible, litellm,
- * huggingFace, openRouter, anthropic) yielded the sentinel
- * to direct stream consumers but Pipeline B saw nothing.
- *
- * Stamps three attributes:
- *   - `neurolink.no_output = true` (Pipeline B trigger)
- *   - `langfuse.status_message` (enriched, with finishReason + tokens)
- *   - `neurolink.no_output.finish_reason` (raw finish reason)
- *
- * Safe to call when tracing isn't initialized — silently no-ops.
+ * Marks the active span as a no-output stream so Langfuse shows a WARNING
+ * observation with the enriched status message. Safe to call when tracing
+ * isn't initialized — silently no-ops.
  */
 export function stampNoOutputSpan(sentinel: StreamNoOutputSentinel): void {
-  try {
-    const activeSpan = trace.getSpan(otelContext.active());
-    if (!activeSpan) {
-      return;
-    }
-    activeSpan.setAttribute("neurolink.no_output", true);
-    activeSpan.setAttribute(
-      "langfuse.status_message",
+  trace.getSpan(otelContext.active())?.setAttributes({
+    no_output: true,
+    "no_output.finish_reason": String(sentinel.metadata.finishReason),
+    [LangfuseOtelSpanAttributes.OBSERVATION_LEVEL]:
+      observationLevel("no-output"),
+    [LangfuseOtelSpanAttributes.OBSERVATION_STATUS_MESSAGE]:
       buildNoOutputStatusMessage(
         sentinel.metadata.finishReason,
         sentinel.metadata.usage,
       ),
-    );
-    activeSpan.setAttribute(
-      "neurolink.no_output.finish_reason",
-      String(sentinel.metadata.finishReason),
-    );
-  } catch {
-    // Tracing not initialized — ignore.
-  }
+  });
 }
 
 /**
- * Build the OTel `langfuse.status_message` summary string for a no-output
+ * Build the OTel `langfuse.observation.status_message` summary string for a no-output
  * stream. Used by `StreamHandler.createTextStream` and any future provider
  * that wants to stamp the active span with the same enriched message.
  *

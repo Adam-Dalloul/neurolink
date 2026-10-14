@@ -58,7 +58,7 @@ export function createOpenApiRoutes(
         handler: async () =>
           withSpan(
             {
-              name: "neurolink.http.openapi.json",
+              name: "http.openapi.json",
               tracer: tracers.http,
               attributes: {
                 "http.route": `${basePath}/openapi.json`,
@@ -97,7 +97,7 @@ export function createOpenApiRoutes(
         handler: async () =>
           withSpan(
             {
-              name: "neurolink.http.openapi.yaml",
+              name: "http.openapi.yaml",
               tracer: tracers.http,
               attributes: {
                 "http.route": `${basePath}/openapi.yaml`,
@@ -140,7 +140,7 @@ export function createOpenApiRoutes(
         handler: async () =>
           withSpan(
             {
-              name: "neurolink.http.openapi.docs",
+              name: "http.openapi.docs",
               tracer: tracers.http,
               attributes: {
                 "http.route": `${basePath}/docs`,

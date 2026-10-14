@@ -92,7 +92,7 @@ export class SSEClient {
   ): Promise<void> {
     return withClientSpan(
       {
-        name: "neurolink.client.streaming.sse.connect",
+        name: "client.streaming.sse.connect",
         tracer: tracers.http,
         attributes: {
           "http.url": this.url,
@@ -485,7 +485,7 @@ export class WebSocketStreamingClient {
   async connect(): Promise<void> {
     return withClientSpan(
       {
-        name: "neurolink.client.streaming.ws.connect",
+        name: "client.streaming.ws.connect",
         tracer: tracers.http,
         attributes: { "http.url": this.options.url },
       },

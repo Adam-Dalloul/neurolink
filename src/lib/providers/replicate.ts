@@ -21,6 +21,8 @@ import type {
   TextGenerationOptions,
   ValidationSchema,
 } from "../types/index.js";
+import { observeGeneration } from "../telemetry/observation.js";
+import { withGeneration } from "../telemetry/withSpan.js";
 import { logger } from "../utils/logger.js";
 import { ERROR_CODES, NeuroLinkError } from "../utils/errorHandling.js";
 import {
@@ -303,13 +305,32 @@ export class ReplicateProvider extends BaseProvider {
 
     let prediction: Awaited<ReturnType<typeof predict>>;
     try {
-      prediction = await predict(
-        auth,
+      const call = { provider: this.providerName, model: this.modelName };
+      prediction = await withGeneration(
         {
-          model: this.modelName,
-          input: replicateInput,
+          ...call,
+          modelParameters: {
+            temperature: options.temperature,
+            maxTokens: options.maxTokens,
+            topP: 1,
+          },
+          input: { prompt },
         },
-        { abortSignal: options.abortSignal },
+        async (span) => {
+          const settled = await predict(
+            auth,
+            {
+              model: this.modelName,
+              input: replicateInput,
+            },
+            { abortSignal: options.abortSignal },
+          );
+          observeGeneration(span, {
+            ...call,
+            output: flattenReplicateOutput(settled.output),
+          });
+          return settled;
+        },
       );
     } catch (err) {
       throw this.handleProviderError(err);

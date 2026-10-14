@@ -3,10 +3,8 @@
 /**
  * NeuroLink CLI Telemetry Commands
  *
- * Commands for managing telemetry and observability exporters:
- * - status: Show exporter status
- * - configure: Configure an exporter
- * - list-exporters: List configured exporters
+ * Commands for managing telemetry:
+ * - status: Show telemetry status
  * - flush: Flush pending spans
  * - stats: Show token/cost stats
  */
@@ -24,30 +22,12 @@ import {
   validateNativeTelemetry,
 } from "../utils/nativeTelemetry.js";
 import type {
-  ExporterName,
   TelemetryStatusArgs as StatusArgs,
-  TelemetryConfigureArgs as ConfigureArgs,
-  TelemetryListExportersArgs as ListExportersArgs,
   TelemetryFlushArgs as FlushArgs,
   TelemetryStatsArgs as StatsArgs,
   TelemetryNativePrepareArgs,
   TelemetryNativeValidateArgs,
 } from "../../lib/types/index.js";
-
-/**
- * Available exporter names
- */
-const AVAILABLE_EXPORTERS = [
-  "langfuse",
-  "langsmith",
-  "otel",
-  "datadog",
-  "sentry",
-  "braintrust",
-  "arize",
-  "posthog",
-  "laminar",
-] as const;
 
 /**
  * Telemetry Command Factory
@@ -60,12 +40,10 @@ export class TelemetryCommandFactory {
     return {
       command: "telemetry <subcommand>",
       aliases: ["tel"],
-      describe: "Telemetry and exporter management",
+      describe: "Telemetry management",
       builder: (yargs: Argv<object>) => {
         return yargs
           .command(TelemetryCommandFactory.createStatusCommand())
-          .command(TelemetryCommandFactory.createConfigureCommand())
-          .command(TelemetryCommandFactory.createListExportersCommand())
           .command(TelemetryCommandFactory.createFlushCommand())
           .command(TelemetryCommandFactory.createStatsCommand())
           .command(TelemetryCommandFactory.createNativePrepareCommand())
@@ -217,7 +195,7 @@ export class TelemetryCommandFactory {
   static createStatusCommand(): CommandModule<object, StatusArgs> {
     return {
       command: "status",
-      describe: "Show exporter status and health",
+      describe: "Show telemetry status",
       builder: (yargs: Argv<object>) => {
         return yargs
           .option("format", {
@@ -237,7 +215,7 @@ export class TelemetryCommandFactory {
       handler: async (args) => {
         const spinner = args.quiet
           ? null
-          : ora("Checking exporter status...").start();
+          : ora("Checking telemetry status...").start();
 
         try {
           const neurolink = new NeuroLink();
@@ -316,30 +294,6 @@ export class TelemetryCommandFactory {
               }
             }
 
-            // Exporters health summary
-            if (status.exporters && status.exporters.length > 0) {
-              logger.always("");
-              logger.always(chalk.bold("Exporter Health:"));
-              for (const exporter of status.exporters) {
-                const healthIcon = exporter.healthy
-                  ? chalk.green("[OK]")
-                  : chalk.red("[ERROR]");
-                const pendingInfo = exporter.pendingSpans
-                  ? chalk.gray(` (${exporter.pendingSpans} pending)`)
-                  : "";
-                logger.always(`  ${healthIcon} ${exporter.name}${pendingInfo}`);
-
-                if (exporter.errors && exporter.errors.length > 0) {
-                  for (const error of exporter.errors.slice(0, 2)) {
-                    logger.always(chalk.red(`      Error: ${error}`));
-                  }
-                }
-              }
-            } else {
-              logger.always("");
-              logger.always(chalk.gray("No exporters configured."));
-            }
-
             logger.always("");
           }
         } catch (error) {
@@ -357,276 +311,12 @@ export class TelemetryCommandFactory {
   }
 
   /**
-   * Create the configure subcommand
-   */
-  static createConfigureCommand(): CommandModule<object, ConfigureArgs> {
-    return {
-      command: "configure",
-      describe: "Configure an exporter with JSON settings",
-      builder: (yargs: Argv<object>) => {
-        return yargs
-          .option("exporter", {
-            alias: "e",
-            type: "string",
-            demandOption: true,
-            choices: AVAILABLE_EXPORTERS,
-            describe: "Exporter name to configure",
-          })
-          .option("config", {
-            alias: "c",
-            type: "string",
-            demandOption: true,
-            describe: "JSON configuration string",
-          })
-          .option("format", {
-            alias: "f",
-            type: "string",
-            choices: ["text", "json", "table"] as const,
-            default: "text",
-            describe: "Output format",
-          })
-          .option("quiet", {
-            alias: "q",
-            type: "boolean",
-            default: false,
-            describe: "Minimal output",
-          }) as Argv<ConfigureArgs>;
-      },
-      handler: async (args) => {
-        const spinner = args.quiet
-          ? null
-          : ora(`Configuring ${args.exporter} exporter...`).start();
-
-        try {
-          // Parse the JSON config
-          let config: Record<string, unknown>;
-          try {
-            config = JSON.parse(args.config);
-          } catch {
-            if (spinner) {
-              spinner.fail("Invalid JSON configuration");
-            }
-            logger.always(chalk.red("Error: Configuration must be valid JSON"));
-            logger.always("");
-            logger.always("Example:");
-            logger.always(
-              chalk.gray(
-                `  neurolink telemetry configure --exporter langfuse --config '{"publicKey":"pk-...", "secretKey":"sk-..."}'`,
-              ),
-            );
-            process.exit(1);
-          }
-
-          // Validate required fields based on exporter type
-          const validationResult = validateExporterConfig(
-            args.exporter as ExporterName,
-            config,
-          );
-          if (!validationResult.valid) {
-            if (spinner) {
-              spinner.fail("Configuration validation failed");
-            }
-            logger.always(chalk.red(`Error: ${validationResult.error}`));
-            logger.always("");
-            logger.always(
-              chalk.yellow(`Required fields for ${args.exporter}:`),
-            );
-            for (const field of validationResult.requiredFields ?? []) {
-              logger.always(chalk.gray(`  - ${field}`));
-            }
-            process.exit(1);
-          }
-
-          // Currently, exporter configuration is done via environment variables
-          // or SDK initialization. This command provides guidance on how to configure.
-          if (spinner) {
-            spinner.succeed(`${args.exporter} configuration validated`);
-          }
-
-          if (args.format === "json") {
-            logger.always(
-              JSON.stringify(
-                {
-                  exporter: args.exporter,
-                  config: config,
-                  valid: true,
-                  message:
-                    "Configuration validated. Set environment variables or use SDK initialization.",
-                },
-                null,
-                2,
-              ),
-            );
-          } else {
-            logger.always("");
-            logger.always(
-              chalk.bold.cyan(`=== ${args.exporter} Configuration ===`),
-            );
-            logger.always("");
-            logger.always(chalk.green("Configuration validated successfully!"));
-            logger.always("");
-            logger.always(chalk.bold("To apply this configuration:"));
-            logger.always("");
-
-            // Show environment variable instructions
-            const envVars = getExporterEnvVars(args.exporter as ExporterName);
-            logger.always(chalk.yellow("Option 1: Set environment variables"));
-            for (const [key, description] of Object.entries(envVars)) {
-              logger.always(chalk.gray(`  export ${key}="<${description}>"`));
-            }
-
-            logger.always("");
-            logger.always(chalk.yellow("Option 2: SDK initialization"));
-            logger.always(chalk.gray(`  const neurolink = new NeuroLink({`));
-            logger.always(chalk.gray(`    observability: {`));
-            logger.always(
-              chalk.gray(
-                `      ${args.exporter}: ${JSON.stringify(config, null, 6).split("\n").join("\n      ")}`,
-              ),
-            );
-            logger.always(chalk.gray(`    }`));
-            logger.always(chalk.gray(`  });`));
-
-            logger.always("");
-          }
-        } catch (error) {
-          if (spinner) {
-            spinner.fail("Failed to configure exporter");
-          }
-          logger.error(
-            "Error:",
-            error instanceof Error ? error.message : String(error),
-          );
-          process.exit(1);
-        }
-      },
-    };
-  }
-
-  /**
-   * Create the list-exporters subcommand
-   */
-  static createListExportersCommand(): CommandModule<
-    object,
-    ListExportersArgs
-  > {
-    return {
-      command: "list-exporters",
-      aliases: ["list", "ls"],
-      describe: "List all available and configured exporters",
-      builder: (yargs: Argv<object>) => {
-        return yargs
-          .option("format", {
-            alias: "f",
-            type: "string",
-            choices: ["text", "json", "table"] as const,
-            default: "text",
-            describe: "Output format",
-          })
-          .option("quiet", {
-            alias: "q",
-            type: "boolean",
-            default: false,
-            describe: "Minimal output",
-          }) as Argv<ListExportersArgs>;
-      },
-      handler: async (args) => {
-        const spinner = args.quiet ? null : ora("Listing exporters...").start();
-
-        try {
-          const neurolink = new NeuroLink();
-          const status = neurolink.getTelemetryStatus();
-
-          if (spinner) {
-            spinner.succeed("Exporters listed");
-          }
-
-          const configuredExporters = status.exporters ?? [];
-          const configuredNames = new Set(
-            configuredExporters.map((e) => e.name.toLowerCase()),
-          );
-
-          if (args.format === "json") {
-            logger.always(
-              JSON.stringify(
-                {
-                  available: AVAILABLE_EXPORTERS,
-                  configured: configuredExporters,
-                },
-                null,
-                2,
-              ),
-            );
-          } else {
-            logger.always("");
-            logger.always(chalk.bold.cyan("=== Available Exporters ==="));
-            logger.always("");
-
-            for (const exporter of AVAILABLE_EXPORTERS) {
-              const isConfigured = configuredNames.has(exporter);
-              const configuredExporter = configuredExporters.find(
-                (e) => e.name.toLowerCase() === exporter,
-              );
-
-              const statusIcon = isConfigured
-                ? configuredExporter?.healthy
-                  ? chalk.green("[ACTIVE]")
-                  : chalk.yellow("[CONFIGURED]")
-                : chalk.gray("[AVAILABLE]");
-
-              const description = getExporterDescription(exporter);
-              logger.always(`${statusIcon} ${chalk.bold(exporter)}`);
-              logger.always(chalk.gray(`    ${description}`));
-
-              if (isConfigured && configuredExporter) {
-                if (configuredExporter.pendingSpans) {
-                  logger.always(
-                    chalk.gray(
-                      `    Pending spans: ${configuredExporter.pendingSpans}`,
-                    ),
-                  );
-                }
-                if (configuredExporter.lastExportTime) {
-                  const lastExport = new Date(
-                    configuredExporter.lastExportTime,
-                  );
-                  logger.always(
-                    chalk.gray(`    Last export: ${lastExport.toISOString()}`),
-                  );
-                }
-              }
-              logger.always("");
-            }
-
-            logger.always(chalk.bold("Configuration Help:"));
-            logger.always(
-              chalk.gray(
-                "  Use 'neurolink telemetry configure --exporter <name> --config <json>' to configure an exporter",
-              ),
-            );
-            logger.always("");
-          }
-        } catch (error) {
-          if (spinner) {
-            spinner.fail("Failed to list exporters");
-          }
-          logger.error(
-            "Error:",
-            error instanceof Error ? error.message : String(error),
-          );
-          process.exit(1);
-        }
-      },
-    };
-  }
-
-  /**
    * Create the flush subcommand
    */
   static createFlushCommand(): CommandModule<object, FlushArgs> {
     return {
       command: "flush",
-      describe: "Flush all pending spans to exporters",
+      describe: "Flush all pending spans",
       builder: (yargs: Argv<object>) => {
         return yargs
           .option("timeout", {
@@ -655,16 +345,6 @@ export class TelemetryCommandFactory {
           : ora("Flushing pending spans...").start();
 
         try {
-          const neurolink = new NeuroLink();
-          const statusBefore = neurolink.getTelemetryStatus();
-
-          // Count pending spans before flush
-          const pendingBefore =
-            statusBefore.exporters?.reduce(
-              (sum, e) => sum + (e.pendingSpans ?? 0),
-              0,
-            ) ?? 0;
-
           // Create a timeout promise
           let flushTimer: ReturnType<typeof setTimeout> | undefined;
           const timeoutPromise = new Promise<void>((_, reject) => {
@@ -685,42 +365,16 @@ export class TelemetryCommandFactory {
             clearTimeout(flushTimer);
           }
 
-          // Get status after flush
-          const statusAfter = neurolink.getTelemetryStatus();
-          const pendingAfter =
-            statusAfter.exporters?.reduce(
-              (sum, e) => sum + (e.pendingSpans ?? 0),
-              0,
-            ) ?? 0;
-
-          const flushedCount = Math.max(0, pendingBefore - pendingAfter);
-
           if (spinner) {
             spinner.succeed("Flush completed");
           }
 
           if (args.format === "json") {
-            logger.always(
-              JSON.stringify(
-                {
-                  success: true,
-                  pendingBefore,
-                  pendingAfter,
-                  flushed: flushedCount,
-                },
-                null,
-                2,
-              ),
-            );
+            logger.always(JSON.stringify({ success: true }, null, 2));
           } else {
             logger.always("");
             logger.always(chalk.bold.cyan("=== Flush Complete ==="));
             logger.always("");
-            logger.always(formatRow("Spans before:", pendingBefore.toString()));
-            logger.always(formatRow("Spans after:", pendingAfter.toString()));
-            logger.always(
-              formatRow("Flushed:", chalk.green(flushedCount.toString())),
-            );
             logger.always("");
           }
         } catch (error) {
@@ -991,111 +645,4 @@ export class TelemetryCommandFactory {
       },
     };
   }
-}
-
-/**
- * Validate exporter configuration
- */
-function validateExporterConfig(
-  exporter: ExporterName,
-  config: Record<string, unknown>,
-): { valid: boolean; error?: string; requiredFields?: string[] } {
-  const requiredFieldsMap: Record<ExporterName, string[]> = {
-    langfuse: ["publicKey", "secretKey"],
-    langsmith: ["apiKey"],
-    otel: ["endpoint"],
-    datadog: ["apiKey"],
-    sentry: ["dsn"],
-    braintrust: ["apiKey", "projectName"],
-    arize: ["spaceKey", "apiKey"],
-    posthog: ["apiKey"],
-    laminar: ["apiKey"],
-  };
-
-  const requiredFields = requiredFieldsMap[exporter];
-  const missingFields = requiredFields.filter(
-    (field) => !(field in config) || !config[field],
-  );
-
-  if (missingFields.length > 0) {
-    return {
-      valid: false,
-      error: `Missing required fields: ${missingFields.join(", ")}`,
-      requiredFields,
-    };
-  }
-
-  return { valid: true };
-}
-
-/**
- * Get environment variable names for an exporter
- */
-function getExporterEnvVars(exporter: ExporterName): Record<string, string> {
-  const envVarsMap: Record<ExporterName, Record<string, string>> = {
-    langfuse: {
-      LANGFUSE_PUBLIC_KEY: "your-public-key",
-      LANGFUSE_SECRET_KEY: "your-secret-key",
-      LANGFUSE_BASEURL: "https://cloud.langfuse.com (optional)",
-    },
-    langsmith: {
-      LANGCHAIN_API_KEY: "your-api-key",
-      LANGCHAIN_PROJECT: "your-project-name (optional)",
-      LANGCHAIN_ENDPOINT: "https://api.smith.langchain.com (optional)",
-    },
-    otel: {
-      OTEL_EXPORTER_OTLP_ENDPOINT: "http://localhost:4318",
-      OTEL_SERVICE_NAME: "your-service-name",
-      OTEL_EXPORTER_OTLP_PROTOCOL: "http (or grpc)",
-    },
-    datadog: {
-      DD_API_KEY: "your-api-key",
-      DD_SITE: "datadoghq.com (or regional site)",
-      DD_SERVICE: "your-service-name",
-    },
-    sentry: {
-      SENTRY_DSN: "your-dsn-url",
-      SENTRY_TRACES_SAMPLE_RATE: "1.0 (optional)",
-      SENTRY_RELEASE: "your-release-version (optional)",
-    },
-    braintrust: {
-      BRAINTRUST_API_KEY: "your-api-key",
-      BRAINTRUST_PROJECT: "your-project-name",
-    },
-    arize: {
-      ARIZE_SPACE_KEY: "your-space-key",
-      ARIZE_API_KEY: "your-api-key",
-    },
-    posthog: {
-      POSTHOG_API_KEY: "your-api-key",
-      POSTHOG_HOST: "https://app.posthog.com (optional)",
-    },
-    laminar: {
-      LAMINAR_API_KEY: "your-api-key",
-      LAMINAR_BASE_URL: "https://api.laminar.run (optional)",
-    },
-  };
-
-  return envVarsMap[exporter];
-}
-
-/**
- * Get description for an exporter
- */
-function getExporterDescription(exporter: ExporterName): string {
-  const descriptions: Record<ExporterName, string> = {
-    langfuse:
-      "Open-source LLM observability platform with traces and analytics",
-    langsmith:
-      "LangChain's platform for LLM application debugging and monitoring",
-    otel: "OpenTelemetry Protocol (OTLP) for distributed tracing",
-    datadog: "APM and infrastructure monitoring platform",
-    sentry: "Error tracking and performance monitoring",
-    braintrust: "AI evaluation and experimentation platform",
-    arize: "ML observability platform for model monitoring",
-    posthog: "Product analytics with LLM event tracking",
-    laminar: "LLM application monitoring and debugging",
-  };
-
-  return descriptions[exporter];
 }

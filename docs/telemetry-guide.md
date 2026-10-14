@@ -18,192 +18,37 @@ NeuroLink includes optional OpenTelemetry integration for enterprise monitoring 
 
 ---
 
-## 🎯 Langfuse Integration
+## Langfuse Integration
 
-NeuroLink provides native integration with [Langfuse](https://langfuse.com/) for LLM-specific observability.
-
-### Quick Setup
+Set `LANGFUSE_PUBLIC_KEY` and `LANGFUSE_SECRET_KEY` and NeuroLink exports every AI operation to [Langfuse](https://langfuse.com/). Pass `observability: { langfuse: false }` to disable. Full input and output are captured by default; use `mask` for sensitive data.
 
 ```typescript
 import { NeuroLink } from "@juspay/neurolink";
 
-const neurolink = new NeuroLink({
-  observability: {
-    langfuse: {
-      enabled: true,
-      publicKey: process.env.LANGFUSE_PUBLIC_KEY!,
-      secretKey: process.env.LANGFUSE_SECRET_KEY!,
-      baseUrl: "https://cloud.langfuse.com", // or self-hosted URL
-      environment: "production",
-      release: "1.0.0",
-    },
-  },
+const neurolink = new NeuroLink();
+await neurolink.generate({
+  input: { text: "Hello" },
+  context: { userId: "user-123", sessionId: "session-456", tags: ["support"] },
 });
 ```
 
-### Context Enrichment
+If your application already registers an OpenTelemetry `TracerProvider`, NeuroLink creates no provider but registers its Langfuse exporter when keys are configured; add `createExporterSpanProcessor()` to your provider (recommended), or add `new LangfuseSpanProcessor()` from `@langfuse/otel` with its own keys (no custom filter is needed because every NeuroLink observation span carries `gen_ai.observation.type` and infrastructure spans are not exported; NeuroLink's `mask`, chunking and retry do not apply to it). In serverless, call `flushOpenTelemetry()` before exit.
 
-Add user, session, and custom metadata to your traces:
-
-```typescript
-import { setLangfuseContext, getLangfuseContext } from "@juspay/neurolink";
-
-// Set context with all available fields
-await setLangfuseContext({
-  userId: "user-123",
-  sessionId: "session-456",
-  conversationId: "conv-789",
-  requestId: "req-abc",
-  traceName: "customer-support-chat",
-  metadata: {
-    feature: "support",
-    tier: "premium",
-    region: "us-east-1",
-  },
-});
-
-// Read current context
-const context = getLangfuseContext();
-console.log(context?.conversationId);
-```
-
-### Custom Spans
-
-Create your own spans for detailed tracing:
-
-```typescript
-import { getTracer, setLangfuseContext } from "@juspay/neurolink";
-
-const tracer = getTracer("my-app");
-
-await setLangfuseContext({ userId: "user-123" }, async () => {
-  const span = tracer.startSpan("process-request");
-  try {
-    const result = await neurolink.generate("Hello");
-    span.setAttribute("tokens.total", result.usage?.totalTokens);
-    return result;
-  } finally {
-    span.end();
-  }
-});
-```
-
-### External TracerProvider Mode
-
-If your application already has OpenTelemetry instrumentation, use external provider mode:
-
-```typescript
-import { NeuroLink, getSpanProcessors } from "@juspay/neurolink";
-import { NodeSDK } from "@opentelemetry/sdk-node";
-import { BatchSpanProcessor } from "@opentelemetry/sdk-trace-base";
-import { OTLPTraceExporter } from "@opentelemetry/exporter-trace-otlp-http";
-
-// Initialize NeuroLink without creating its own TracerProvider
-const neurolink = new NeuroLink({
-  observability: {
-    langfuse: {
-      enabled: true,
-      publicKey: process.env.LANGFUSE_PUBLIC_KEY!,
-      secretKey: process.env.LANGFUSE_SECRET_KEY!,
-      useExternalTracerProvider: true, // Don't create TracerProvider
-    },
-  },
-});
-
-// Create your existing exporter wrapped in BatchSpanProcessor
-const exporter = new OTLPTraceExporter({
-  url: "http://localhost:4318/v1/traces",
-});
-
-// Add NeuroLink's processors to your existing OTEL setup
-const sdk = new NodeSDK({
-  spanProcessors: [
-    new BatchSpanProcessor(exporter),
-    ...getSpanProcessors(), // [ContextEnricher, LangfuseSpanProcessor]
-  ],
-});
-sdk.start();
-```
-
-### Vercel AI SDK Integration
-
-If your application also uses the Vercel AI SDK, NeuroLink's `ContextEnricher` reads the GenAI semantic-convention attributes that `experimental_telemetry` emits. NeuroLink itself has no dependency on the `ai` package — the imports below are your application's, and the SDK is not required to use NeuroLink:
-
-```typescript
-import { generateText } from "ai";
-import { openai } from "@ai-sdk/openai";
-import { setLangfuseContext } from "@juspay/neurolink";
-
-await setLangfuseContext({ userId: "user-123" }, async () => {
-  const result = await generateText({
-    model: openai("gpt-4"),
-    prompt: "Hello",
-    experimental_telemetry: { isEnabled: true },
-  });
-  // Token usage and model info automatically captured
-});
-```
+The full guide, including the migration table for removed fields and exports, is [Observability](./features/observability.md).
 
 ---
 
-## 🔧 Basic Setup
-
-### Environment Configuration
-
-```bash
-# Enable telemetry
-NEUROLINK_TELEMETRY_ENABLED=true
-
-# OpenTelemetry endpoint (Jaeger, OTLP collector, etc.)
-OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4318
-
-# Service identification
-OTEL_SERVICE_NAME=my-ai-application
-OTEL_SERVICE_VERSION=1.0.0
-
-# Optional: Resource attributes
-OTEL_RESOURCE_ATTRIBUTES="service.name=my-ai-app,service.version=1.0.0,deployment.environment=production"
-
-# Optional: Sampling configuration
-OTEL_TRACES_SAMPLER=traceidratio
-OTEL_TRACES_SAMPLER_ARG=0.1  # Sample 10% of traces
-```
-
-### Programmatic Initialization
-
-```typescript
-import { initializeTelemetry, getTelemetryStatus } from "@juspay/neurolink";
-
-// Configuration is done via environment variables:
-// NEUROLINK_TELEMETRY_ENABLED=true
-// OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4318
-// OTEL_SERVICE_NAME=my-ai-application
-// OTEL_SERVICE_VERSION=1.0.0
-
-// Initialize telemetry (reads from environment variables)
-const success = await initializeTelemetry();
-// Returns: Promise<boolean>
-
-if (success) {
-  console.log("Telemetry initialized successfully");
-}
-
-// Check telemetry status
-const status = await getTelemetryStatus();
-// Returns: { enabled: boolean, initialized: boolean, endpoint?: string, service?: string, version?: string }
-
-console.log("Telemetry enabled:", status.enabled);
-console.log("Endpoint:", status.endpoint);
-```
+## Basic Setup
 
 ### Environment Variables
 
-| Variable                      | Description              | Default        |
-| ----------------------------- | ------------------------ | -------------- |
-| `NEUROLINK_TELEMETRY_ENABLED` | Enable/disable telemetry | `false`        |
-| `OTEL_EXPORTER_OTLP_ENDPOINT` | OTLP endpoint URL        | -              |
-| `OTEL_SERVICE_NAME`           | Service name             | `neurolink-ai` |
-| `OTEL_SERVICE_VERSION`        | Service version          | `3.0.1`        |
+| Variable                      | Description                                          | Default        |
+| ----------------------------- | ---------------------------------------------------- | -------------- |
+| `LANGFUSE_PUBLIC_KEY`         | Langfuse public key; with the secret key, enables it | -              |
+| `LANGFUSE_SECRET_KEY`         | Langfuse secret key                                  | -              |
+| `LANGFUSE_BASE_URL`           | Langfuse host                                        | Langfuse Cloud |
+| `OTEL_EXPORTER_OTLP_ENDPOINT` | OTLP collector endpoint for traces and metrics       | -              |
+| `OTEL_SERVICE_NAME`           | Service name                                         | `neurolink-ai` |
 
 ---
 
@@ -223,7 +68,7 @@ When running the NeuroLink proxy (`neurolink proxy start`), OpenTelemetry is aut
 
 **Caller trace linkage:** When a calling SDK already has an active trace, NeuroLink forwards W3C `traceparent`/`tracestate` headers and `x-neurolink-session-id` / `x-neurolink-user-id` / `x-neurolink-conversation-id` headers into the proxy so proxy spans can attach to the caller trace and preserve session-level attribution.
 
-**TelemetryService reuse:** If a global `TracerProvider` is already registered (e.g., by the host application), `TelemetryService` will reuse it instead of creating a duplicate — avoiding "already registered" errors.
+**Provider reuse:** If a global `TracerProvider` is already registered (e.g., by the host application), NeuroLink registers nothing and uses it, avoiding "already registered" errors.
 
 **OpenObserve dashboard:** The maintained proxy dashboard definition lives in `docs/assets/dashboards/neurolink-proxy-observability-dashboard.json`. For how to read that dashboard and which streams it should use, see [Claude Proxy Observability](./features/claude-proxy-observability.md).
 
@@ -293,7 +138,6 @@ services:
   my-ai-app:
     build: .
     environment:
-      - NEUROLINK_TELEMETRY_ENABLED=true
       - OTEL_EXPORTER_OTLP_ENDPOINT=http://jaeger:14268/api/traces
       - OTEL_SERVICE_NAME=my-ai-application
       - OPENAI_API_KEY=${OPENAI_API_KEY}
@@ -371,10 +215,9 @@ neurolink_websocket_connections_active
 
 ### ✅ Quick Setup (5 minutes)
 
-1. **Enable Telemetry**
+1. **Set the service name**
 
    ```bash
-   export NEUROLINK_TELEMETRY_ENABLED=true
    export OTEL_SERVICE_NAME=my-ai-app
    ```
 
@@ -393,12 +236,9 @@ neurolink_websocket_connections_active
    export OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:14268/api/traces
    ```
 
-4. **Initialize in Code**
+4. **Run your app**
 
-   ```typescript
-   import { initializeTelemetry } from "@juspay/neurolink";
-   await initializeTelemetry();
-   ```
+   Tracing starts with the first `new NeuroLink()`; no initialization call is needed.
 
 5. **View Traces**
    - Open http://localhost:16686

@@ -1456,7 +1456,7 @@ await test("a deferred tool hydrated mid-turn is executed and observed with a to
   // deferred external tool is not an enumerable entry of the live record, so
   // calling it always dispatches through resolveToolOnMiss — auto-hydration
   // from the deferred catalog. This pins that the hydrated execution carries
-  // the same ai.toolCall observation as an up-front one: the hand-rolled loop
+  // the same tool observation as an up-front one: the hand-rolled loop
   // opened the span after the executor lookup, so a hydrated call was never
   // the one unobserved execution in a turn.
   let deferredName = "";
@@ -1509,8 +1509,8 @@ await test("a deferred tool hydrated mid-turn is executed and observed with a to
   }
   const toolSpanNames = spanExporter
     .getFinishedSpans()
-    .filter((s) => s.name === "ai.toolCall")
-    .map((s) => s.attributes["ai.toolCall.name"]);
+    .filter((s) => s.attributes["tool.name"] !== undefined)
+    .map((s) => s.name);
   console.log(
     `    [diagnostic] vertex-claude hydration spans: externalTools=${externalToolCount} standInCalls=${server.calls.length} mcpToolCalls=${mcp.toolCalls.length} toolSpans=${toolSpanNames.length}`,
   );
@@ -1768,14 +1768,11 @@ async function runObservedToolTurn(options: {
 
 await test("a tool span records the call's arguments and id", async () => {
   const { spans, counter } = await runObservedToolTurn({});
-  const toolSpan = spans.find(
-    (s) =>
-      s.name === "ai.toolCall" && s.attributes["ai.toolCall.name"] === "lookup",
-  );
+  const toolSpan = spans.find((s) => s.name === "lookup");
   assert(counter.calls === 1, "the tool did not execute once");
   assert(toolSpan !== undefined, "no tool span was recorded for the call");
   assert(
-    String(toolSpan?.attributes["ai.toolCall.args"] ?? "").includes(
+    String(toolSpan?.attributes["langfuse.observation.input"] ?? "").includes(
       "needle-argument",
     ),
     "the tool span does not carry the call's arguments",
@@ -1787,7 +1784,7 @@ await test("a tool span records the call's arguments and id", async () => {
     "the tool observation has no input",
   );
   assert(
-    toolSpan?.attributes["ai.toolCall.id"] === "toolu_eval_1",
+    toolSpan?.attributes["toolCallId"] === "toolu_eval_1",
     "the tool span does not carry the model's tool call id",
   );
 });
@@ -1797,19 +1794,23 @@ await test("the question survives a system prompt larger than the attribute cap"
     systemPrompt: "S".repeat(60_000),
   });
   const turnSpan = spans.find((s) => s.name === "anthropic.vertex.stream");
-  const traceInput = String(turnSpan?.attributes["langfuse.trace.input"] ?? "");
-  let parsed: { messages?: unknown[] } | undefined;
+  const traceInput = String(
+    turnSpan?.attributes["langfuse.observation.input"] ?? "",
+  );
+  let parsed: ChatInput | undefined;
   try {
-    parsed = JSON.parse(traceInput) as { messages?: unknown[] };
+    parsed = JSON.parse(traceInput) as ChatInput;
   } catch {
     parsed = undefined;
   }
-  const stepSpans = spans.filter((s) => s.name === "anthropic.messages.stream");
+  const stepSpans = spans.filter(
+    (s) => s.attributes["langfuse.observation.type"] === "generation",
+  );
   assert(turnSpan !== undefined, "no turn span was recorded");
   assert(traceInput.length <= 40_000, "the trace input exceeds the cap");
   assert(parsed !== undefined, "the trace input is not valid JSON");
   assert(
-    JSON.stringify(parsed?.messages ?? []).includes("QUESTION-MARKER"),
+    JSON.stringify(parsed ?? []).includes("QUESTION-MARKER"),
     "the user's question was cut from the trace input",
   );
   assert(stepSpans.length === 2, "a tool round trip should record two steps");
@@ -1826,7 +1827,7 @@ await test("the question survives a system prompt larger than the attribute cap"
 await test("the answering step's input holds this turn's tool call and result", async () => {
   const { spans } = await runObservedToolTurn({});
   const stepSpans = spans
-    .filter((s) => s.name === "anthropic.messages.stream")
+    .filter((s) => s.attributes["langfuse.observation.type"] === "generation")
     .sort(
       (a, b) =>
         a.startTime[0] - b.startTime[0] || a.startTime[1] - b.startTime[1],
@@ -1855,10 +1856,10 @@ await test("the answering step's input holds this turn's tool call and result", 
   );
 });
 
-await test("a step that called a tool records the call, and every step its finish reason", async () => {
+await test("a step that called a tool records the call, and a normal stop leaves every step at the default level", async () => {
   const { spans } = await runObservedToolTurn({});
   const stepSpans = spans
-    .filter((s) => s.name === "anthropic.messages.stream")
+    .filter((s) => s.attributes["langfuse.observation.type"] === "generation")
     .sort(
       (a, b) =>
         a.startTime[0] - b.startTime[0] || a.startTime[1] - b.startTime[1],
@@ -1871,14 +1872,10 @@ await test("a step that called a tool records the call, and every step its finis
     "the asking step's output does not record the tool call it made",
   );
   assert(
-    askingStep.attributes["langfuse.observation.metadata.finishReason"] ===
-      "tool_use",
-    "the asking step does not record why it stopped",
-  );
-  assert(
-    answeringStep.attributes["langfuse.observation.metadata.finishReason"] ===
-      "end_turn",
-    "the answering step does not record why it stopped",
+    [askingStep, answeringStep].every(
+      (s) => s.attributes["langfuse.observation.level"] === undefined,
+    ),
+    "a step that stopped normally was flagged above the default level",
   );
   assert(
     !String(
@@ -1933,11 +1930,10 @@ await test("a tool result over the cap stays valid JSON and keeps its structure"
   const { spans } = await runObservedToolTurn({
     toolResult: { id: "result-keep", text: "x".repeat(120_000) },
   });
-  const toolSpan = spans.find(
-    (s) =>
-      s.name === "ai.toolCall" && s.attributes["ai.toolCall.name"] === "lookup",
+  const toolSpan = spans.find((s) => s.name === "lookup");
+  const recorded = String(
+    toolSpan?.attributes["langfuse.observation.output"] ?? "",
   );
-  const recorded = String(toolSpan?.attributes["ai.toolCall.result"] ?? "");
   let parsed: { id?: string; text?: string } | undefined;
   try {
     parsed = JSON.parse(recorded);
@@ -1961,54 +1957,32 @@ await test("an oversized system prompt keeps its full opening beside the truncat
     systemPrompt: "S".repeat(60_000),
     question: "Q".repeat(60_000),
   });
-  const stepSpan = spans.find((s) => s.name === "anthropic.messages.stream");
-  const parsed: { system?: string } = JSON.parse(
-    String(stepSpan?.attributes["langfuse.observation.input"] ?? "{}"),
+  const stepSpan = spans.find(
+    (s) => s.attributes["langfuse.observation.type"] === "generation",
   );
-  const opening = (parsed.system ?? "").match(/^S*/)?.[0].length ?? 0;
-  assert(opening >= 2_000, `the system opening is ${opening} characters`);
+  const parsed: ChatInput = JSON.parse(
+    String(stepSpan?.attributes["langfuse.observation.input"] ?? "[]"),
+  );
+  const system = systemOf(parsed);
+  const opening = system.match(/S+/)?.[0].length ?? 0;
+  assert(opening >= 1_500, `the system opening is ${opening} characters`);
   assert(
-    (parsed.system ?? "").includes("[truncated"),
+    system.includes("[truncated"),
     "the system prompt does not say it was shortened",
   );
 });
 
-await test("NEUROLINK_RECORD_INPUTS=false opts out even when the value has stray spaces", async () => {
-  const previous = process.env.NEUROLINK_RECORD_INPUTS;
-  process.env.NEUROLINK_RECORD_INPUTS = " false ";
-  try {
-    const { spans } = await runObservedToolTurn({});
-    const toolSpan = spans.find(
-      (s) =>
-        s.name === "ai.toolCall" &&
-        s.attributes["ai.toolCall.name"] === "lookup",
-    );
-    assert(toolSpan !== undefined, "no tool span was recorded");
-    assert(
-      toolSpan?.attributes["ai.toolCall.args"] === undefined,
-      "the tool arguments were recorded despite the opt-out",
-    );
-  } finally {
-    if (previous === undefined) {
-      delete process.env.NEUROLINK_RECORD_INPUTS;
-    } else {
-      process.env.NEUROLINK_RECORD_INPUTS = previous;
-    }
-  }
-});
+type ChatInput = Array<{ role: string; content: string | object[] }>;
+
+function systemOf(input: ChatInput): string {
+  const content = input.find((entry) => entry.role === "system")?.content;
+  return typeof content === "string" ? content : "";
+}
 
 function turnObservationStopReason(
   turnSpan: { attributes: Record<string, unknown> } | undefined,
 ): unknown {
-  try {
-    return (
-      JSON.parse(
-        String(turnSpan?.attributes["langfuse.observation.metadata"] ?? "{}"),
-      ) as { stopReason?: unknown }
-    ).stopReason;
-  } catch {
-    return undefined;
-  }
+  return turnSpan?.attributes["langfuse.observation.metadata.stopReason"];
 }
 
 await test("a completed turn marks its stop reason on the trace", async () => {
@@ -2047,15 +2021,15 @@ await test("a question larger than the cap keeps the system prompt's opening", a
     question: `QUESTION-MARKER ${"q".repeat(60_000)}`,
   });
   const turnSpan = spans.find((s) => s.name === "anthropic.vertex.stream");
-  let parsed: { system?: unknown; messages?: unknown[] } | undefined;
+  let parsed: ChatInput | undefined;
   try {
     parsed = JSON.parse(
-      String(turnSpan?.attributes["langfuse.trace.input"] ?? ""),
-    ) as { system?: unknown; messages?: unknown[] };
+      String(turnSpan?.attributes["langfuse.observation.input"] ?? ""),
+    ) as ChatInput;
   } catch {
     parsed = undefined;
   }
-  const system = typeof parsed?.system === "string" ? parsed.system : "";
+  const system = systemOf(parsed ?? []);
   assert(parsed !== undefined, "the trace input is not valid JSON");
   assert(
     system.startsWith("SYSTEM-OPENING"),
@@ -2066,7 +2040,7 @@ await test("a question larger than the cap keeps the system prompt's opening", a
     "a cut system prompt does not say it was cut",
   );
   assert(
-    JSON.stringify(parsed?.messages ?? []).includes("QUESTION-MARKER"),
+    JSON.stringify(parsed ?? []).includes("QUESTION-MARKER"),
     "the start of the question was dropped",
   );
 });

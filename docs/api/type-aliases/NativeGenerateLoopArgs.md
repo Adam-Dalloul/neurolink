@@ -125,6 +125,14 @@ Resolved model id, handed to `prepareStep` as its `model` argument.
 
 ---
 
+### provider
+
+> **provider**: `string`
+
+Provider name recorded on each step's generation and used to price it.
+
+---
+
 ### responseFormat?
 
 > `optional` **responseFormat?**: `Record`\<`string`, `unknown`\>

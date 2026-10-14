@@ -1224,7 +1224,7 @@ try {
       );
       assert.equal(final.accountType, "translation");
       assert.equal(final.accountIdentityStatus, "unavailable");
-      assert.equal(parentSpan.attributes["gen_ai.response.model"], "gpt-4o");
+      assert.equal(parentSpan.attributes["proxy.response.model"], "gpt-4o");
       assert.equal(parentSpan.attributes["proxy.actual_provider"], "openai");
       assert.equal(parentSpan.attributes["proxy.account.served"], "unknown");
       assert.equal(
@@ -1233,7 +1233,7 @@ try {
       );
       assert.equal(parentSpan.attributes["ai.tokens.input"], undefined);
       assert.equal(
-        parentSpan.attributes["gen_ai.usage.input_tokens"],
+        parentSpan.attributes["proxy.usage.input_tokens"],
         undefined,
       );
       for (const field of [
@@ -1281,7 +1281,7 @@ try {
       assert.equal(final.outputTokens, 13);
       assert.equal(final.reasoningTokens, 11);
       assert.equal(
-        parentSpan.attributes["gen_ai.response.model"],
+        parentSpan.attributes["proxy.response.model"],
         "gpt-5.6-terra",
       );
       assert.equal(parentSpan.attributes["ai.tokens.input"], 60);

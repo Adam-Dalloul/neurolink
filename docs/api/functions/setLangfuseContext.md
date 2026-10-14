@@ -6,102 +6,42 @@
 
 # Function: setLangfuseContext()
 
-> **setLangfuseContext**\<`T`\>(`context`, `callback?`): `Promise`\<`void` \| `T`\>
-
-Set user and session context for Langfuse spans in the current async context
-
-Merges the provided context with existing AsyncLocalStorage context. If a callback is provided,
-the context is scoped to that callback execution and returns the callback's result.
-Without a callback, the context applies to the current execution context and its children.
-
-Uses AsyncLocalStorage to properly scope context per request, avoiding race conditions
-in concurrent scenarios.
+> **setLangfuseContext**\<`T`\>(`params`, `fn`): `T`
 
 ## Type Parameters
 
 ### T
 
-`T` = `void`
+`T`
 
 ## Parameters
 
-### context
+### params
 
-Object containing context fields to merge with existing context
+[`NeurolinkTraceContext`](../type-aliases/NeurolinkTraceContext.md)
 
-#### userId?
+{NeurolinkTraceContext} - User, session, trace name, tags and metadata for the trace.
 
-`string` \| `null`
+### fn
 
-#### sessionId?
+() => `T`
 
-`string` \| `null`
-
-#### conversationId?
-
-`string` \| `null`
-
-#### requestId?
-
-`string` \| `null`
-
-#### traceName?
-
-`string` \| `null`
-
-#### metadata?
-
-`Record`\<`string`, `unknown`\> \| `null`
-
-#### tags?
-
-`string`[] \| `null`
-
-Langfuse trace tags, set on the trace's root span
-
-#### operationName?
-
-`string` \| `null`
-
-Explicit operation name (overrides auto-detection)
-
-#### autoDetectOperationName?
-
-`boolean`
-
-Override global autoDetectOperationName for this context
-
-#### customAttributes?
-
-`Record`\<`string`, `string` \| `number` \| `boolean`\>
-
-Custom attributes to set on all spans within this context
-
-### callback?
-
-() => `T` \| `Promise`\<`T`\>
-
-Optional callback to run within the context scope. If omitted, context applies to current execution
+{() => T} - Work to run inside the propagated context.
 
 ## Returns
 
-`Promise`\<`void` \| `T`\>
+`T`
 
-The callback's return value if provided, otherwise void
+Whatever `fn` returns.
 
-## Examples
+## Description
 
-```ts
-// With callback - returns the result
-const result = await setLangfuseContext({ userId: "user123" }, async () => {
-  return await generateText({ model: "gpt-4", prompt: "Hello" });
-});
-```
+Runs `fn` with trace attributes propagated to every span it creates. `conversationId` and `requestId` become metadata; empty values are dropped. Metadata values of up to 200 characters once stringified are on every observation; longer values and arrays are recorded in full on the trace only, written by the trace root.
+
+## Example
 
 ```ts
-// Without callback - sets context for current execution
-await setLangfuseContext({
-  sessionId: "session456",
-  traceName: "chat-completion",
-});
+await setLangfuseContext({ userId: "u1", sessionId: "s1" }, () =>
+  neurolink.generate({ input: { text: "hi" } }),
+);
 ```

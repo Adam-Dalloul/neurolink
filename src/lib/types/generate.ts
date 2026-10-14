@@ -12,6 +12,7 @@ import type {
   TerminalAgentModeOption,
   TerminalAgentModeVersion,
 } from "./agentMode.js";
+import type { NeurolinkTraceContext } from "./observability.js";
 import type { Content, ImageWithAltText } from "./content.js";
 import type {
   ChatMessage,
@@ -707,7 +708,7 @@ export type GenerateOptions = {
   // Analytics and Evaluation
   enableEvaluation?: boolean;
   enableAnalytics?: boolean;
-  context?: StandardRecord;
+  context?: StandardRecord & NeurolinkTraceContext;
 
   // Domain-aware evaluation
   evaluationDomain?: string;
@@ -2070,6 +2071,8 @@ export type NativeGenerateLoopArgs = {
   prepareStep?: NativeLoopPrepareStep;
   /** Resolved model id, handed to `prepareStep` as its `model` argument. */
   modelId: string;
+  /** Provider name recorded on each step's generation and used to price it. */
+  provider: string;
   responseFormat?: Record<string, unknown>;
   providerOptions?: Record<string, Record<string, unknown>>;
   maxSteps: number;

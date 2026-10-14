@@ -38,7 +38,6 @@ import { HITLUserRejectedError, HITLTimeoutError } from "../hitl/hitlErrors.js";
 import { detectCategory } from "../utils/mcpDefaults.js";
 
 import { isObject, isNonNullObject } from "../utils/typeUtils.js";
-import { TelemetryService } from "../telemetry/telemetryService.js";
 import { tracers } from "../telemetry/tracers.js";
 import { SpanStatusCode } from "@opentelemetry/api";
 
@@ -1367,7 +1366,7 @@ export class ExternalServerManager extends EventEmitter {
 
     const config = instance.config;
 
-    const span = tracers.mcp.startSpan("neurolink.mcp.server.start", {
+    const span = tracers.mcp.startSpan("mcp.server.start", {
       attributes: {
         "mcp.server_id": serverId,
         "mcp.transport": config.transport,
@@ -1628,7 +1627,7 @@ export class ExternalServerManager extends EventEmitter {
       return;
     }
 
-    const span = tracers.mcp.startSpan("neurolink.mcp.server.stop", {
+    const span = tracers.mcp.startSpan("mcp.server.stop", {
       attributes: {
         "mcp.server_id": serverId,
       },
@@ -1942,16 +1941,13 @@ export class ExternalServerManager extends EventEmitter {
     }
     instance.restartTimer = setTimeout(async () => {
       this.retryDeadlines.delete(serverId);
-      const restartSpan = tracers.mcp.startSpan(
-        "neurolink.mcp.server.restart",
-        {
-          attributes: {
-            "mcp.server_id": serverId,
-            "mcp.restart_attempt": instance.reconnectAttempts,
-            "mcp.restart_delay_ms": delay,
-          },
+      const restartSpan = tracers.mcp.startSpan("mcp.server.restart", {
+        attributes: {
+          "mcp.server_id": serverId,
+          "mcp.restart_attempt": instance.reconnectAttempts,
+          "mcp.restart_delay_ms": delay,
         },
-      );
+      });
 
       try {
         if (this.servers.get(serverId) !== instance) {
@@ -2680,10 +2676,6 @@ export class ExternalServerManager extends EventEmitter {
         // of counting every resolved error as a success.
         const resolvedError = result.isErrorResult === true;
         if (resolvedError) {
-          // Keep this instance's totalErrors (and the getStatistics() /
-          // getExternalMCPStatistics() it feeds) consistent with the breaker,
-          // TelemetryService and ToolDiscoveryService's failedCalls, all of
-          // which already count a resolved isError result as a failure.
           instance.metrics.totalErrors++;
         }
         mcpLogger.debug(
@@ -2694,32 +2686,12 @@ export class ExternalServerManager extends EventEmitter {
             duration,
           },
         );
-        try {
-          TelemetryService.getInstance()?.recordMCPToolCall(
-            toolName,
-            duration,
-            !resolvedError,
-          );
-        } catch {
-          /* telemetry should not break execution */
-        }
         return result.data;
       } else {
         throw new Error(result.error || "Tool execution failed");
       }
     } catch (error) {
       instance.metrics.totalErrors++;
-
-      try {
-        const errorDuration = Date.now() - startTime;
-        TelemetryService.getInstance()?.recordMCPToolCall(
-          toolName,
-          errorDuration,
-          false,
-        );
-      } catch {
-        /* telemetry should not break execution */
-      }
 
       mcpLogger.error(
         `[ExternalServerManager] Tool execution failed: ${toolName} on ${serverId}`,

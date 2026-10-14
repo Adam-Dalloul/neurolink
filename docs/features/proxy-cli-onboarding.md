@@ -106,7 +106,7 @@ so Codex traffic to `chatgpt.com` is costed against Anthropic's price table.
 
 - There are **four** hard-coded `"anthropic"` sites, not two: `proxyTracer.ts:497`,
   `:826`, `:874` (all `calculateCost`) and `:883`
-  (`TelemetryService.recordAIRequest("anthropic", …)`).
+  (the `recordAIRequest` metric call).
 - **`codexProxyRoutes.ts` never imports `ProxyTracer` and never calls
   `calculateCost`.** Its `logRequest()` object literal (`:322-339`) has no token keys
   at all, and it never parses `usage` out of the SSE stream. Codex traffic is not

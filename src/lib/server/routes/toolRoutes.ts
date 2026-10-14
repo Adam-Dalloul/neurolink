@@ -40,7 +40,7 @@ export function createToolRoutes(basePath: string = "/api"): RouteGroup {
         handler: async (ctx: ServerContext) =>
           withSpan(
             {
-              name: "neurolink.http.tools.list",
+              name: "http.tools.list",
               tracer: tracers.http,
               attributes: { "http.route": `${basePath}/tools` },
             },
@@ -69,7 +69,7 @@ export function createToolRoutes(basePath: string = "/api"): RouteGroup {
         handler: async (ctx: ServerContext) =>
           withSpan(
             {
-              name: "neurolink.http.tools.search",
+              name: "http.tools.search",
               tracer: tracers.http,
               attributes: {
                 "http.route": `${basePath}/tools/search`,
@@ -142,7 +142,7 @@ export function createToolRoutes(basePath: string = "/api"): RouteGroup {
 
           return withSpan(
             {
-              name: "neurolink.http.tools.execute",
+              name: "http.tools.execute",
               tracer: tracers.http,
               attributes: {
                 "http.route": `${basePath}/tools/execute`,
@@ -246,7 +246,7 @@ export function createToolRoutes(basePath: string = "/api"): RouteGroup {
 
           return withSpan(
             {
-              name: "neurolink.http.tools.executeByName",
+              name: "http.tools.executeByName",
               tracer: tracers.http,
               attributes: {
                 "http.route": `${basePath}/tools/:name/execute`,
@@ -329,7 +329,7 @@ export function createToolRoutes(basePath: string = "/api"): RouteGroup {
 
           return withSpan(
             {
-              name: "neurolink.http.tools.get",
+              name: "http.tools.get",
               tracer: tracers.http,
               attributes: {
                 "http.route": `${basePath}/tools/:name`,

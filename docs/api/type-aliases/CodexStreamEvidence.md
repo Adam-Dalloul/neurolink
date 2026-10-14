@@ -59,3 +59,9 @@ Malformed, oversized or undispatched frames prevent proving output absence.
 ### errorCode?
 
 > `optional` **errorCode?**: `string`
+
+---
+
+### response?
+
+> `optional` **response?**: [`JsonObject`](JsonObject.md)

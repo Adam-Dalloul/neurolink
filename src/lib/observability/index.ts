@@ -9,6 +9,10 @@ export {
   getExporterRegistry,
   resetExporterRegistry,
 } from "./exporterRegistry.js";
+export {
+  createExporterSpanProcessor,
+  ExporterSpanProcessor,
+} from "./exporterSpanProcessor.js";
 export { ArizeExporter } from "./exporters/arizeExporter.js";
 
 // Exporters

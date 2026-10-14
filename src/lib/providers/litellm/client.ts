@@ -1,4 +1,3 @@
-import { SpanKind, SpanStatusCode, trace } from "@opentelemetry/api";
 import type { AIProviderName } from "../../constants/enums.js";
 import {
   registerRuntimeContextWindow,
@@ -8,7 +7,6 @@ import { createProxyFetch } from "../../proxy/proxyFetch.js";
 import type {
   EmbedInput,
   OpenAICompatBuildBodyArgs,
-  OpenAICompatStreamLifecycleListeners,
   ProviderErrorRule,
   UnknownRecord,
 } from "../../types/index.js";
@@ -30,13 +28,10 @@ import { isAbortError } from "../../utils/errorHandling.js";
 import { logger } from "../../utils/logger.js";
 import { redactUrlCredentials } from "../../utils/logSanitize.js";
 import { isGemini25Model as isCanonicalGemini25Model } from "../../utils/modelDetection.js";
-import { calculateCost } from "../../utils/pricing.js";
 import { getProviderModel } from "../../utils/providerConfig.js";
 import { createTimeoutController } from "../../utils/timeout.js";
 import { stripTrailingSlash } from "../openaiChatCompletionsClient.js";
 import { OpenAIChatCompletionsProvider } from "../openaiChatCompletionsBase.js";
-
-const streamTracer = trace.getTracer("neurolink.provider.litellm");
 
 const FALLBACK_LITELLM_MODEL = "openai/gpt-5.4-mini";
 
@@ -271,8 +266,7 @@ const isGemini25Model = (modelName: string): boolean => {
  *
  * All request/stream/tool-loop orchestration lives in
  * `OpenAIChatCompletionsProvider`. This class adds LiteLLM-specific
- * behaviour: OTel span wrap with cost (`onStreamStart`), Gemini 2.5
- * maxTokens skip (`adjustBuildBodyOptions`), ModelAccessDeniedError on
+ * behaviour: Gemini 2.5 maxTokens skip (`adjustBuildBodyOptions`), ModelAccessDeniedError on
  * 403, 10-minute model cache (`getAvailableModels`), `LITELLM_FALLBACK_MODELS`
  * env-driven fallback list, and native `/v1/embeddings`.
  */
@@ -374,71 +368,6 @@ export class LiteLLMProvider extends OpenAIChatCompletionsProvider {
       return { ...opts, maxTokens: undefined };
     }
     return opts;
-  }
-
-  /**
-   * Wrap the stream in an OTel span to capture provider-level latency,
-   * token usage, finish reason, and cost. Matches the pre-migration
-   * behaviour where streamText was wrapped in `neurolink.provider.streamText`.
-   */
-  protected onStreamStart(
-    modelId: string,
-  ): OpenAICompatStreamLifecycleListeners | undefined {
-    const span = streamTracer.startSpan("neurolink.provider.streamText", {
-      kind: SpanKind.CLIENT,
-      attributes: {
-        "gen_ai.system": "litellm",
-        "gen_ai.request.model": modelId,
-      },
-    });
-    let spanEnded = false;
-    const endSpan = () => {
-      if (!spanEnded) {
-        spanEnded = true;
-        span.end();
-      }
-    };
-    return {
-      onUsage: (usage) => {
-        // promptTokens is the uncached remainder — the attribute reports the
-        // full prompt (uncached + cache read/creation), and the cache fields
-        // let calculateCost price tiers.
-        span.setAttribute(
-          "gen_ai.usage.input_tokens",
-          usage.promptTokens +
-            (usage.cacheReadTokens ?? 0) +
-            (usage.cacheCreationTokens ?? 0),
-        );
-        span.setAttribute("gen_ai.usage.output_tokens", usage.completionTokens);
-        const cost = calculateCost(this.providerName, modelId, {
-          input: usage.promptTokens,
-          output: usage.completionTokens,
-          total: usage.totalTokens,
-          ...(usage.cacheReadTokens
-            ? { cacheReadTokens: usage.cacheReadTokens }
-            : {}),
-          ...(usage.cacheCreationTokens
-            ? { cacheCreationTokens: usage.cacheCreationTokens }
-            : {}),
-        });
-        if (cost && cost > 0) {
-          span.setAttribute("neurolink.cost", cost);
-        }
-      },
-      onFinish: (reason, capturedError) => {
-        span.setAttribute("gen_ai.response.finish_reason", reason || "unknown");
-        if (reason === "error") {
-          span.setStatus({
-            code: SpanStatusCode.ERROR,
-            message:
-              capturedError instanceof Error
-                ? capturedError.message
-                : String(capturedError ?? "stream error"),
-          });
-        }
-        endSpan();
-      },
-    };
   }
 
   public formatProviderError(error: unknown): Error {

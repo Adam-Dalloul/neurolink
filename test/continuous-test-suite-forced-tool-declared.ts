@@ -432,6 +432,7 @@ void runSuite(async () => {
       const { warnings } = await captureWarnings(() =>
         runNativeGenerateLoop(
           {
+            provider: "probe",
             doGenerate,
             conversation: [{ role: "user", content: "hi" }],
             tools: requestTools,
