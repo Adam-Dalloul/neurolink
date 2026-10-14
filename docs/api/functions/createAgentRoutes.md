@@ -6,7 +6,7 @@
 
 # Function: createAgentRoutes()
 
-> **createAgentRoutes**(`basePath?`): [`RouteGroup`](../type-aliases/RouteGroup.md)
+> **createAgentRoutes**(`basePath?`, `options?`): [`RouteGroup`](../type-aliases/RouteGroup.md)
 
 Create agent routes
 
@@ -15,6 +15,13 @@ Create agent routes
 ### basePath?
 
 `string` = `"/api"`
+
+### options?
+
+[`ServerAgentRouteOptions`](../type-aliases/ServerAgentRouteOptions.md)
+
+`allowedInputRoots` (default: local-path attachments are
+refused) and `maxInputBytes` for `input.images` / `input.files`.
 
 ## Returns
 
