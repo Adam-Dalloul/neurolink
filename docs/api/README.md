@@ -1546,6 +1546,8 @@ console.log(result.content);
 - [LiveKitEventBridgeParams](type-aliases/LiveKitEventBridgeParams.md)
 - [LiveKitEventBridgeHandle](type-aliases/LiveKitEventBridgeHandle.md)
 - [LiveKitServerCredentials](type-aliases/LiveKitServerCredentials.md)
+- [RealtimeVoiceBackend](type-aliases/RealtimeVoiceBackend.md)
+- [RealtimeLlm](type-aliases/RealtimeLlm.md)
 - [RealtimeVoiceConfig](type-aliases/RealtimeVoiceConfig.md)
 - [RealtimeVoiceLogEntry](type-aliases/RealtimeVoiceLogEntry.md)
 - [RealtimeVoiceLogContext](type-aliases/RealtimeVoiceLogContext.md)
