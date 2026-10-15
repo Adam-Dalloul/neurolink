@@ -453,7 +453,9 @@ Cloudflare Clef a request takes at most 64 questions, which `tryDecide()` splits
 into batches of 64 (see [its guide](../getting-started/providers/cloudflare-clef.md#limits));
 OpenAI Decisions declares no question cap, so the request goes whole and what the
 endpoint accepts is not established
-(see [its guide](../getting-started/providers/openai-decisions.md#what-is-not-established)).
+(see [its guide](../getting-started/providers/openai-decisions.md#what-is-not-established));
+ScaleDown declares none either, and its maximum is not measured
+(see [its guide](../getting-started/providers/scaledown.md#not-measured)).
 NeuroLink also refuses a state it estimates at more than 16,000 tokens (about
 60,000 characters of prose), so a longer set of eligible messages gets a refusal
 and the stage is skipped, as on any failure.
