@@ -10,8 +10,9 @@
 
 Props for the NeuroLinkProvider React component.
 
-`children` is typed as `unknown` so this module stays React-agnostic;
-the provider component in reactHooks.tsx narrows it to `ReactNode`.
+`children` is typed as `unknown` so the declaration needs no React types;
+anything React accepts as a child is accepted, and the component renders it
+as is.
 
 ## Properties
 
@@ -27,4 +28,4 @@ Client configuration
 
 > **children**: `unknown`
 
-Child components (ReactNode at runtime)
+Child components (any ReactNode)
